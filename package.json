@@ -16,6 +16,6 @@
     "dotenv": "^17.2.1",
     "express": "^5.1.0",
     "node-fetch": "^3.3.2",
-    "soundcloud-downloader": "^0.2.5"
+    "soundcloud-downloader": "^0.1.8"
   }
 }
