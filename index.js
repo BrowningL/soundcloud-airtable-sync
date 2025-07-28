@@ -3,7 +3,7 @@ const fs = require("fs");
 const path = require("path");
 const bodyParser = require("body-parser");
 const fetch = require("node-fetch").default;
-const scdl = require("soundcloud-downloader").default;
+const scdl = require("soundcloud-downloader");
 require("dotenv").config();
 
 const app = express();
@@ -45,13 +45,9 @@ app.post("/webhook", async (req, res) => {
 
   try {
     const info = await scdl.getInfo(soundcloud_url, CLIENT_ID);
-    const progressive = info.media.transcodings.find(t => t.format.protocol === 'progressive');
+    const stream = await scdl.download(soundcloud_url, CLIENT_ID);
 
-    if (!progressive) throw new Error("No progressive stream found");
-
-    const stream = await scdl.downloadFromURL(progressive.url, CLIENT_ID);
     const writeStream = fs.createWriteStream(filepath);
-
     stream.pipe(writeStream);
 
     writeStream.on("finish", async () => {
