@@ -21,12 +21,19 @@ const AIRTABLE_API_KEY = process.env.AIRTABLE_API_KEY;
 const CLIENT_ID = process.env.SOUNDCLOUD_CLIENT_ID;
 const SAVE_CLIENT_ID = (process.env.SAVE_CLIENT_ID || "false").toLowerCase() === "true";
 
+// Simple health check
+app.get("/health", (req, res) => res.json({ ok: true }));
+
+// Serve MP3 with explicit headers Airtable's fetcher likes
 app.get("/tracks/:filename", (req, res) => {
   const f = path.join(DOWNLOAD_DIR, req.params.filename);
   if (fs.existsSync(f)) {
     const stat = fs.statSync(f);
     res.setHeader("Content-Type", "audio/mpeg");
     res.setHeader("Content-Length", stat.size);
+    res.setHeader("Accept-Ranges", "bytes");
+    res.setHeader("Cache-Control", "public, max-age=3600");
+    res.setHeader("Content-Disposition", `inline; filename="${req.params.filename}"`);
     res.sendFile(f);
   } else {
     res.status(404).send("Not found");
@@ -44,8 +51,8 @@ app.post("/webhook", async (req, res) => {
   const publicUrl = `${HOST}/tracks/${filename}`;
 
   try {
+    // Download stream and write to disk
     const stream = await scdl.download(soundcloud_url, CLIENT_ID);
-
     const writeStream = fs.createWriteStream(filepath);
     stream.pipe(writeStream);
 
@@ -54,6 +61,8 @@ app.post("/webhook", async (req, res) => {
 
       try {
         const airtableUrl = `https://api.airtable.com/v0/${BASE_ID}/${encodeURIComponent(TABLE)}/${record_id}`;
+        console.log("🔗 Sending to Airtable:", publicUrl);
+
         const patchResp = await fetch(airtableUrl, {
           method: "PATCH",
           headers: {
@@ -73,33 +82,50 @@ app.post("/webhook", async (req, res) => {
           return res.status(500).json({ error: "Airtable update failed", details: result });
         }
 
-        console.log(`📤 Uploaded public URL to Airtable for record ${record_id}`);
+        const returnedAtt = result.fields?.["Raw Track Audio File"]?.[0] || null;
+        console.log("📦 Airtable returned attachment:", returnedAtt);
 
-        setTimeout(async () => {
+        // Respond immediately with the URLs for debugging
+        res.json({
+          success: true,
+          message: "File processed and pushed to Airtable.",
+          sent_url: publicUrl,
+          airtable_returned_url: returnedAtt?.url || null,
+          airtable_returned: returnedAtt
+        });
+
+        // Poll for rehosting and cleanup (up to 90s)
+        const started = Date.now();
+        const poll = async () => {
           try {
             const pollResp = await fetch(airtableUrl, {
               headers: { Authorization: `Bearer ${AIRTABLE_API_KEY}` }
             });
-
             const record = await pollResp.json();
             const att = record.fields?.["Raw Track Audio File"];
-            const isAirtableHosted = att?.[0]?.url?.includes("airtableusercontent");
+            const currentUrl = att?.[0]?.url || null;
+            const isAirtableHosted = currentUrl?.includes("airtableusercontent");
+            console.log("🔎 Current attachment URL:", currentUrl);
 
-            if (isAirtableHosted && fs.existsSync(filepath)) {
-              fs.unlink(filepath, () => {});
+            if (isAirtableHosted) {
+              if (fs.existsSync(filepath)) fs.unlink(filepath, () => {});
               console.log(`🧹 Cleaned up ${filename}`);
+              return; // stop polling
+            }
+
+            if (Date.now() - started < 90000) {
+              setTimeout(poll, 10000);
             } else {
-              console.log(`⏳ Cleanup skipped: Airtable hasn't rehosted or file missing`);
+              console.log("⏳ Gave up waiting for Airtable to rehost after 90s");
             }
           } catch (e) {
             console.error("⚠️ Polling error during cleanup:", e);
           }
-        }, 20000);
-
-        return res.json({ success: true, message: "File processed and pushed to Airtable." });
+        };
+        setTimeout(poll, 10000);
       } catch (uploadErr) {
         console.error("❌ Upload to Airtable failed:", uploadErr);
-        return res.status(500).json({ error: "Upload to Airtable failed" });
+        return; // response already sent if we reached here earlier
       }
     });
 
@@ -109,7 +135,7 @@ app.post("/webhook", async (req, res) => {
     });
   } catch (err) {
     console.error("❌ SoundCloud download failed:", err);
-    return res.status(500).json({ error: "SoundCloud download failed" });
+    return res.status(500).json({ error: "SoundCloud download failed", details: String(err?.message || err) });
   }
 });
 
