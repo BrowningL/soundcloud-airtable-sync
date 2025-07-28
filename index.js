@@ -42,7 +42,7 @@ app.post("/webhook", async (req, res) => {
   const publicUrl = `${HOST}/tracks/${filename}`;
 
   try {
-    const stream = await scdl.download(soundcloud_url);
+    const stream = await scdl.download(soundcloud_url, process.env.SOUNDCLOUD_CLIENT_ID)
     const writeStream = fs.createWriteStream(filepath);
 
     stream.pipe(writeStream);
