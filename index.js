@@ -18,6 +18,8 @@ const BASE_ID = process.env.AIRTABLE_BASE_ID;
 const TABLE = process.env.AIRTABLE_TABLE_NAME;
 const HOST = process.env.HOST_URL;
 const AIRTABLE_API_KEY = process.env.AIRTABLE_API_KEY;
+const CLIENT_ID = process.env.SOUNDCLOUD_CLIENT_ID;
+const SAVE_CLIENT_ID = (process.env.SAVE_CLIENT_ID || "false").toLowerCase() === "true";
 
 app.get("/tracks/:filename", (req, res) => {
   const f = path.join(DOWNLOAD_DIR, req.params.filename);
@@ -42,7 +44,12 @@ app.post("/webhook", async (req, res) => {
   const publicUrl = `${HOST}/tracks/${filename}`;
 
   try {
-    const stream = await scdl.download(soundcloud_url, process.env.SOUNDCLOUD_CLIENT_ID)
+    const info = await scdl.getInfo(soundcloud_url, CLIENT_ID);
+    const progressive = info.media.transcodings.find(t => t.format.protocol === 'progressive');
+
+    if (!progressive) throw new Error("No progressive stream found");
+
+    const stream = await scdl.downloadFromURL(progressive.url, CLIENT_ID);
     const writeStream = fs.createWriteStream(filepath);
 
     stream.pipe(writeStream);
@@ -50,7 +57,6 @@ app.post("/webhook", async (req, res) => {
     writeStream.on("finish", async () => {
       console.log(`✅ Downloaded to ${filepath}`);
 
-      // Upload to Airtable
       try {
         const airtableUrl = `https://api.airtable.com/v0/${BASE_ID}/${encodeURIComponent(TABLE)}/${record_id}`;
         const patchResp = await fetch(airtableUrl, {
@@ -74,7 +80,6 @@ app.post("/webhook", async (req, res) => {
 
         console.log(`📤 Uploaded public URL to Airtable for record ${record_id}`);
 
-        // Begin cleanup after delay
         setTimeout(async () => {
           try {
             const pollResp = await fetch(airtableUrl, {
