@@ -3,7 +3,7 @@ const fs = require("fs");
 const path = require("path");
 const bodyParser = require("body-parser");
 const fetch = require("node-fetch").default;
-const scdl = require("soundcloud-downloader");
+const scdl = require("soundcloud-downloader").default;
 require("dotenv").config();
 
 const app = express();
@@ -44,7 +44,6 @@ app.post("/webhook", async (req, res) => {
   const publicUrl = `${HOST}/tracks/${filename}`;
 
   try {
-    const info = await scdl.getInfo(soundcloud_url, CLIENT_ID);
     const stream = await scdl.download(soundcloud_url, CLIENT_ID);
 
     const writeStream = fs.createWriteStream(filepath);
