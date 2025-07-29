@@ -4,32 +4,43 @@ const path = require("path");
 const bodyParser = require("body-parser");
 const fetch = require("node-fetch").default;
 const scdl = require("soundcloud-downloader").default;
-const ffmpeg = require("fluent-ffmpeg");
+
 const ffmpegPath = require("ffmpeg-static");
+const ffmpeg = require("fluent-ffmpeg");
+ffmpeg.setFfmpegPath(ffmpegPath);
+
 const mm = require("music-metadata");
 require("dotenv").config();
 
-ffmpeg.setFfmpegPath(ffmpegPath);
-
+// ----------------------------------
+// Config
+// ----------------------------------
 const app = express();
 app.use(bodyParser.json());
 
-const PORT = process.env.PORT || 3000;
+const PORT = process.env.PORT || 3000; // Railway sets PORT
 const DOWNLOAD_DIR = process.env.TRACKS_DIR || path.join(__dirname, "tracks");
 const BASE_ID = process.env.AIRTABLE_BASE_ID;
 const TABLE = process.env.AIRTABLE_TABLE_NAME;
 const HOST = (process.env.HOST_URL || "").trim();
 const AIRTABLE_API_KEY = process.env.AIRTABLE_API_KEY;
 const CLIENT_ID = process.env.SOUNDCLOUD_CLIENT_ID;
-const CLEANUP_POLL_SECONDS = Number(process.env.CLEANUP_POLL_SECONDS || 90);
+
+// Polling for rehost
+const CLEANUP_POLL_SECONDS = Number(process.env.CLEANUP_POLL_SECONDS || 180);
 const CLEANUP_POLL_INTERVAL = Number(process.env.CLEANUP_POLL_INTERVAL || 10);
 
 if (!fs.existsSync(DOWNLOAD_DIR)) fs.mkdirSync(DOWNLOAD_DIR, { recursive: true });
 
+// prevent duplicate concurrent work per record
 const activeJobs = new Set();
 
+// ----------------------------------
+// Helpers
+// ----------------------------------
 const wait = (ms) => new Promise((r) => setTimeout(r, ms));
-const airtableRecordUrl = (recordId) => `https://api.airtable.com/v0/${BASE_ID}/${encodeURIComponent(TABLE)}/${recordId}`;
+const airtableRecordUrl = (recordId) =>
+  `https://api.airtable.com/v0/${BASE_ID}/${encodeURIComponent(TABLE)}/${recordId}`;
 
 function normalizeHost(h) {
   if (!h) return null;
@@ -40,26 +51,91 @@ function normalizeHost(h) {
 function resolveHostUrl(req) {
   const fromEnv = normalizeHost(HOST);
   if (fromEnv) return fromEnv;
-  const proto = (req.get("x-forwarded-proto") || req.protocol || "https").split(',')[0].trim();
-  const host = (req.get("x-forwarded-host") || req.get("host") || "").split(',')[0].trim();
+  const proto = (req.get("x-forwarded-proto") || req.protocol || "https").split(",")[0].trim();
+  const host = (req.get("x-forwarded-host") || req.get("host") || "").split(",")[0].trim();
   return normalizeHost(`${proto}://${host}`);
 }
 function ensureHttpsUrl(u) {
-  if (!u) return null;
   return /^https?:\/\//i.test(u) ? u : `https://${u}`;
 }
 async function headOk(url) {
-  try { const resp = await fetch(url, { method: "HEAD" }); return resp.ok; }
-  catch { return false; }
+  try { const r = await fetch(url, { method: "HEAD" }); return r.ok; } catch { return false; }
 }
-function serveFileHeaders(res, filename, stat) {
+
+function serveInlineHeaders(res, filename, stat) {
   res.setHeader("Content-Type", "audio/mpeg");
   res.setHeader("Content-Length", stat.size);
   res.setHeader("Accept-Ranges", "bytes");
   res.setHeader("Cache-Control", "public, max-age=3600");
   res.setHeader("Content-Disposition", `inline; filename="${filename}"`);
 }
+function serveDownloadHeaders(res, filename, stat) {
+  res.setHeader("Content-Type", "audio/mpeg");
+  res.setHeader("Content-Length", stat.size);
+  res.setHeader("Content-Disposition", `attachment; filename="${filename}"`);
+  res.setHeader("Cache-Control", "public, max-age=300");
+}
 
+// Normalize MP3 headers (ensure duration shows up consistently)
+async function normalizeMp3Container(inputPath) {
+  const tempOut = inputPath.replace(/\.mp3$/i, ".fixed.mp3");
+
+  // Try remux (no quality loss) with Xing/VBR header
+  const tryRemux = () =>
+    new Promise((resolve, reject) => {
+      ffmpeg(inputPath)
+        .outputOptions(["-c:a", "copy", "-write_xing", "1"])
+        .on("end", resolve)
+        .on("error", reject)
+        .save(tempOut);
+    });
+
+  // Fallback: re-encode to a clean container if remux fails
+  const tryReencode = () =>
+    new Promise((resolve, reject) => {
+      ffmpeg(inputPath)
+        .audioCodec("libmp3lame")
+        .audioBitrate("192k")
+        .audioFrequency(44100)
+        .noVideo()
+        .outputOptions(["-write_xing", "1"])
+        .on("end", resolve)
+        .on("error", reject)
+        .save(tempOut);
+    });
+
+  try {
+    await tryRemux();
+  } catch {
+    await tryReencode();
+  }
+  fs.renameSync(tempOut, inputPath);
+}
+
+async function ensureGoodMp3(filepath) {
+  let duration = 0;
+  try {
+    const meta = await mm.parseFile(filepath);
+    duration = meta?.format?.duration || 0;
+  } catch { /* ignore */ }
+
+  console.log(`🧭 Parsed duration before normalize: ${duration ? duration.toFixed(2) + "s" : "unknown"}`);
+  if (duration && duration > 5) return; // already looks fine
+
+  console.log("🔧 Normalizing MP3 container …");
+  await normalizeMp3Container(filepath);
+
+  try {
+    const meta2 = await mm.parseFile(filepath);
+    console.log(`✅ Normalized. New duration: ${meta2?.format?.duration ? meta2.format.duration.toFixed(2) + "s" : "unknown"}`);
+  } catch {
+    console.log("✅ Normalized (metadata parse unavailable)");
+  }
+}
+
+// ----------------------------------
+// Health & debug
+// ----------------------------------
 app.get("/health", (_req, res) => res.json({ ok: true, tracksDir: DOWNLOAD_DIR }));
 app.get("/debug/files", (_req, res) => {
   try {
@@ -70,23 +146,49 @@ app.get("/debug/files", (_req, res) => {
   }
 });
 
+// Access logging for fetchers
+app.use((req, _res, next) => {
+  if (req.path.startsWith("/tracks/") || req.path.startsWith("/dl/")) {
+    console.log(`📥 ${req.method} ${req.path} UA=${req.get("user-agent") || "?"}`);
+  }
+  next();
+});
+
+// Human-facing stream (inline)
 app.get("/tracks/:filename", (req, res) => {
-  const file = req.params.filename;
-  const fpath = path.join(DOWNLOAD_DIR, file);
+  const fpath = path.join(DOWNLOAD_DIR, req.params.filename);
   if (!fs.existsSync(fpath)) return res.status(404).send("Not found");
   const stat = fs.statSync(fpath);
-  serveFileHeaders(res, file, stat);
+  serveInlineHeaders(res, req.params.filename, stat);
   res.sendFile(fpath);
 });
 app.head("/tracks/:filename", (req, res) => {
-  const file = req.params.filename;
-  const fpath = path.join(DOWNLOAD_DIR, file);
+  const fpath = path.join(DOWNLOAD_DIR, req.params.filename);
   if (!fs.existsSync(fpath)) return res.sendStatus(404);
   const stat = fs.statSync(fpath);
-  serveFileHeaders(res, file, stat);
-  return res.sendStatus(200);
+  serveInlineHeaders(res, req.params.filename, stat);
+  res.sendStatus(200);
 });
 
+// Airtable ingestion route (download semantics)
+app.get("/dl/:filename", (req, res) => {
+  const fpath = path.join(DOWNLOAD_DIR, req.params.filename);
+  if (!fs.existsSync(fpath)) return res.status(404).send("Not found");
+  const stat = fs.statSync(fpath);
+  serveDownloadHeaders(res, req.params.filename, stat);
+  res.sendFile(fpath);
+});
+app.head("/dl/:filename", (req, res) => {
+  const fpath = path.join(DOWNLOAD_DIR, req.params.filename);
+  if (!fs.existsSync(fpath)) return res.sendStatus(404);
+  const stat = fs.statSync(fpath);
+  serveDownloadHeaders(res, req.params.filename, stat);
+  res.sendStatus(200);
+});
+
+// ----------------------------------
+// Webhook
+// ----------------------------------
 app.post("/webhook", async (req, res) => {
   const { record_id, soundcloud_url } = req.body || {};
   if (!record_id || !soundcloud_url) {
@@ -100,14 +202,16 @@ app.post("/webhook", async (req, res) => {
   const baseHost = resolveHostUrl(req);
   const filename = `${record_id}.mp3`;
   const filepath = path.join(DOWNLOAD_DIR, filename);
-  const normalizedPath = path.join(DOWNLOAD_DIR, `normalized_${filename}`);
-  const publicUrl = ensureHttpsUrl(`${baseHost}/tracks/${encodeURIComponent(filename)}`);
+
+  // Use the /dl route for Airtable ingestion (looks like a real file download)
+  const publicUrl = ensureHttpsUrl(`${baseHost}/dl/${encodeURIComponent(filename)}`);
 
   try {
     console.log("🌐 Base host:", baseHost);
     console.log("🔗 Computed publicUrl:", publicUrl);
     console.log("🎧 Download start:", soundcloud_url);
 
+    // Download → disk
     const stream = await scdl.download(soundcloud_url, CLIENT_ID);
     await new Promise((resolve, reject) => {
       const out = fs.createWriteStream(filepath);
@@ -117,30 +221,21 @@ app.post("/webhook", async (req, res) => {
       stream.pipe(out);
     });
 
-    console.log(`✅ Downloaded: ${filepath} (${fs.statSync(filepath).size} bytes)`);
+    const size = fs.statSync(filepath).size;
+    console.log(`✅ Downloaded: ${filepath} (${size} bytes)`);
 
-    console.log("🔧 Normalizing MP3 container (writing Xing/VBR) …");
-    await new Promise((resolve, reject) => {
-      ffmpeg(filepath)
-        .audioCodec("libmp3lame")
-        .outputOptions("-write_xing", "1")
-        .on("error", reject)
-        .on("end", () => {
-          fs.renameSync(normalizedPath, filepath);
-          resolve();
-        })
-        .save(normalizedPath);
-    });
-    const metadata = await mm.parseFile(filepath);
-    console.log("✅ Normalized. New duration:", metadata.format.duration);
+    // Normalize MP3 so duration is visible everywhere
+    await ensureGoodMp3(filepath);
 
+    // ensure URL is reachable before sending to Airtable
     for (let i = 0; i < 5; i++) {
       const ok = await headOk(publicUrl);
-      console.log(`🧪 HEAD ${publicUrl} -> ${ok ? 'OK' : 'FAIL'}`);
+      console.log(`🧪 HEAD ${publicUrl} -> ${ok ? "OK" : "FAIL"}`);
       if (ok) break;
       await wait(500 * (i + 1));
     }
 
+    // PATCH Airtable
     const airtableUrl = airtableRecordUrl(record_id);
     console.log("🔗 Sending to Airtable:", publicUrl);
     const patchResp = await fetch(airtableUrl, {
@@ -149,11 +244,13 @@ app.post("/webhook", async (req, res) => {
         Authorization: `Bearer ${AIRTABLE_API_KEY}`,
         "Content-Type": "application/json",
       },
-      body: JSON.stringify({ fields: { "Raw Track Audio File": [{ url: publicUrl, filename }] } }),
+      body: JSON.stringify({
+        fields: { "Raw Track Audio File": [{ url: publicUrl, filename }] }
+      }),
     });
-
     const patchJson = await patchResp.json();
     console.log("🧾 Airtable PATCH response:", patchJson);
+
     if (!patchResp.ok) {
       console.error("❌ Airtable update failed:", patchJson);
       return res.status(500).json({ error: "Airtable update failed", details: patchJson, sent_url: publicUrl });
@@ -162,6 +259,7 @@ app.post("/webhook", async (req, res) => {
     const returnedAtt = patchJson.fields?.["Raw Track Audio File"]?.[0] || null;
     console.log("📦 Airtable returned attachment:", returnedAtt);
 
+    // respond to caller with debug
     res.json({
       success: true,
       message: "File processed and pushed to Airtable.",
@@ -170,6 +268,7 @@ app.post("/webhook", async (req, res) => {
       airtable_returned: returnedAtt,
     });
 
+    // poll for rehost → cleanup
     const t0 = Date.now();
     while (Date.now() - t0 < CLEANUP_POLL_SECONDS * 1000) {
       await wait(CLEANUP_POLL_INTERVAL * 1000);
