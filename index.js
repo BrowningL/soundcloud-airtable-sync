@@ -16,10 +16,9 @@ const PORT = process.env.PORT || 3000; // Railway provides PORT
 const DOWNLOAD_DIR = process.env.TRACKS_DIR || path.join(__dirname, "tracks");
 const BASE_ID = process.env.AIRTABLE_BASE_ID;
 const TABLE = process.env.AIRTABLE_TABLE_NAME;
-const HOST = process.env.HOST_URL; // e.g. https://soundcloud-airtable-sync-production.up.railway.app
+const HOST = (process.env.HOST_URL || "").trim(); // may be bare host; we normalize below
 const AIRTABLE_API_KEY = process.env.AIRTABLE_API_KEY;
 const CLIENT_ID = process.env.SOUNDCLOUD_CLIENT_ID;
-const SAVE_CLIENT_ID = (process.env.SAVE_CLIENT_ID || "false").toLowerCase() === "true";
 const CLEANUP_POLL_SECONDS = Number(process.env.CLEANUP_POLL_SECONDS || 90);
 const CLEANUP_POLL_INTERVAL = Number(process.env.CLEANUP_POLL_INTERVAL || 10);
 
@@ -34,23 +33,29 @@ const activeJobs = new Set();
 const wait = (ms) => new Promise((r) => setTimeout(r, ms));
 const airtableRecordUrl = (recordId) => `https://api.airtable.com/v0/${BASE_ID}/${encodeURIComponent(TABLE)}/${recordId}`;
 
+function normalizeHost(h) {
+  if (!h) return null;
+  let v = h.trim();
+  if (!/^https?:\/\//i.test(v)) v = `https://${v}`; // ensure scheme
+  return v.replace(/\/$/, "");
+}
 function resolveHostUrl(req) {
-  // If HOST not provided, infer from request (works behind Railway proxy)
-  if (HOST) return HOST.replace(/\/$/, "");
-  const proto = req.get("x-forwarded-proto") || req.protocol || "https";
-  const host = req.get("x-forwarded-host") || req.get("host");
-  return `${proto}://${host}`;
+  // Prefer env, normalized to include https://
+  const fromEnv = normalizeHost(HOST);
+  if (fromEnv) return fromEnv;
+  // Fallback: infer from proxy headers
+  const proto = (req.get("x-forwarded-proto") || req.protocol || "https").split(',')[0].trim();
+  const host = (req.get("x-forwarded-host") || req.get("host") || "").split(',')[0].trim();
+  return normalizeHost(`${proto}://${host}`);
 }
-
+function ensureHttpsUrl(u) {
+  if (!u) return null;
+  return /^https?:\/\//i.test(u) ? u : `https://${u}`;
+}
 async function headOk(url) {
-  try {
-    const resp = await fetch(url, { method: "HEAD" });
-    return resp.ok;
-  } catch (_) {
-    return false;
-  }
+  try { const resp = await fetch(url, { method: "HEAD" }); return resp.ok; }
+  catch { return false; }
 }
-
 function serveFileHeaders(res, filename, stat) {
   res.setHeader("Content-Type", "audio/mpeg");
   res.setHeader("Content-Length", stat.size);
@@ -83,7 +88,6 @@ app.get("/tracks/:filename", (req, res) => {
   serveFileHeaders(res, file, stat);
   res.sendFile(fpath);
 });
-
 // Explicit HEAD support (some fetchers preflight with HEAD)
 app.head("/tracks/:filename", (req, res) => {
   const file = req.params.filename;
@@ -110,13 +114,15 @@ app.post("/webhook", async (req, res) => {
   const baseHost = resolveHostUrl(req);
   const filename = `${record_id}.mp3`;
   const filepath = path.join(DOWNLOAD_DIR, filename);
-  const publicUrl = `${baseHost}/tracks/${filename}`;
+  const publicUrl = ensureHttpsUrl(`${baseHost}/tracks/${encodeURIComponent(filename)}`);
 
   try {
-    // 1) Download stream and write to disk
+    console.log("🌐 Base host:", baseHost);
+    console.log("🔗 Computed publicUrl:", publicUrl);
     console.log("🎧 Download start:", soundcloud_url);
-    const stream = await scdl.download(soundcloud_url, CLIENT_ID);
 
+    // 1) Download stream and write to disk
+    const stream = await scdl.download(soundcloud_url, CLIENT_ID);
     await new Promise((resolve, reject) => {
       const out = fs.createWriteStream(filepath);
       stream.on("error", reject);
@@ -127,31 +133,30 @@ app.post("/webhook", async (req, res) => {
 
     const size = fs.statSync(filepath).size;
     console.log(`✅ Downloaded: ${filepath} (${size} bytes)`);
-    if (size < 64 * 1024) console.warn("⚠️ File size unexpectedly small; Airtable may reject fetch.");
+    if (size < 64 * 1024) console.warn("⚠️ File size unexpectedly small; Airtable may reject fetch.")
 
     // 2) Ensure our public URL is reachable (HEAD). Retry quickly a few times in case of FS lag.
-    let headTries = 0;
-    while (headTries < 5) {
-      if (await headOk(publicUrl)) break;
-      headTries += 1;
-      await wait(500 * headTries);
+    for (let i = 0; i < 5; i++) {
+      const ok = await headOk(publicUrl);
+      console.log(`🧪 HEAD ${publicUrl} -> ${ok ? 'OK' : 'FAIL'}`);
+      if (ok) break;
+      await wait(500 * (i + 1));
     }
-    console.log("🔗 Sending to Airtable:", publicUrl);
 
     // 3) PATCH Airtable attachment field with public URL
     const airtableUrl = airtableRecordUrl(record_id);
+    console.log("🔗 Sending to Airtable:", publicUrl);
     const patchResp = await fetch(airtableUrl, {
       method: "PATCH",
       headers: {
         Authorization: `Bearer ${AIRTABLE_API_KEY}`,
         "Content-Type": "application/json",
       },
-      body: JSON.stringify({
-        fields: { "Raw Track Audio File": [{ url: publicUrl, filename }] },
-      }),
+      body: JSON.stringify({ fields: { "Raw Track Audio File": [{ url: publicUrl, filename }] } }),
     });
 
     const patchJson = await patchResp.json();
+    console.log("🧾 Airtable PATCH response:", patchJson);
     if (!patchResp.ok) {
       console.error("❌ Airtable update failed:", patchJson);
       return res.status(500).json({ error: "Airtable update failed", details: patchJson, sent_url: publicUrl });
