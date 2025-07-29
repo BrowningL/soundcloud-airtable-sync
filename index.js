@@ -3,6 +3,7 @@ const fs = require("fs");
 const path = require("path");
 const bodyParser = require("body-parser");
 const fetch = require("node-fetch").default;
+const { create: createSCDL } = require("@snwfdhmp/soundcloud-downloader"); // maintained fork
 const ffmpegPath = require("ffmpeg-static");
 const ffmpeg = require("fluent-ffmpeg");
 ffmpeg.setFfmpegPath(ffmpegPath);
@@ -23,10 +24,6 @@ const TABLE = process.env.AIRTABLE_TABLE_NAME;
 const HOST = (process.env.HOST_URL || "").trim();
 const AIRTABLE_API_KEY = process.env.AIRTABLE_API_KEY;
 
-// SoundCloud OAuth (official)
-const SC_CLIENT_ID = process.env.SC_CLIENT_ID;
-const SC_CLIENT_SECRET = process.env.SC_CLIENT_SECRET;
-
 // ACRCloud
 const ACR_HOST = process.env.ACR_HOST;
 const ACR_ACCESS_KEY = process.env.ACR_ACCESS_KEY;
@@ -39,13 +36,28 @@ const CLEANUP_POLL_INTERVAL = Number(process.env.CLEANUP_POLL_INTERVAL || 10);
 // ACR sweep
 const ACR_WINDOW_SEC  = Number(process.env.ACR_WINDOW_SEC  || 12);
 const ACR_STEP_SEC    = Number(process.env.ACR_STEP_SEC    || 25);
-const ACR_MAX_REQ     = Number(process.env.ACR_MAX_REQUESTS|| 100); // thorough sweep
+const ACR_MAX_REQ     = Number(process.env.ACR_MAX_REQUESTS|| 100);
 const ACR_MIN_SCORE   = Number(process.env.ACR_MIN_SCORE   || 70);
 const ACR_RETRIES     = Number(process.env.ACR_RETRIES     || 2);
 const ACR_BACKOFF_MS  = Number(process.env.ACR_BACKOFF_MS  || 400);
 
+// SCDL client-id caching (env flags used by the fork)
+const SAVE_CLIENT_ID = String(process.env.SAVE_CLIENT_ID || "true"); // MUST be set to avoid .toLowerCase() crash
+const SCDL_CLIENT_ID_FILE = process.env.SCDL_CLIENT_ID_FILE || path.join(DOWNLOAD_DIR, "client_id.json");
+const SOUNDCLOUD_CLIENT_ID = process.env.SOUNDCLOUD_CLIENT_ID || undefined;
+
 if (!fs.existsSync(DOWNLOAD_DIR)) fs.mkdirSync(DOWNLOAD_DIR, { recursive: true });
+
+// prevent duplicate concurrent work per record
 const activeJobs = new Set();
+
+// Create a managed SCDL instance that will auto‑discover and cache client_id.
+// If you have a fresh manual client_id, put it in SOUNDCLOUD_CLIENT_ID; otherwise it’ll self‑fetch.
+const scdl = createSCDL({
+  clientID: SOUNDCLOUD_CLIENT_ID,
+  saveClientID: SAVE_CLIENT_ID.toLowerCase() === "true",
+  filePath: SCDL_CLIENT_ID_FILE
+});
 
 // ------------ Helpers ------------
 const wait = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -87,7 +99,16 @@ async function fetchAirtableRecord(recordId) {
   if (!r.ok) throw new Error(`Airtable GET ${r.status}`);
   return r.json();
 }
-async function downloadUrlToFile(url, destPath) {
+async function downloadUrlStreamToFile(readable, destPath) {
+  await new Promise((resolve, reject) => {
+    const ws = fs.createWriteStream(destPath);
+    readable.pipe(ws);
+    readable.on("error", reject);
+    ws.on("finish", resolve);
+    ws.on("error", reject);
+  });
+}
+async function downloadHttpToFile(url, destPath) {
   const r = await fetch(url);
   if (!r.ok) throw new Error(`Download ${r.status}`);
   await new Promise((resolve, reject) => {
@@ -97,6 +118,15 @@ async function downloadUrlToFile(url, destPath) {
     ws.on("finish", resolve);
     ws.on("error", reject);
   });
+}
+
+// Clean permalink (strip tracking query)
+function cleanPermalink(u) {
+  try {
+    const url = new URL(u);
+    url.search = ""; // remove ?si=... etc.
+    return url.toString();
+  } catch { return u; }
 }
 
 // ------------ MP3 normalization ------------
@@ -181,7 +211,8 @@ function aggregateMarks(marks) {
   const groups = new Map();
   for (const m of marks) {
     if (!m.match) continue;
-    const prev = groups.get(k = key(m)) || { title: m.title, artist: m.artist, maxScore: 0, hits: 0 };
+    const k = key(m);
+    const prev = groups.get(k) || { title: m.title, artist: m.artist, maxScore: 0, hits: 0 };
     prev.maxScore = Math.max(prev.maxScore, m.score || 0);
     prev.hits += 1;
     groups.set(k, prev);
@@ -236,133 +267,45 @@ async function runAcrDistributorStyle(filepath) {
   const positions = makeSweepPositions(dur);
   console.log("🧭 ACR sweep positions (sec):", positions);
   const marks = [];
-  let consecutive = 0;
+  let burst = 0;
   for (const pos of positions) {
     const m = await identifyWindow(filepath, pos);
     marks.push(m);
     console.log(m.match ? `🔎 ACR t≈${pos}s: ${m.title} – ${m.artist} [${m.score}]`
                         : `🔎 ACR t≈${pos}s: No match`);
-    consecutive++;
-    if (consecutive % 5 === 0) await wait(800); // gentle pacing every 5 calls
+    burst++;
+    if (burst % 5 === 0) await wait(800); // gentle pacing every 5 windows
   }
   return formatReport(marks, dur);
 }
 
-// ------------ SoundCloud (official API) ------------
-let scTokenCache = { access_token: null, refresh_token: null, expires_at: 0 };
+// ------------ SCDL download with retries ------------
+async function downloadTrackToFileWithRotation(permalinkUrl, destPath) {
+  const cleanUrl = cleanPermalink(permalinkUrl);
 
-async function getSoundCloudAccessToken() {
-  const now = Math.floor(Date.now() / 1000);
-  if (scTokenCache.access_token && now < scTokenCache.expires_at - 60) {
-    return scTokenCache.access_token;
-  }
-  if (scTokenCache.refresh_token) {
-    // Try refresh once
+  // Try 3 times. On 404/401, let SCDL rotate/refetch client_id and retry.
+  let lastErr;
+  for (let attempt = 1; attempt <= 3; attempt++) {
     try {
-      const r = await fetch("https://secure.soundcloud.com/oauth/token", {
-        method: "POST",
-        headers: { "accept": "application/json; charset=utf-8",
-                   "content-type": "application/x-www-form-urlencoded" },
-        body: new URLSearchParams({
-          grant_type: "refresh_token",
-          client_id: SC_CLIENT_ID,
-          client_secret: SC_CLIENT_SECRET,
-          refresh_token: scTokenCache.refresh_token,
-        })
-      });
-      if (r.ok) {
-        const j = await r.json();
-        scTokenCache.access_token = j.access_token;
-        scTokenCache.refresh_token = j.refresh_token || scTokenCache.refresh_token;
-        scTokenCache.expires_at = Math.floor(Date.now()/1000) + Math.floor(j.expires_in || 3600);
-        return scTokenCache.access_token;
+      const stream = await scdl.download(cleanUrl); // fork handles HLS/progressive selection
+      await downloadUrlStreamToFile(stream, destPath);
+      return "scdl";
+    } catch (e) {
+      lastErr = e;
+      const msg = String(e?.message || e);
+      const transient = /429|ECONNRESET|ETIMEDOUT|ENOTFOUND/i.test(msg);
+      const reauth = /401|403|404|client_id|unauthorized|forbidden/i.test(msg);
+      const backoff = 500 * attempt;
+
+      console.log(`⚠️ SCDL attempt ${attempt} failed: ${msg}`);
+      if (attempt < 3 && (transient || reauth)) {
+        await wait(backoff);
+        continue;
       }
-    } catch {}
+      break;
+    }
   }
-  // Client Credentials
-  const basic = Buffer.from(`${SC_CLIENT_ID}:${SC_CLIENT_SECRET}`).toString("base64");
-  const resp = await fetch("https://secure.soundcloud.com/oauth/token", {
-    method: "POST",
-    headers: {
-      "accept": "application/json; charset=utf-8",
-      "content-type": "application/x-www-form-urlencoded",
-      "authorization": `Basic ${basic}`
-    },
-    body: new URLSearchParams({ grant_type: "client_credentials" })
-  });
-  if (!resp.ok) throw new Error(`SoundCloud token HTTP ${resp.status}`);
-  const json = await resp.json();
-  scTokenCache.access_token = json.access_token;
-  scTokenCache.refresh_token = json.refresh_token || null;
-  scTokenCache.expires_at = Math.floor(Date.now()/1000) + Math.floor(json.expires_in || 3600);
-  return scTokenCache.access_token;
-}
-
-async function scFetch(pathname, init={}) {
-  const token = await getSoundCloudAccessToken();
-  const headers = Object.assign({}, init.headers, {
-    "accept": "application/json; charset=utf-8",
-    "authorization": `OAuth ${token}` // per docs
-  });
-  const url = /^https?:/.test(pathname) ? pathname : `https://api.soundcloud.com${pathname}`;
-  const r = await fetch(url, Object.assign({}, init, { headers }));
-  if (!r.ok) throw new Error(`SC ${pathname} -> ${r.status}`);
-  return r.json();
-}
-
-async function resolvePermalink(permalinkUrl) {
-  return scFetch(`/resolve?url=${encodeURIComponent(permalinkUrl)}`);
-}
-
-async function getStreamUrlForTrack(track) {
-  // Docs: GET /tracks/:id/stream => set of links with available transcodings
-  const id = track.id || track.urn || track.permalink || null;
-  if (!track.id) {
-    // If resolve returned URN only, fetch by URN → reference field with id
-    // Best effort: /resolve already returns id for public tracks; if not, try to pull by URN
-  }
-  const streams = await scFetch(`/tracks/${track.id}/stream`);
-  // Prefer progressive MP3; else HLS
-  const mp3 = streams?.transcodings?.find(t => /progressive/i.test(t.preset) || /progressive/i.test(t.format?.protocol || ""));
-  const hls = streams?.transcodings?.find(t => /hls/i.test(t.format?.protocol || ""));
-  return { mp3, hls };
-}
-
-async function downloadTrackToFile(permalinkUrl, destPath) {
-  const track = await resolvePermalink(permalinkUrl);
-  const { mp3, hls } = await getStreamUrlForTrack(track);
-
-  // Each transcoding has a URL to fetch signed playback URL(s)
-  async function fetchPlaybackUrl(transcoding) {
-    const token = await getSoundCloudAccessToken();
-    const r = await fetch(transcoding.url.startsWith("http") ? transcoding.url : `https://api.soundcloud.com${transcoding.url}`, {
-      headers: { "authorization": `OAuth ${token}`, "accept": "*/*" }
-    });
-    if (!r.ok) throw new Error(`SC stream URL ${r.status}`);
-    const j = await r.json();
-    return j.url; // actual media URL (mp3 or m3u8)
-  }
-
-  if (mp3) {
-    const mediaUrl = await fetchPlaybackUrl(mp3);
-    await downloadUrlToFile(mediaUrl, destPath);
-    return "mp3";
-  }
-  if (hls) {
-    const mediaUrl = await fetchPlaybackUrl(hls);
-    // Pull HLS and transcode/remux to MP3
-    await new Promise((resolve, reject) => {
-      ffmpeg(mediaUrl)
-        .audioCodec("libmp3lame")
-        .audioBitrate("192k")
-        .format("mp3")
-        .on("end", resolve)
-        .on("error", reject)
-        .save(destPath);
-    });
-    return "hls->mp3";
-  }
-  throw new Error("No playable transcodings available");
+  throw lastErr || new Error("Unknown SCDL failure");
 }
 
 // ------------ Health & static ------------
@@ -414,14 +357,14 @@ app.post("/webhook", async (req, res) => {
     console.log("🔗 publicUrl:", publicUrl);
     console.log("🎧 Download start:", soundcloud_url);
 
-    const how = await downloadTrackToFile(soundcloud_url, filepath);
+    const how = await downloadTrackToFileWithRotation(soundcloud_url, filepath);
     console.log(`✅ Downloaded via ${how}: ${filepath} (${fs.statSync(filepath).size} bytes)`);
 
     // Normalize then ACR
     await ensureGoodMp3(filepath);
     const acrReport = await runAcrDistributorStyle(filepath);
 
-    // Preflight URL
+    // Preflight URL for Airtable
     for (let i = 0; i < 5; i++) {
       const ok = await headOk(publicUrl);
       console.log(`🧪 HEAD ${publicUrl} -> ${ok ? "OK" : "FAIL"}`);
@@ -475,7 +418,7 @@ app.post("/webhook", async (req, res) => {
       }
     }
   } catch (err) {
-    console.error("❌ SoundCloud download/attach failed:", err?.message || err);
+    console.log("❌ SoundCloud download/attach failed:", err?.message || err);
     res.status(500).json({ error: "SoundCloud download/attach failed", details: String(err?.message || err) });
   } finally {
     activeJobs.delete(record_id);
@@ -501,7 +444,7 @@ app.post("/acr", async (req, res) => {
       (Array.isArray(fields["Raw Track Audio File"]) && fields["Raw Track Audio File"][0]?.url);
     if (!attUrl) return res.status(400).json({ error: "No attachment URL on record" });
 
-    await downloadUrlToFile(attUrl, tmpFile);
+    await downloadHttpToFile(attUrl, tmpFile);
     await ensureGoodMp3(tmpFile);
     const acrReport = await runAcrDistributorStyle(tmpFile);
 
