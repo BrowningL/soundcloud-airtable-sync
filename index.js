@@ -35,13 +35,10 @@ const ACR_ACCESS_SECRET = process.env.ACR_ACCESS_SECRET;
 const CLEANUP_POLL_SECONDS = Number(process.env.CLEANUP_POLL_SECONDS || 180);
 const CLEANUP_POLL_INTERVAL = Number(process.env.CLEANUP_POLL_INTERVAL || 10);
 
-// ACR sweep
-const ACR_WINDOW_SEC  = Number(process.env.ACR_WINDOW_SEC  || 12);
-const ACR_STEP_SEC    = Number(process.env.ACR_STEP_SEC    || 25);
-const ACR_MAX_REQ     = Number(process.env.ACR_MAX_REQUESTS|| 100);
-const ACR_MIN_SCORE   = Number(process.env.ACR_MIN_SCORE   || 70);
-const ACR_RETRIES     = Number(process.env.ACR_RETRIES     || 2);
-const ACR_BACKOFF_MS  = Number(process.env.ACR_BACKOFF_MS  || 400);
+// ACR scan config (retries/backoff retained from your service)
+const ACR_MIN_SCORE = Number(process.env.ACR_MIN_SCORE || 70); // not used by Python mode, kept for env compatibility
+const ACR_RETRIES = Number(process.env.ACR_RETRIES || 2);
+const ACR_BACKOFF_MS = Number(process.env.ACR_BACKOFF_MS || 400);
 
 // SCDL client-id caching
 const SAVE_CLIENT_ID = String(process.env.SAVE_CLIENT_ID || "true");
@@ -54,7 +51,7 @@ if (!fs.existsSync(DOWNLOAD_DIR)) fs.mkdirSync(DOWNLOAD_DIR, { recursive: true }
 // prevent duplicate concurrent work per record
 const activeJobs = new Set();
 
-// Create SCDL instance (auto‑discover client_id)
+// Create SCDL instance (auto-discover client_id)
 const scdl = createSCDL({
   clientID: SOUNDCLOUD_CLIENT_ID,
   saveClientID: SAVE_CLIENT_ID.toLowerCase() === "true",
@@ -143,7 +140,7 @@ async function ensureGoodMp3(filepath) {
   } catch {}
 }
 
-// ------------ ACR (distributor-style sweep) ------------
+// ------------ ACR (shared low-level: HTTP + cutting) ------------
 async function acrIdentifyBuffer(sampleBuf) {
   const http_method = "POST";
   const http_uri = "/v1/identify";
@@ -183,90 +180,110 @@ async function cutSegmentToBuffer(filepath, startSec, durSec) {
     out.on("data", (d) => chunks.push(d));
   });
 }
-function makeSweepPositions(durationSec) {
-  if (!durationSec || durationSec < 10) return [0];
-  const positions = new Set([0]);
-  const step = Math.max(ACR_STEP_SEC, ACR_WINDOW_SEC + 1);
-  while (positions.size < ACR_MAX_REQ - 1) {
-    const next = Math.min(durationSec - ACR_WINDOW_SEC, positions.size * step);
-    if (next <= 0 || next >= durationSec - 1) break;
-    positions.add(Math.floor(next));
-    if (next >= durationSec - ACR_WINDOW_SEC - 1) break;
+
+// ------------ ACR (Python-GUI-equivalent sweep) ------------
+const ACR_WINDOW_SECONDS_FIXED = 15; // exactly like recognizer.recognize_by_file(..., 15)
+
+function selectScanWindows(durationSec) {
+  // Returns [{ label, start }]
+  const windows = [];
+  // Intro (always)
+  windows.push({ label: "Intro", start: 0 });
+
+  // Quarter (dur > 40s)
+  if (durationSec > 40) {
+    windows.push({ label: "Quarter", start: Math.floor(durationSec / 4) });
   }
-  positions.add(Math.max(0, durationSec - ACR_WINDOW_SEC));
-  return Array.from(positions).sort((a, b) => a - b);
-}
-function aggregateMarks(marks) {
-  const key = (m) => `${m.title || "?"}__${m.artist || "?"}`;
-  const groups = new Map();
-  for (const m of marks) {
-    if (!m.match) continue;
-    const k = key(m);
-    const prev = groups.get(k) || { title: m.title, artist: m.artist, maxScore: 0, hits: 0 };
-    prev.maxScore = Math.max(prev.maxScore, m.score || 0);
-    prev.hits += 1;
-    groups.set(k, prev);
+
+  // Middle at 30s (dur > 60s)
+  if (durationSec > 60) {
+    windows.push({ label: "Middle", start: 30 });
   }
-  const best = Array.from(groups.values()).sort((a, b) => (b.hits - a.hits) || (b.maxScore - a.maxScore))[0] || null;
-  return { best, groups };
+
+  // Outro last 15s (always)
+  const outroStart = Math.max(durationSec - 15, 0);
+  windows.push({ label: "Outro", start: outroStart });
+
+  // Ensure unique & sorted
+  const seen = new Set();
+  return windows
+    .filter(w => {
+      const k = `${w.label}:${w.start}`;
+      if (seen.has(k)) return false;
+      seen.add(k);
+      return true;
+    })
+    .sort((a, b) => a.start - b.start);
 }
-function formatReport(marks, durationSec) {
-  const hits = marks.filter(m => m.match);
-  const header = hits.length
-    ? `✖ Matches detected — ${hits.length}/${marks.length} windows (duration ~${Math.round(durationSec)}s)`
-    : `✔ No matches detected — scanned ${marks.length} windows (duration ~${Math.round(durationSec)}s)`;
-  const lines = [header];
-  for (const m of marks) {
-    lines.push(m.match
-      ? `✅ [t≈${m.pos}s] ${m.title} – ${m.artist} [Score ${m.score}]`
-      : `❌ [t≈${m.pos}s] No match`
-    );
-  }
-  const { best } = aggregateMarks(marks);
-  if (best) lines.push(`\nTop candidate: ${best.title} – ${best.artist} (hits ${best.hits}, max score ${best.maxScore})`);
-  return lines.join("\n");
-}
-async function identifyWindow(filepath, pos) {
+
+async function identifySegment(filepath, startSec, label) {
   for (let attempt = 0; attempt <= ACR_RETRIES; attempt++) {
     try {
-      const buf = await cutSegmentToBuffer(filepath, pos, ACR_WINDOW_SEC);
+      const buf = await cutSegmentToBuffer(filepath, startSec, ACR_WINDOW_SECONDS_FIXED);
       const res = await acrIdentifyBuffer(buf);
+
+      // EXACT Python logic: any status.code === 0 + at least one music result = match
       if (res?.status?.code === 0 && Array.isArray(res?.metadata?.music) && res.metadata.music.length) {
         const best = res.metadata.music[0];
-        const score = Number(best.score ?? 0);
-        if (score >= ACR_MIN_SCORE) {
-          return { pos, match: true, title: best.title || "Unknown",
-                   artist: (best.artists && best.artists[0]?.name) || "Unknown", score };
-        }
+        const score = Number(best.score ?? 100); // Python defaults to 100 if missing
+        const title = best.title || "Unknown";
+        const artist = (best.artists && best.artists[0]?.name) || "Unknown";
+        const line = `✅ [${label}] ${title} – ${artist}  [Score ${score}]`;
+        return { match: true, line, label, start: startSec, end: startSec + ACR_WINDOW_SECONDS_FIXED, score };
       }
-      return { pos, match: false };
+
+      const line = `❌ [${label}] No match`;
+      return { match: false, line, label, start: startSec, end: startSec + ACR_WINDOW_SECONDS_FIXED, score: null };
     } catch (e) {
-      if (attempt < ACR_RETRIES) await wait(ACR_BACKOFF_MS * (attempt + 1));
-      else return { pos, match: false };
+      if (attempt < ACR_RETRIES) {
+        await wait(ACR_BACKOFF_MS * (attempt + 1));
+      } else {
+        // Final failure -> treat as "No match" (GUI just logs and continues)
+        const line = `❌ [${label}] No match`;
+        return { match: false, line, label, start: startSec, end: startSec + ACR_WINDOW_SECONDS_FIXED, score: null };
+      }
     }
   }
 }
-async function runAcrDistributorStyle(filepath) {
+
+async function runAcrPythonGuiStyle(filepath) {
   if (!ACR_HOST || !ACR_ACCESS_KEY || !ACR_ACCESS_SECRET) {
     console.log("ℹ️ ACR credentials not set; skipping ACR scan.");
     return null;
   }
+
+  // Duration like Python (recognizer.get_duration_ms_by_file)
   let dur = 0;
-  try { const meta = await mm.parseFile(filepath); dur = Math.round(meta?.format?.duration || 0); } catch {}
-  if (!dur) return "✖ Could not read duration";
-  const positions = makeSweepPositions(dur);
-  console.log("🧭 ACR sweep positions (sec):", positions);
-  const marks = [];
-  let burst = 0;
-  for (const pos of positions) {
-    const m = await identifyWindow(filepath, pos);
-    marks.push(m);
-    console.log(m.match ? `🔎 ACR t≈${pos}s: ${m.title} – ${m.artist} [${m.score}]`
-                        : `🔎 ACR t≈${pos}s: No match`);
-    burst++;
-    if (burst % 5 === 0) await wait(800);
+  try {
+    const meta = await mm.parseFile(filepath);
+    dur = Math.max(0, Math.round(meta?.format?.duration || 0));
+  } catch {}
+
+  if (!dur) {
+    return "⚠️  Could not read duration, skipping.";
+    // Note: In the GUI this sets a red cross; here we just return the message.
   }
-  return formatReport(marks, dur);
+
+  const windows = selectScanWindows(dur);
+
+  const results = [];
+  for (const w of windows) {
+    const r = await identifySegment(filepath, w.start, w.label);
+    console.log(r.line);
+    results.push(r);
+    await wait(150); // small pacing similar to GUI feel
+  }
+
+  // Big icon logic summarized: any match -> red cross; else green tick
+  const anyDetected = results.some(r => r.match);
+  const summary = anyDetected
+    ? "⛔ Fingerprint detected (red cross)"
+    : "✅ No matches detected (green tick)";
+
+  const lines = results.map(r => r.line);
+  lines.push("");
+  lines.push(summary);
+  return lines.join("\n");
 }
 
 // ------------ SoundCloud download: fork first, API-v2 fallback ------------
@@ -293,7 +310,7 @@ async function resolveWithClientId(permalinkUrl, clientId) {
   const url = `${base}?url=${encodeURIComponent(cleanPermalink(permalinkUrl))}&client_id=${encodeURIComponent(clientId)}&app_locale=en`;
   const r = await fetch(url, { headers: { "accept": "application/json" } });
   if (!r.ok) throw new Error(`resolve ${r.status}`);
-  return r.json(); // track JSON (should contain media.transcodings)
+  return r.json();
 }
 
 async function getMediaUrl(transcodingUrl, clientId) {
@@ -423,9 +440,9 @@ app.post("/webhook", async (req, res) => {
     const how = await downloadTrackResilient(soundcloud_url, filepath);
     console.log(`✅ Downloaded via ${how}: ${filepath} (${fs.statSync(filepath).size} bytes)`);
 
-    // Normalize then ACR
+    // Normalize then ACR (Python-GUI-equivalent)
     await ensureGoodMp3(filepath);
-    const acrReport = await runAcrDistributorStyle(filepath);
+    const acrReport = await runAcrPythonGuiStyle(filepath);
 
     // Preflight URL for Airtable
     for (let i = 0; i < 5; i++) {
@@ -500,6 +517,7 @@ app.post("/acr", async (req, res) => {
     const rec = await fetchAirtableRecord(record_id);
     const fields = rec.fields || {};
     if (!force && fields["ACR Report"]) {
+      activeJobs.delete(record_id);
       return res.json({ success: true, skipped: true, reason: "Report already present" });
     }
     const attUrl =
@@ -509,7 +527,7 @@ app.post("/acr", async (req, res) => {
 
     await httpToFile(attUrl, tmpFile);
     await ensureGoodMp3(tmpFile);
-    const acrReport = await runAcrDistributorStyle(tmpFile);
+    const acrReport = await runAcrPythonGuiStyle(tmpFile);
 
     const patchUrl = `https://api.airtable.com/v0/${BASE_ID}/${encodeURIComponent(TABLE)}/${record_id}`;
     const patchResp = await fetch(patchUrl, {
@@ -526,7 +544,7 @@ app.post("/acr", async (req, res) => {
     res.status(500).json({ error: String(e?.message || e) });
   } finally {
     activeJobs.delete(record_id);
-    if (fs.existsSync(tmpFile)) fs.unlinkSync(tmpFile);
+    try { if (fs.existsSync(tmpFile)) fs.unlinkSync(tmpFile); } catch {}
   }
 });
 
