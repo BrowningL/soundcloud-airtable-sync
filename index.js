@@ -35,7 +35,7 @@ const ACR_ACCESS_SECRET = process.env.ACR_ACCESS_SECRET;
 const CLEANUP_POLL_SECONDS = Number(process.env.CLEANUP_POLL_SECONDS || 180);
 const CLEANUP_POLL_INTERVAL = Number(process.env.CLEANUP_POLL_INTERVAL || 10);
 
-// ACR scan config (retries/backoff retained from your service)
+// ACR scan config (retries/backoff retained)
 const ACR_MIN_SCORE = Number(process.env.ACR_MIN_SCORE || 70); // not used by Python mode, kept for env compatibility
 const ACR_RETRIES = Number(process.env.ACR_RETRIES || 2);
 const ACR_BACKOFF_MS = Number(process.env.ACR_BACKOFF_MS || 400);
@@ -185,26 +185,13 @@ async function cutSegmentToBuffer(filepath, startSec, durSec) {
 const ACR_WINDOW_SECONDS_FIXED = 15; // exactly like recognizer.recognize_by_file(..., 15)
 
 function selectScanWindows(durationSec) {
-  // Returns [{ label, start }]
   const windows = [];
-  // Intro (always)
   windows.push({ label: "Intro", start: 0 });
-
-  // Quarter (dur > 40s)
-  if (durationSec > 40) {
-    windows.push({ label: "Quarter", start: Math.floor(durationSec / 4) });
-  }
-
-  // Middle at 30s (dur > 60s)
-  if (durationSec > 60) {
-    windows.push({ label: "Middle", start: 30 });
-  }
-
-  // Outro last 15s (always)
+  if (durationSec > 40) windows.push({ label: "Quarter", start: Math.floor(durationSec / 4) });
+  if (durationSec > 60) windows.push({ label: "Middle", start: 30 });
   const outroStart = Math.max(durationSec - 15, 0);
   windows.push({ label: "Outro", start: outroStart });
 
-  // Ensure unique & sorted
   const seen = new Set();
   return windows
     .filter(w => {
@@ -222,10 +209,9 @@ async function identifySegment(filepath, startSec, label) {
       const buf = await cutSegmentToBuffer(filepath, startSec, ACR_WINDOW_SECONDS_FIXED);
       const res = await acrIdentifyBuffer(buf);
 
-      // EXACT Python logic: any status.code === 0 + at least one music result = match
       if (res?.status?.code === 0 && Array.isArray(res?.metadata?.music) && res.metadata.music.length) {
         const best = res.metadata.music[0];
-        const score = Number(best.score ?? 100); // Python defaults to 100 if missing
+        const score = Number(best.score ?? 100);
         const title = best.title || "Unknown";
         const artist = (best.artists && best.artists[0]?.name) || "Unknown";
         const line = `✅ [${label}] ${title} – ${artist}  [Score ${score}]`;
@@ -235,10 +221,8 @@ async function identifySegment(filepath, startSec, label) {
       const line = `❌ [${label}] No match`;
       return { match: false, line, label, start: startSec, end: startSec + ACR_WINDOW_SECONDS_FIXED, score: null };
     } catch (e) {
-      if (attempt < ACR_RETRIES) {
-        await wait(ACR_BACKOFF_MS * (attempt + 1));
-      } else {
-        // Final failure -> treat as "No match" (GUI just logs and continues)
+      if (attempt < ACR_RETRIES) await wait(ACR_BACKOFF_MS * (attempt + 1));
+      else {
         const line = `❌ [${label}] No match`;
         return { match: false, line, label, start: startSec, end: startSec + ACR_WINDOW_SECONDS_FIXED, score: null };
       }
@@ -252,7 +236,6 @@ async function runAcrPythonGuiStyle(filepath) {
     return null;
   }
 
-  // Duration like Python (recognizer.get_duration_ms_by_file)
   let dur = 0;
   try {
     const meta = await mm.parseFile(filepath);
@@ -261,20 +244,17 @@ async function runAcrPythonGuiStyle(filepath) {
 
   if (!dur) {
     return "⚠️  Could not read duration, skipping.";
-    // Note: In the GUI this sets a red cross; here we just return the message.
   }
 
   const windows = selectScanWindows(dur);
-
   const results = [];
   for (const w of windows) {
     const r = await identifySegment(filepath, w.start, w.label);
     console.log(r.line);
     results.push(r);
-    await wait(150); // small pacing similar to GUI feel
+    await wait(150);
   }
 
-  // Big icon logic summarized: any match -> red cross; else green tick
   const anyDetected = results.some(r => r.match);
   const summary = anyDetected
     ? "⛔ Fingerprint detected (red cross)"
@@ -356,7 +336,6 @@ async function downloadViaApiV2(permalinkUrl, destPath, clientId) {
 async function downloadTrackResilient(permalinkUrl, destPath) {
   let lastErr;
 
-  // Try maintained fork first (it auto-rotates client_id internally)
   for (let i = 1; i <= 2; i++) {
     try {
       const how = await downloadViaSCDL(permalinkUrl, destPath);
@@ -368,7 +347,6 @@ async function downloadTrackResilient(permalinkUrl, destPath) {
     }
   }
 
-  // Fallback: use cached/manual client_id via api-v2
   for (let i = 1; i <= 2; i++) {
     const cid = readCachedClientId();
     if (!cid) break;
@@ -379,7 +357,6 @@ async function downloadTrackResilient(permalinkUrl, destPath) {
     } catch (e) {
       lastErr = e;
       console.log(`⚠️ api-v2 attempt ${i} failed: ${e?.message || e}`);
-      // nuke cached client_id to force fork to fetch a new one next time
       try { if (fs.existsSync(SCDL_CLIENT_ID_FILE)) fs.unlinkSync(SCDL_CLIENT_ID_FILE); } catch {}
       await wait(500 * i);
     }
@@ -421,9 +398,9 @@ app.head("/dl/:filename", (req, res) => {
   res.sendStatus(200);
 });
 
-// ------------ POST /webhook (SC → attach → ACR) ------------
+// ------------ POST /webhook (SC → attach → optional ACR via skip_acr) ------------
 app.post("/webhook", async (req, res) => {
-  const { record_id, soundcloud_url } = req.body || {};
+  const { record_id, soundcloud_url, skip_acr = false } = req.body || {};
   if (!record_id || !soundcloud_url) return res.status(400).json({ error: "Missing record_id or soundcloud_url" });
   if (activeJobs.has(record_id)) return res.status(202).json({ queued: true, message: "Job already in progress" });
   activeJobs.add(record_id);
@@ -440,11 +417,13 @@ app.post("/webhook", async (req, res) => {
     const how = await downloadTrackResilient(soundcloud_url, filepath);
     console.log(`✅ Downloaded via ${how}: ${filepath} (${fs.statSync(filepath).size} bytes)`);
 
-    // Normalize then ACR (Python-GUI-equivalent)
     await ensureGoodMp3(filepath);
-    const acrReport = await runAcrPythonGuiStyle(filepath);
 
-    // Preflight URL for Airtable
+    let acrReport = null;
+    if (!skip_acr) {
+      acrReport = await runAcrPythonGuiStyle(filepath);
+    }
+
     for (let i = 0; i < 5; i++) {
       const ok = await headOk(publicUrl);
       console.log(`🧪 HEAD ${publicUrl} -> ${ok ? "OK" : "FAIL"}`);
@@ -452,10 +431,9 @@ app.post("/webhook", async (req, res) => {
       await wait(500 * (i + 1));
     }
 
-    // Patch Airtable
     const airtableUrl = airtableRecordUrl(record_id);
     const fields = { "Raw Track Audio File": [{ url: publicUrl, filename }] };
-    if (acrReport) fields["ACR Report"] = acrReport;
+    if (!skip_acr && acrReport) fields["ACR Report"] = acrReport;
 
     const patchResp = await fetch(airtableUrl, {
       method: "PATCH",
@@ -471,14 +449,15 @@ app.post("/webhook", async (req, res) => {
     const returnedAtt = patchJson.fields?.["Raw Track Audio File"]?.[0] || null;
     res.json({
       success: true,
-      message: "File processed, ACR scanned, and pushed to Airtable.",
+      message: skip_acr
+        ? "File processed and pushed to Airtable (ACR skipped)."
+        : "File processed, ACR scanned, and pushed to Airtable.",
       sent_url: publicUrl,
       airtable_returned_url: returnedAtt?.url || null,
       airtable_returned: returnedAtt,
-      acr_report: acrReport || null
+      acr_report: skip_acr ? null : (acrReport || null)
     });
 
-    // Cleanup once Airtable rehosts
     const t0 = Date.now();
     while (Date.now() - t0 < CLEANUP_POLL_SECONDS * 1000) {
       await wait(CLEANUP_POLL_INTERVAL * 1000);
