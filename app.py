@@ -216,4 +216,294 @@ def parse_playcount(js: Dict[str, Any], track_id: str) -> Optional[int]:
                 if isinstance(pc, str):
                     s = pc.replace(",", "")
                     return int(s) if s.isdigit() else None
-                if isin
+                if isinstance(pc, (int, float)):
+                    return int(pc)
+                return None
+    except Exception:
+        pass
+    return None
+
+# ==========
+# TOKEN SNIFF (Playwright page traffic)
+# ==========
+
+async def sniff_tokens_in_browser() -> Tuple[str, Optional[str]]:
+    """
+    Opens open.spotify.com headlessly and waits for a pathfinder v2 request,
+    then captures Authorization (Bearer ...) and Client-Token headers.
+    """
+    async with async_playwright() as p:
+        browser = await p.chromium.launch(
+            headless=True,
+            args=[
+                "--no-sandbox",
+                "--disable-dev-shm-usage",
+                "--disable-blink-features=AutomationControlled",
+            ],
+        )
+        context = await browser.new_context(user_agent=USER_AGENT, locale="en-GB")
+        # Small stealth tweaks
+        await context.add_init_script("""
+            Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
+            window.chrome = { runtime: {} };
+            Object.defineProperty(navigator, 'languages', {get: () => ['en-GB','en']});
+            Object.defineProperty(navigator, 'platform', {get: () => 'Win32'});
+        """)
+        page = await context.new_page()
+
+        bearer: Optional[str] = None
+        client_tok: Optional[str] = None
+        got = asyncio.get_event_loop().create_future()
+
+        async def on_response(resp):
+            nonlocal bearer, client_tok
+            u = resp.url or ""
+            if "/pathfinder/v2/query" in u and resp.status == 200:
+                try:
+                    req = resp.request
+                    h = req.headers or {}
+                    auth = h.get("authorization") or h.get("Authorization")
+                    if auth and auth.lower().startswith("bearer "):
+                        bearer = auth.split(" ", 1)[1].strip()
+                        client_tok = h.get("client-token") or h.get("Client-Token")
+                        if not got.done():
+                            got.set_result(True)
+                except Exception:
+                    pass
+
+        page.on("response", on_response)
+
+        # Visit homepage, then hit a known album to force pathfinder calls
+        try:
+            await page.goto("https://open.spotify.com/", wait_until="domcontentloaded", timeout=35000)
+        except PWTimeout:
+            pass
+        await page.wait_for_timeout(800)
+        try:
+            # Taylor Swift – Reputation (random known album id just to trigger calls)
+            await page.goto("https://open.spotify.com/album/2noRn2Aes5aoNVsU6iWThc",
+                            wait_until="domcontentloaded", timeout=35000)
+            try:
+                await asyncio.wait_for(got, timeout=12.0)
+            except asyncio.TimeoutError:
+                # tiny scroll nudge then retry wait
+                try:
+                    await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+                    await asyncio.wait_for(got, timeout=6.0)
+                except asyncio.TimeoutError:
+                    pass
+        except Exception:
+            pass
+
+        await browser.close()
+        if not bearer:
+            raise RuntimeError("Did not observe Authorization header on any pathfinder v2 request.")
+        return bearer, client_tok
+
+# ==========
+# CALL PATHFINDER V2
+# ==========
+
+def call_album_v2_exact(
+    album_id: str,
+    web_bearer: str,
+    client_token: Optional[str],
+    op_name: Optional[str],
+    sha256_hash: str,
+    captured_vars: Dict[str, Any],
+    session: Optional[requests.Session] = None,
+) -> Dict[str, Any]:
+    s = session or requests.Session()
+    headers = {
+        "Authorization": f"Bearer {web_bearer}",
+        "User-Agent": USER_AGENT,
+        "Accept": "application/json, text/plain, */*",
+        "Referer": "https://open.spotify.com/",
+        "Origin": "https://open.spotify.com",
+        "App-Platform": "Web Player",
+        "content-type": "application/json",
+    }
+    if client_token:
+        headers["Client-Token"] = client_token
+
+    vars_copy = dict(captured_vars or {})
+    vars_copy["uri"] = f"spotify:album:{album_id}"
+    vars_copy.setdefault("offset", 0)
+    vars_copy.setdefault("limit", 50)
+
+    body = {
+        "variables": vars_copy,
+        "extensions": {"persistedQuery": {"version": 1, "sha256Hash": sha256_hash}},
+    }
+    if op_name:
+        body["operationName"] = op_name
+
+    errors = []
+    for host in PATHFINDER_HOSTS:
+        url = f"https://{host}/pathfinder/v2/query"
+        try:
+            r = s.post(url, headers=headers, json=body, timeout=30)
+            if r.status_code == 200:
+                return r.json()
+            errors.append(f"{host}:{r.status_code}")
+        except Exception as e:
+            errors.append(f"{host}: {e}")
+    raise RuntimeError("Pathfinder v2 failed: " + " | ".join(errors[:4]))
+
+# ==========
+# ORCHESTRATION
+# ==========
+
+async def run_sync():
+    """
+    One full run: read ISRCs, fetch counts, write Airtable, write CSV for logs.
+    """
+    # 1) Catalogue → ISRCs (from view)
+    cat_rows = airtable_list_catalogue_isrcs()
+    if not cat_rows:
+        print("No ISRCs found in the selected view.")
+        return
+
+    # Deduplicate by ISRC, keep first record id
+    seen = set()
+    isrc_order: List[str] = []
+    cat_id_by_isrc: Dict[str, str] = {}
+    for r in cat_rows:
+        isrc = r["isrc"]
+        if isrc not in seen:
+            seen.add(isrc)
+            isrc_order.append(isrc)
+            cat_id_by_isrc[isrc] = r["id"]
+
+    print(f"Running for {len(isrc_order)} unique ISRC(s).")
+
+    # 2) Get tokens
+    print("Sniffing Spotify tokens (Playwright headless)…")
+    web_bearer, client_token = await sniff_tokens_in_browser()
+
+    # 3) Spotify public token for search
+    search_bearer = get_search_token()
+
+    # 4) Resolve tracks/albums, then fetch playcounts per album
+    s = requests.Session()
+    track_album_by_isrc: Dict[str, Tuple[Optional[str], Optional[str], Optional[str]]] = {}
+    album_cache: Dict[str, Dict[str, Any]] = {}
+
+    # Resolve all ISRCs first
+    for isrc in isrc_order:
+        try:
+            found = search_track_by_isrc(isrc, search_bearer)
+            if found:
+                t_id, a_id, t_name = found
+                track_album_by_isrc[isrc] = (t_id, a_id, t_name)
+            else:
+                track_album_by_isrc[isrc] = (None, None, None)
+        except Exception:
+            track_album_by_isrc[isrc] = (None, None, None)
+
+    # Call v2 once per unique album
+    fetched_albums = set()
+    for isrc, triple in track_album_by_isrc.items():
+        t_id, a_id, _tname = triple
+        if not a_id or a_id in fetched_albums:
+            continue
+        time.sleep(SPOTIFY_SLEEP_BETWEEN_ALBUMS)
+        album_cache[a_id] = call_album_v2_exact(
+            album_id=a_id,
+            web_bearer=web_bearer,
+            client_token=client_token,
+            op_name=OPERATION_NAME,
+            sha256_hash=PERSISTED_HASH,
+            captured_vars=CAPTURED_VARS,
+            session=s,
+        )
+        fetched_albums.add(a_id)
+
+    # 5) Build CSV + Airtable rows
+    today_iso = date.today().isoformat()
+    csv_rows: List[Dict[str, Any]] = []
+    at_inserts: List[Dict[str, Any]] = []
+
+    for isrc in isrc_order:
+        t_id, a_id, t_name = track_album_by_isrc.get(isrc, (None, None, None))
+        row = {"isrc": isrc, "track_name": t_name, "play_count": None, "error": None}
+        if not a_id or not t_id:
+            row["error"] = "No album/track ID"
+            csv_rows.append(row)
+            continue
+
+        js = album_cache.get(a_id)
+        pc = parse_playcount(js, t_id)
+        if pc is None:
+            row["error"] = "Playcount missing"
+            csv_rows.append(row)
+            continue
+
+        row["play_count"] = pc
+        csv_rows.append(row)
+
+        prev_pc = airtable_get_previous_playcount(cat_id_by_isrc[isrc])
+        delta_val = pc - prev_pc if isinstance(prev_pc, int) else None
+
+        at_inserts.append({
+            "catalogue_rec_id": cat_id_by_isrc[isrc],
+            "date_iso": today_iso,
+            "playcount": pc,
+            "delta": delta_val,
+        })
+
+    # 6) Write CSV (helpful audit in logs/artifacts)
+    with open("playcounts.csv", "w", newline="", encoding="utf-8") as f:
+        w = csv.DictWriter(f, fieldnames=["isrc", "track_name", "play_count", "error"])
+        w.writeheader()
+        w.writerows(csv_rows)
+    print(f"Done. Wrote {len(csv_rows)} rows to playcounts.csv")
+
+    # 7) Insert into Airtable (batches of 10)
+    if at_inserts:
+        print(f"Inserting {len(at_inserts)} rows into '{PLAYCOUNTS_TABLE}'…")
+        airtable_batch_insert_playcounts(at_inserts)
+        print("Airtable inserts complete.")
+
+    # Log a short summary to stdout
+    for r in csv_rows:
+        print(r)
+
+# ==========
+# FLASK APP (Webhook to trigger run)
+# ==========
+
+app = Flask(__name__)
+
+@app.get("/health")
+def health():
+    return {"ok": True}, 200
+
+@app.post("/run")
+def trigger_run():
+    """
+    POST /run
+      - query ?async=1 to return immediately and run in background
+      - otherwise blocks until the job completes
+    """
+    run_async = request.args.get("async", "0") in ("1", "true", "yes")
+
+    def worker():
+        asyncio.run(run_sync())
+
+    if run_async:
+        threading.Thread(target=worker, daemon=True).start()
+        return jsonify({"status": "started"}), 202
+    else:
+        asyncio.run(run_sync())
+        return jsonify({"status": "ok"}), 200
+
+# ==========
+# ENTRYPOINT
+# ==========
+
+if __name__ == "__main__":
+    # If Railway is starting this process as a web service:
+    #   Expose Flask so Airtable can POST /run daily.
+    port = int(os.environ.get("PORT", "3000"))
+    app.run(host="0.0.0.0", port=port)
