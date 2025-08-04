@@ -30,7 +30,7 @@ PLAYCOUNTS_DATE_FIELD = "Date"
 PLAYCOUNTS_COUNT_FIELD = "Playcount"
 PLAYCOUNTS_DELTA_FIELD = "Delta"
 
-AIRTABLE_SLEEP_BETWEEN_WRITES = 0.2    # seconds between Airtable batch writes
+AIRTABLE_SLEEP_BETWEEN_WRITES = 0.2    # seconds between Airtable writes
 SPOTIFY_SLEEP_BETWEEN_ALBUMS  = 0.15   # seconds between album calls
 
 # Spotify (public API for ISRC search)
@@ -67,7 +67,6 @@ def _at_headers_bearer() -> Dict[str, str]:
     return {"Authorization": f"Bearer {AT_API_KEY}"}
 
 def _at_base_url(table_name: str) -> str:
-    # Airtable expects URL-encoded table name if it has spaces
     return f"https://api.airtable.com/v0/{AT_BASE_ID}/{requests.utils.quote(table_name)}"
 
 def airtable_list_catalogue_isrcs() -> List[Dict[str, Any]]:
@@ -100,13 +99,26 @@ def airtable_list_catalogue_isrcs() -> List[Dict[str, Any]]:
             break
     return out
 
-def airtable_get_previous_playcount(catalogue_rec_id: str) -> Optional[int]:
+def airtable_find_today_record(catalogue_rec_id: str, today_iso: str) -> Optional[str]:
     """
-    Reads latest (by Date desc) playcount row for a given linked Catalogue record.
+    Returns recordId of today's row for this linked Catalogue record, or None if not found.
+    Uses IS_SAME({Date}, 'YYYY-MM-DD', 'day') to match the day exactly.
     """
     url = _at_base_url(PLAYCOUNTS_TABLE)
-    # Formula finds rows whose linked field (array) contains the Catalogue record id
-    formula = f"SEARCH('{catalogue_rec_id}', ARRAYJOIN({{{{{ {PLAYCOUNTS_LINK_FIELD} }}}}}))"
+    formula = f"AND(SEARCH('{catalogue_rec_id}', ARRAYJOIN({{{{{ {PLAYCOUNTS_LINK_FIELD} }}}}})), IS_SAME({{{{{ {PLAYCOUNTS_DATE_FIELD} }}}}}, '{today_iso}', 'day'))"
+    params = {"filterByFormula": formula, "pageSize": 1}
+    r = requests.get(url, headers=_at_headers_bearer(), params=params, timeout=30)
+    if r.status_code != 200:
+        return None
+    recs = r.json().get("records", [])
+    return recs[0]["id"] if recs else None
+
+def airtable_get_previous_playcount_before(catalogue_rec_id: str, before_iso: str) -> Optional[int]:
+    """
+    Returns the most recent playcount strictly before 'before_iso' (YYYY-MM-DD).
+    """
+    url = _at_base_url(PLAYCOUNTS_TABLE)
+    formula = f"AND(SEARCH('{catalogue_rec_id}', ARRAYJOIN({{{{{ {PLAYCOUNTS_LINK_FIELD} }}}}})), {{{{{ {PLAYCOUNTS_DATE_FIELD} }}}}} < '{before_iso}')"
     params = {
         "filterByFormula": formula,
         "pageSize": 1,
@@ -116,46 +128,49 @@ def airtable_get_previous_playcount(catalogue_rec_id: str) -> Optional[int]:
     r = requests.get(url, headers=_at_headers_bearer(), params=params, timeout=30)
     if r.status_code != 200:
         return None
-    records = r.json().get("records", [])
-    if not records:
+    recs = r.json().get("records", [])
+    if not recs:
         return None
-    fields = records[0].get("fields", {}) or {}
-    val = fields.get(PLAYCOUNTS_COUNT_FIELD)
+    val = (recs[0].get("fields") or {}).get(PLAYCOUNTS_COUNT_FIELD)
     try:
         return int(val)
     except Exception:
         return None
 
-def airtable_batch_insert_playcounts(rows: List[Dict[str, Any]]) -> None:
+def airtable_upsert_playcount(catalogue_rec_id: str, date_iso: str, playcount: int) -> None:
     """
-    Inserts rows into SpotifyPlaycounts. Each row must contain:
-      - "catalogue_rec_id": str (linked record id)
-      - "date_iso": str (YYYY-MM-DD)
-      - "playcount": int
-      - "delta": Optional[int]
+    Idempotent per-day write:
+      - If today's record exists → PATCH it with new Playcount & recomputed Delta (vs latest before today).
+      - Else → POST a new row with those fields.
     """
-    if not rows:
-        return
     url = _at_base_url(PLAYCOUNTS_TABLE)
+    # Delta computed vs previous (strictly before today)
+    prev_pc = airtable_get_previous_playcount_before(catalogue_rec_id, date_iso)
+    delta_val = playcount - prev_pc if isinstance(prev_pc, int) else None
 
-    def to_record(r: Dict[str, Any]) -> Dict[str, Any]:
-        fields = {
-            PLAYCOUNTS_LINK_FIELD: [r["catalogue_rec_id"]],
-            PLAYCOUNTS_DATE_FIELD: r["date_iso"],
-            PLAYCOUNTS_COUNT_FIELD: r["playcount"],
-        }
-        if r.get("delta") is not None:
-            fields[PLAYCOUNTS_DELTA_FIELD] = r["delta"]
-        return {"fields": fields}
+    existing_id = airtable_find_today_record(catalogue_rec_id, date_iso)
+    fields = {
+        PLAYCOUNTS_LINK_FIELD: [catalogue_rec_id],  # link stays present even on PATCH
+        PLAYCOUNTS_DATE_FIELD: date_iso,
+        PLAYCOUNTS_COUNT_FIELD: playcount,
+    }
+    if delta_val is not None:
+        fields[PLAYCOUNTS_DELTA_FIELD] = delta_val
 
-    # Chunk insert (<=10 records/request recommended)
-    for i in range(0, len(rows), 10):
-        chunk = rows[i:i+10]
-        body = {"records": [to_record(x) for x in chunk]}
+    if existing_id:
+        # PATCH existing
+        body = {"records": [{"id": existing_id, "fields": fields}], "typecast": False}
+        resp = requests.patch(url, headers=_at_headers_json(), data=json.dumps(body), timeout=30)
+        if resp.status_code not in (200, 201):
+            raise RuntimeError(f"Airtable UPDATE failed: {resp.status_code}: {resp.text[:300]}")
+    else:
+        # POST create
+        body = {"records": [{"fields": fields}], "typecast": False}
         resp = requests.post(url, headers=_at_headers_json(), data=json.dumps(body), timeout=30)
         if resp.status_code not in (200, 201):
             raise RuntimeError(f"Airtable INSERT failed: {resp.status_code}: {resp.text[:300]}")
-        time.sleep(AIRTABLE_SLEEP_BETWEEN_WRITES)
+
+    time.sleep(AIRTABLE_SLEEP_BETWEEN_WRITES)
 
 # ==========
 # SPOTIFY HELPERS
@@ -177,7 +192,6 @@ def search_track_by_isrc(isrc: str, bearer: str) -> Optional[Tuple[str, str, str
     params = {"q": f"isrc:{isrc}", "type": "track", "limit": 1}
     r = requests.get("https://api.spotify.com/v1/search", headers=headers, params=params, timeout=30)
     if r.status_code != 200:
-        # Treat as not found; log in calling layer if needed
         return None
     items = (r.json().get("tracks") or {}).get("items") or []
     if not items:
@@ -186,12 +200,11 @@ def search_track_by_isrc(isrc: str, bearer: str) -> Optional[Tuple[str, str, str
     return t["id"], t["album"]["id"], t["name"]
 
 def parse_playcount(js: Dict[str, Any], track_id: str) -> Optional[int]:
-    # v2 schema (albumUnion -> tracksV2 -> items -> track.playcount)
+    # v2 schema
     try:
         items = js["data"]["albumUnion"]["tracksV2"]["items"]
         for it in items:
             tr = it.get("track") or {}
-            # track id may appear as id or in uri
             if track_id in (tr.get("id"), (tr.get("uri") or "").split(":")[-1]):
                 pc = tr.get("playcount")
                 if pc is None:
@@ -204,7 +217,7 @@ def parse_playcount(js: Dict[str, Any], track_id: str) -> Optional[int]:
                 return None
     except Exception:
         pass
-    # fallback: older schema (rare now)
+    # fallback: older schema
     try:
         items = js["data"]["album"]["tracks"]["items"]
         for it in items:
@@ -242,7 +255,6 @@ async def sniff_tokens_in_browser() -> Tuple[str, Optional[str]]:
             ],
         )
         context = await browser.new_context(user_agent=USER_AGENT, locale="en-GB")
-        # Small stealth tweaks
         await context.add_init_script("""
             Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
             window.chrome = { runtime: {} };
@@ -273,20 +285,17 @@ async def sniff_tokens_in_browser() -> Tuple[str, Optional[str]]:
 
         page.on("response", on_response)
 
-        # Visit homepage, then hit a known album to force pathfinder calls
         try:
             await page.goto("https://open.spotify.com/", wait_until="domcontentloaded", timeout=35000)
         except PWTimeout:
             pass
         await page.wait_for_timeout(800)
         try:
-            # Taylor Swift – Reputation (random known album id just to trigger calls)
             await page.goto("https://open.spotify.com/album/2noRn2Aes5aoNVsU6iWThc",
                             wait_until="domcontentloaded", timeout=35000)
             try:
                 await asyncio.wait_for(got, timeout=12.0)
             except asyncio.TimeoutError:
-                # tiny scroll nudge then retry wait
                 try:
                     await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
                     await asyncio.wait_for(got, timeout=6.0)
@@ -356,9 +365,9 @@ def call_album_v2_exact(
 
 async def run_sync():
     """
-    One full run: read ISRCs, fetch counts, write Airtable, write CSV for logs.
+    One full run: read ISRCs, fetch counts, upsert Airtable (idempotent per day), write CSV for logs.
     """
-    # 1) Catalogue → ISRCs (from view)
+    # 1) Catalogue → ISRCs
     cat_rows = airtable_list_catalogue_isrcs()
     if not cat_rows:
         print("No ISRCs found in the selected view.")
@@ -419,10 +428,9 @@ async def run_sync():
         )
         fetched_albums.add(a_id)
 
-    # 5) Build CSV + Airtable rows
+    # 5) Build CSV + Airtable UPSERTS (idempotent)
     today_iso = date.today().isoformat()
     csv_rows: List[Dict[str, Any]] = []
-    at_inserts: List[Dict[str, Any]] = []
 
     for isrc in isrc_order:
         t_id, a_id, t_name = track_album_by_isrc.get(isrc, (None, None, None))
@@ -442,28 +450,16 @@ async def run_sync():
         row["play_count"] = pc
         csv_rows.append(row)
 
-        prev_pc = airtable_get_previous_playcount(cat_id_by_isrc[isrc])
-        delta_val = pc - prev_pc if isinstance(prev_pc, int) else None
+        # UPSERT today's row (overwrites if already exists)
+        cat_rec_id = cat_id_by_isrc[isrc]
+        airtable_upsert_playcount(cat_rec_id, today_iso, pc)
 
-        at_inserts.append({
-            "catalogue_rec_id": cat_id_by_isrc[isrc],
-            "date_iso": today_iso,
-            "playcount": pc,
-            "delta": delta_val,
-        })
-
-    # 6) Write CSV (helpful audit in logs/artifacts)
+    # 6) Write CSV (audit/log convenience)
     with open("playcounts.csv", "w", newline="", encoding="utf-8") as f:
         w = csv.DictWriter(f, fieldnames=["isrc", "track_name", "play_count", "error"])
         w.writeheader()
         w.writerows(csv_rows)
     print(f"Done. Wrote {len(csv_rows)} rows to playcounts.csv")
-
-    # 7) Insert into Airtable (batches of 10)
-    if at_inserts:
-        print(f"Inserting {len(at_inserts)} rows into '{PLAYCOUNTS_TABLE}'…")
-        airtable_batch_insert_playcounts(at_inserts)
-        print("Airtable inserts complete.")
 
     # Log a short summary to stdout
     for r in csv_rows:
@@ -503,7 +499,5 @@ def trigger_run():
 # ==========
 
 if __name__ == "__main__":
-    # If Railway is starting this process as a web service:
-    #   Expose Flask so Airtable can POST /run daily.
     port = int(os.environ.get("PORT", "3000"))
     app.run(host="0.0.0.0", port=port)
