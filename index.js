@@ -181,8 +181,8 @@ async function cutSegmentToBuffer(filepath, startSec, durSec) {
   });
 }
 
-// ------------ ACR (Python-GUI-equivalent sweep) ------------
-const ACR_WINDOW_SECONDS_FIXED = 15; // exactly like recognizer.recognize_by_file(..., 15)
+// ------------ ACR (Python-GUI-equivalent sweep with header summary) ------------
+const ACR_WINDOW_SECONDS_FIXED = 15; // 15s per window
 
 function selectScanWindows(durationSec) {
   const windows = [];
@@ -255,15 +255,15 @@ async function runAcrPythonGuiStyle(filepath) {
     await wait(150);
   }
 
+  // Header summary first, no bracketed tail note
   const anyDetected = results.some(r => r.match);
-  const summary = anyDetected
-    ? "⛔ Fingerprint detected (red cross)"
-    : "✅ No matches detected (green tick)";
+  const header = anyDetected ? "⛔ Fingerprint detected" : "✅ No matches detected";
 
+  // Lines exactly as per window logs
   const lines = results.map(r => r.line);
-  lines.push("");
-  lines.push(summary);
-  return lines.join("\n");
+
+  // Final report: header first, then all window lines (no blank line)
+  return [header, ...lines].join("\n");
 }
 
 // ------------ SoundCloud download: fork first, API-v2 fallback ------------
