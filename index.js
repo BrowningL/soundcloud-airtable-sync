@@ -35,7 +35,7 @@ const ACR_ACCESS_SECRET = process.env.ACR_ACCESS_SECRET;
 const CLEANUP_POLL_SECONDS = Number(process.env.CLEANUP_POLL_SECONDS || 180);
 const CLEANUP_POLL_INTERVAL = Number(process.env.CLEANUP_POLL_INTERVAL || 10);
 
-// ACR scan config (retries/backoff retained)
+// ACR scan config
 const ACR_MIN_SCORE = Number(process.env.ACR_MIN_SCORE || 70); // not used by Python mode, kept for env compatibility
 const ACR_RETRIES = Number(process.env.ACR_RETRIES || 2);
 const ACR_BACKOFF_MS = Number(process.env.ACR_BACKOFF_MS || 400);
@@ -60,8 +60,6 @@ const scdl = createSCDL({
 
 // ------------ Helpers ------------
 const wait = (ms) => new Promise((r) => setTimeout(r, ms));
-const airtableRecordUrl = (recordId) =>
-  `https://api.airtable.com/v0/${BASE_ID}/${encodeURIComponent(TABLE)}/${recordId}`;
 
 function normalizeHost(h) {
   if (!h) return null;
@@ -92,12 +90,18 @@ function serveDownloadHeaders(res, filename, stat) {
   res.setHeader("Content-Disposition", `attachment; filename="${filename}"`);
   res.setHeader("Cache-Control", "public, max-age=300");
 }
-async function fetchAirtableRecord(recordId) {
-  const url = `https://api.airtable.com/v0/${BASE_ID}/${encodeURIComponent(TABLE)}/${recordId}`;
+
+async function fetchAirtableRecord(recordId, opts = {}) {
+  const baseId = opts.baseId || BASE_ID;
+  const tableName = opts.tableName || TABLE;
+  const url = `https://api.airtable.com/v0/${baseId}/${encodeURIComponent(tableName)}/${recordId}`;
   const r = await fetch(url, { headers: { Authorization: `Bearer ${AIRTABLE_API_KEY}` } });
   if (!r.ok) throw new Error(`Airtable GET ${r.status}`);
   return r.json();
 }
+const airtableRecordUrl = (recordId, opts = {}) =>
+  `https://api.airtable.com/v0/${opts.baseId || BASE_ID}/${encodeURIComponent(opts.tableName || TABLE)}/${recordId}`;
+
 async function streamToFile(readable, destPath) {
   await new Promise((resolve, reject) => {
     const ws = fs.createWriteStream(destPath);
@@ -140,7 +144,7 @@ async function ensureGoodMp3(filepath) {
   } catch {}
 }
 
-// ------------ ACR (shared low-level: HTTP + cutting) ------------
+// ------------ ACR (low-level) ------------
 async function acrIdentifyBuffer(sampleBuf) {
   const http_method = "POST";
   const http_uri = "/v1/identify";
@@ -181,9 +185,8 @@ async function cutSegmentToBuffer(filepath, startSec, durSec) {
   });
 }
 
-// ------------ ACR (Python-GUI-equivalent sweep with header summary) ------------
+// ------------ ACR (window sweep) ------------
 const ACR_WINDOW_SECONDS_FIXED = 15; // 15s per window
-
 function selectScanWindows(durationSec) {
   const windows = [];
   windows.push({ label: "Intro", start: 0 });
@@ -194,15 +197,9 @@ function selectScanWindows(durationSec) {
 
   const seen = new Set();
   return windows
-    .filter(w => {
-      const k = `${w.label}:${w.start}`;
-      if (seen.has(k)) return false;
-      seen.add(k);
-      return true;
-    })
+    .filter(w => { const k = `${w.label}:${w.start}`; if (seen.has(k)) return false; seen.add(k); return true; })
     .sort((a, b) => a.start - b.start);
 }
-
 async function identifySegment(filepath, startSec, label) {
   for (let attempt = 0; attempt <= ACR_RETRIES; attempt++) {
     try {
@@ -229,22 +226,18 @@ async function identifySegment(filepath, startSec, label) {
     }
   }
 }
-
 async function runAcrPythonGuiStyle(filepath) {
   if (!ACR_HOST || !ACR_ACCESS_KEY || !ACR_ACCESS_SECRET) {
     console.log("ℹ️ ACR credentials not set; skipping ACR scan.");
     return null;
   }
-
   let dur = 0;
   try {
     const meta = await mm.parseFile(filepath);
     dur = Math.max(0, Math.round(meta?.format?.duration || 0));
   } catch {}
 
-  if (!dur) {
-    return "⚠️  Could not read duration, skipping.";
-  }
+  if (!dur) return "⚠️  Could not read duration, skipping.";
 
   const windows = selectScanWindows(dur);
   const results = [];
@@ -255,18 +248,13 @@ async function runAcrPythonGuiStyle(filepath) {
     await wait(150);
   }
 
-  // Header summary first, no bracketed tail note
   const anyDetected = results.some(r => r.match);
   const header = anyDetected ? "⛔ Fingerprint detected" : "✅ No matches detected";
-
-  // Lines exactly as per window logs
   const lines = results.map(r => r.line);
-
-  // Final report: header first, then all window lines (no blank line)
   return [header, ...lines].join("\n");
 }
 
-// ------------ SoundCloud download: fork first, API-v2 fallback ------------
+// ------------ SoundCloud download helpers ------------
 function readCachedClientId() {
   if (SOUNDCLOUD_CLIENT_ID) return SOUNDCLOUD_CLIENT_ID;
   try {
@@ -277,14 +265,12 @@ function readCachedClientId() {
   } catch {}
   return null;
 }
-
 async function downloadViaSCDL(permalinkUrl, destPath) {
   const clean = cleanPermalink(permalinkUrl);
   const stream = await scdl.download(clean);
   await streamToFile(stream, destPath);
   return "scdl";
 }
-
 async function resolveWithClientId(permalinkUrl, clientId) {
   const base = "https://api-v2.soundcloud.com/resolve";
   const url = `${base}?url=${encodeURIComponent(cleanPermalink(permalinkUrl))}&client_id=${encodeURIComponent(clientId)}&app_locale=en`;
@@ -292,7 +278,6 @@ async function resolveWithClientId(permalinkUrl, clientId) {
   if (!r.ok) throw new Error(`resolve ${r.status}`);
   return r.json();
 }
-
 async function getMediaUrl(transcodingUrl, clientId) {
   const u = transcodingUrl.startsWith("http") ? transcodingUrl : `https://api-v2.soundcloud.com${transcodingUrl}`;
   const r = await fetch(`${u}${u.includes("?") ? "&" : "?"}client_id=${encodeURIComponent(clientId)}`, {
@@ -303,7 +288,6 @@ async function getMediaUrl(transcodingUrl, clientId) {
   if (!j || !j.url) throw new Error("no media url");
   return j.url;
 }
-
 async function downloadViaApiV2(permalinkUrl, destPath, clientId) {
   const track = await resolveWithClientId(permalinkUrl, clientId);
   const trans = (track?.media?.transcodings) || [];
@@ -332,7 +316,6 @@ async function downloadViaApiV2(permalinkUrl, destPath, clientId) {
   }
   throw new Error("no playable transcodings");
 }
-
 async function downloadTrackResilient(permalinkUrl, destPath) {
   let lastErr;
 
@@ -484,46 +467,158 @@ app.post("/webhook", async (req, res) => {
   }
 });
 
-// ------------ POST /acr (run ACR on existing attachment) ------------
+// ------------ POST /acr (run ACR on existing attachment; recover if stale) ------------
 app.post("/acr", async (req, res) => {
-  const { record_id, attachment_url, force = false } = req.body || {};
+  const { record_id, attachment_url, force = false, table_name, base_id } = req.body || {};
   if (!record_id) return res.status(400).json({ error: "Missing record_id" });
   if (activeJobs.has(record_id)) return res.status(202).json({ queued: true });
   activeJobs.add(record_id);
 
-  const tmpFile = path.join(DOWNLOAD_DIR, `acr-${record_id}.mp3`);
+  const opts = { baseId: base_id || BASE_ID, tableName: table_name || TABLE };
+
+  // Working file path (will change if we rehydrate)
+  let workFile = path.join(DOWNLOAD_DIR, `acr-${record_id}.mp3`);
+  let cleanupPaths = [];
+  let rehydratedFromSource = false;
+  let usedUrl = null;
+
   try {
-    const rec = await fetchAirtableRecord(record_id);
+    // Fetch record (lets us fall back to source fields if needed)
+    const rec = await fetchAirtableRecord(record_id, opts);
     const fields = rec.fields || {};
     if (!force && fields["ACR Report"]) {
       activeJobs.delete(record_id);
       return res.json({ success: true, skipped: true, reason: "Report already present" });
     }
-    const attUrl =
-      attachment_url ||
+
+    // Use passed attachment_url else Airtable attachment
+    let attUrl = attachment_url ||
       (Array.isArray(fields["Raw Track Audio File"]) && fields["Raw Track Audio File"][0]?.url);
-    if (!attUrl) return res.status(400).json({ error: "No attachment URL on record" });
 
-    await httpToFile(attUrl, tmpFile);
-    await ensureGoodMp3(tmpFile);
-    const acrReport = await runAcrPythonGuiStyle(tmpFile);
+    if (!attUrl) {
+      return res.status(400).json({ error: "No attachment URL on record" });
+    }
 
-    const patchUrl = `https://api.airtable.com/v0/${BASE_ID}/${encodeURIComponent(TABLE)}/${record_id}`;
+    // Resolve host and decide if attachment is likely our ephemeral link
+    const ourHost = normalizeHost(HOST);
+    const attIsOurHost = (() => {
+      try { return !!(ourHost && normalizeHost(attUrl).startsWith(ourHost)); } catch { return false; }
+    })();
+
+    // Try to download the attachment first
+    try {
+      usedUrl = attUrl;
+      await httpToFile(attUrl, workFile);
+      cleanupPaths.push(workFile);
+    } catch (e) {
+      console.log(`⚠️ Attachment download failed (${attUrl}): ${e?.message || e}`);
+      if (attIsOurHost) {
+        // Fallback: re-download from source fields
+        const sourceUrl =
+          fields["Input Track Link"] ||
+          (typeof fields["Source Links"] === "string" ? fields["Source Links"].split(/\s+/)[0] : null);
+
+        if (!sourceUrl) {
+          throw new Error(`Attachment dead and no source link available on record`);
+        }
+
+        // Redownload via SoundCloud pipeline
+        workFile = path.join(DOWNLOAD_DIR, `${record_id}.mp3`);
+        console.log(`♻️ Rehydrating from source: ${sourceUrl}`);
+        await downloadTrackResilient(sourceUrl, workFile);
+        await ensureGoodMp3(workFile);
+        cleanupPaths.push(workFile);
+        rehydratedFromSource = true;
+      } else {
+        throw e;
+      }
+    }
+
+    // If file was from attachment and we haven't normalized yet, normalize
+    if (!rehydratedFromSource && fs.existsSync(workFile)) {
+      await ensureGoodMp3(workFile);
+    }
+
+    // Run ACR
+    const acrReport = await runAcrPythonGuiStyle(workFile);
+
+    // Prepare Airtable update
+    const patchUrl = airtableRecordUrl(record_id, opts);
+    const update = {};
+    if (typeof acrReport === "string") update["ACR Report"] = acrReport;
+
+    // If we rehydrated, also reattach so Airtable re-hosts (then we can safely clean up)
+    let attachFilename = `${record_id}.mp3`;
+    let publicUrl = null;
+    if (rehydratedFromSource) {
+      const baseHost = resolveHostUrl(req);
+      publicUrl = ensureHttpsUrl(`${baseHost}/dl/${encodeURIComponent(attachFilename)}`);
+      // ensure file has that name
+      if (!workFile.endsWith(attachFilename)) {
+        const newPath = path.join(DOWNLOAD_DIR, attachFilename);
+        fs.copyFileSync(workFile, newPath);
+        cleanupPaths.push(newPath);
+        workFile = newPath;
+      }
+      // Make sure the file is actually served before patch
+      for (let i = 0; i < 5; i++) {
+        const ok = await headOk(publicUrl);
+        if (ok) break;
+        await wait(500 * (i + 1));
+      }
+      update["Raw Track Audio File"] = [{ url: publicUrl, filename: attachFilename }];
+    }
+
+    // Send patch
     const patchResp = await fetch(patchUrl, {
       method: "PATCH",
       headers: { Authorization: `Bearer ${AIRTABLE_API_KEY}`, "Content-Type": "application/json" },
-      body: JSON.stringify({ fields: { "ACR Report": acrReport } }),
+      body: JSON.stringify({ fields: update }),
     });
     const patchJson = await patchResp.json();
-    if (!patchResp.ok) return res.status(500).json({ error: "Airtable update failed", details: patchJson });
+    if (!patchResp.ok) {
+      return res.status(500).json({ error: "Airtable update failed", details: patchJson });
+    }
 
-    res.json({ success: true, wrote_report: true, acr_report: acrReport });
+    // If reattached, poll until Airtable copies to airtableusercontent, then cleanup local
+    if (rehydratedFromSource && publicUrl) {
+      const t0 = Date.now();
+      while (Date.now() - t0 < CLEANUP_POLL_SECONDS * 1000) {
+        await wait(CLEANUP_POLL_INTERVAL * 1000);
+        try {
+          const pollResp = await fetch(patchUrl, { headers: { Authorization: `Bearer ${AIRTABLE_API_KEY}` } });
+          const pollJson = await pollResp.json();
+          const att = pollJson.fields?.["Raw Track Audio File"];
+          const currentUrl = att?.[0]?.url || null;
+          console.log("🔎 Current attachment URL:", currentUrl);
+          if (currentUrl && currentUrl.includes("airtableusercontent")) {
+            // Safe to delete
+            for (const p of cleanupPaths) { try { if (fs.existsSync(p)) fs.unlinkSync(p); } catch {} }
+            console.log(`🧹 Cleaned up rehydrated file(s) for ${record_id}`);
+            break;
+          }
+        } catch (e) {
+          console.error("⚠️ Polling error:", e);
+        }
+      }
+    }
+
+    res.json({
+      success: true,
+      wrote_report: typeof acrReport === "string",
+      acr_report: acrReport || null,
+      attachment_used: usedUrl,
+      rehydrated_from_source: rehydratedFromSource
+    });
   } catch (e) {
     console.error("ACR route error:", e);
     res.status(500).json({ error: String(e?.message || e) });
   } finally {
     activeJobs.delete(record_id);
-    try { if (fs.existsSync(tmpFile)) fs.unlinkSync(tmpFile); } catch {}
+    // best-effort cleanup
+    try {
+      for (const p of cleanupPaths) { if (fs.existsSync(p)) fs.unlinkSync(p); }
+    } catch {}
   }
 });
 
