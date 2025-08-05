@@ -1,18 +1,17 @@
-# Fastest path: use Microsoft’s Playwright Python image (Chromium preinstalled)
+# Keep Playwright image since your playcount service needs it
 FROM mcr.microsoft.com/playwright/python:v1.45.0-jammy
 
-# System updates are already applied in the base image; just set up the app.
 WORKDIR /app
 
-# Copy dependency list first for better layer caching
+# Install deps first for better caching
 COPY requirements.txt /app/requirements.txt
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Copy the app
-COPY app.py /app/app.py
+# Copy the entire repo so both scripts exist
+COPY . /app
 
-# (Optional) If you want to pin the Chromium build explicitly:
-# RUN playwright install chromium
+# Default to your existing playcount app
+ENV RUN_CMD="python app.py"
 
-# Railway will run this by default (or set Start Command to "python app.py")
-CMD ["python", "app.py"]
+# Allow overriding with Railway Start Command or env var
+CMD ["sh", "-lc", "$RUN_CMD"]
