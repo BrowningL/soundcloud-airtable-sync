@@ -1,3 +1,4 @@
+// index.js
 const express = require("express");
 const fs = require("fs");
 const path = require("path");
@@ -36,7 +37,6 @@ const CLEANUP_POLL_SECONDS = Number(process.env.CLEANUP_POLL_SECONDS || 180);
 const CLEANUP_POLL_INTERVAL = Number(process.env.CLEANUP_POLL_INTERVAL || 10);
 
 // ACR scan config
-const ACR_MIN_SCORE = Number(process.env.ACR_MIN_SCORE || 70); // not used by Python mode, kept for env compatibility
 const ACR_RETRIES = Number(process.env.ACR_RETRIES || 2);
 const ACR_BACKOFF_MS = Number(process.env.ACR_BACKOFF_MS || 400);
 
@@ -119,6 +119,7 @@ async function httpToFile(url, destPath) {
 function cleanPermalink(u) {
   try { const url = new URL(u); url.search = ""; return url.toString(); } catch { return u; }
 }
+function hostOf(u) { try { return new URL(u).host?.toLowerCase() || ""; } catch { return ""; } }
 
 // ------------ MP3 normalization ------------
 async function normalizeMp3Container(inputPath) {
@@ -476,14 +477,12 @@ app.post("/acr", async (req, res) => {
 
   const opts = { baseId: base_id || BASE_ID, tableName: table_name || TABLE };
 
-  // Working file path (will change if we rehydrate)
   let workFile = path.join(DOWNLOAD_DIR, `acr-${record_id}.mp3`);
-  let cleanupPaths = [];
+  const cleanupPaths = [];
   let rehydratedFromSource = false;
   let usedUrl = null;
 
   try {
-    // Fetch record (lets us fall back to source fields if needed)
     const rec = await fetchAirtableRecord(record_id, opts);
     const fields = rec.fields || {};
     if (!force && fields["ACR Report"]) {
@@ -491,19 +490,16 @@ app.post("/acr", async (req, res) => {
       return res.json({ success: true, skipped: true, reason: "Report already present" });
     }
 
-    // Use passed attachment_url else Airtable attachment
+    // Prefer the passed URL; else use field
     let attUrl = attachment_url ||
       (Array.isArray(fields["Raw Track Audio File"]) && fields["Raw Track Audio File"][0]?.url);
+    if (!attUrl) return res.status(400).json({ error: "No attachment URL on record" });
 
-    if (!attUrl) {
-      return res.status(400).json({ error: "No attachment URL on record" });
-    }
-
-    // Resolve host and decide if attachment is likely our ephemeral link
-    const ourHost = normalizeHost(HOST);
-    const attIsOurHost = (() => {
-      try { return !!(ourHost && normalizeHost(attUrl).startsWith(ourHost)); } catch { return false; }
-    })();
+    // Robust own-host detection by hostname (env host OR current request host)
+    const envHost = hostOf(HOST);
+    const reqHost = hostOf(resolveHostUrl(req));
+    const attHost = hostOf(attUrl);
+    const attIsOurHost = !!attHost && (attHost === envHost || attHost === reqHost);
 
     // Try to download the attachment first
     try {
@@ -513,75 +509,65 @@ app.post("/acr", async (req, res) => {
     } catch (e) {
       console.log(`⚠️ Attachment download failed (${attUrl}): ${e?.message || e}`);
       if (attIsOurHost) {
-        // Fallback: re-download from source fields
-        const sourceUrl =
+        // Rehydrate from a known source field
+        const src =
           fields["Input Track Link"] ||
           (typeof fields["Source Links"] === "string" ? fields["Source Links"].split(/\s+/)[0] : null);
+        if (!src) throw new Error("Attachment dead and no source link on record");
 
-        if (!sourceUrl) {
-          throw new Error(`Attachment dead and no source link available on record`);
-        }
-
-        // Redownload via SoundCloud pipeline
         workFile = path.join(DOWNLOAD_DIR, `${record_id}.mp3`);
-        console.log(`♻️ Rehydrating from source: ${sourceUrl}`);
-        await downloadTrackResilient(sourceUrl, workFile);
+        console.log(`♻️ Rehydrating from source: ${src}`);
+        await downloadTrackResilient(src, workFile);
         await ensureGoodMp3(workFile);
         cleanupPaths.push(workFile);
         rehydratedFromSource = true;
       } else {
+        // Not our host → don't guess; bubble the error
         throw e;
       }
     }
 
-    // If file was from attachment and we haven't normalized yet, normalize
     if (!rehydratedFromSource && fs.existsSync(workFile)) {
       await ensureGoodMp3(workFile);
     }
 
-    // Run ACR
     const acrReport = await runAcrPythonGuiStyle(workFile);
 
-    // Prepare Airtable update
+    // Prepare update
     const patchUrl = airtableRecordUrl(record_id, opts);
     const update = {};
     if (typeof acrReport === "string") update["ACR Report"] = acrReport;
 
-    // If we rehydrated, also reattach so Airtable re-hosts (then we can safely clean up)
-    let attachFilename = `${record_id}.mp3`;
-    let publicUrl = null;
+    // If rehydrated, reattach so Airtable hosts it (then we can clean locally)
     if (rehydratedFromSource) {
+      const attachFilename = `${record_id}.mp3`;
       const baseHost = resolveHostUrl(req);
-      publicUrl = ensureHttpsUrl(`${baseHost}/dl/${encodeURIComponent(attachFilename)}`);
-      // ensure file has that name
+      const publicUrl = ensureHttpsUrl(`${baseHost}/dl/${encodeURIComponent(attachFilename)}`);
+
+      // Ensure named file exists for serving
       if (!workFile.endsWith(attachFilename)) {
         const newPath = path.join(DOWNLOAD_DIR, attachFilename);
         fs.copyFileSync(workFile, newPath);
         cleanupPaths.push(newPath);
         workFile = newPath;
       }
-      // Make sure the file is actually served before patch
+
+      // Try until served
       for (let i = 0; i < 5; i++) {
-        const ok = await headOk(publicUrl);
-        if (ok) break;
+        if (await headOk(publicUrl)) break;
         await wait(500 * (i + 1));
       }
       update["Raw Track Audio File"] = [{ url: publicUrl, filename: attachFilename }];
-    }
 
-    // Send patch
-    const patchResp = await fetch(patchUrl, {
-      method: "PATCH",
-      headers: { Authorization: `Bearer ${AIRTABLE_API_KEY}`, "Content-Type": "application/json" },
-      body: JSON.stringify({ fields: update }),
-    });
-    const patchJson = await patchResp.json();
-    if (!patchResp.ok) {
-      return res.status(500).json({ error: "Airtable update failed", details: patchJson });
-    }
+      // Patch + poll until Airtable copies to airtableusercontent → then cleanup
+      const patchResp = await fetch(patchUrl, {
+        method: "PATCH",
+        headers: { Authorization: `Bearer ${AIRTABLE_API_KEY}`, "Content-Type": "application/json" },
+        body: JSON.stringify({ fields: update }),
+      });
+      const patchJson = await patchResp.json();
+      if (!patchResp.ok) return res.status(500).json({ error: "Airtable update failed", details: patchJson });
 
-    // If reattached, poll until Airtable copies to airtableusercontent, then cleanup local
-    if (rehydratedFromSource && publicUrl) {
       const t0 = Date.now();
       while (Date.now() - t0 < CLEANUP_POLL_SECONDS * 1000) {
         await wait(CLEANUP_POLL_INTERVAL * 1000);
@@ -592,7 +578,6 @@ app.post("/acr", async (req, res) => {
           const currentUrl = att?.[0]?.url || null;
           console.log("🔎 Current attachment URL:", currentUrl);
           if (currentUrl && currentUrl.includes("airtableusercontent")) {
-            // Safe to delete
             for (const p of cleanupPaths) { try { if (fs.existsSync(p)) fs.unlinkSync(p); } catch {} }
             console.log(`🧹 Cleaned up rehydrated file(s) for ${record_id}`);
             break;
@@ -601,24 +586,39 @@ app.post("/acr", async (req, res) => {
           console.error("⚠️ Polling error:", e);
         }
       }
+
+      return res.json({
+        success: true,
+        wrote_report: typeof acrReport === "string",
+        acr_report: acrReport || null,
+        attachment_used: usedUrl,
+        rehydrated_from_source: true
+      });
     }
+
+    // No reattach needed → just patch report
+    const patchResp = await fetch(patchUrl, {
+      method: "PATCH",
+      headers: { Authorization: `Bearer ${AIRTABLE_API_KEY}`, "Content-Type": "application/json" },
+      body: JSON.stringify({ fields: update }),
+    });
+    const patchJson = await patchResp.json();
+    if (!patchResp.ok) return res.status(500).json({ error: "Airtable update failed", details: patchJson });
 
     res.json({
       success: true,
       wrote_report: typeof acrReport === "string",
       acr_report: acrReport || null,
       attachment_used: usedUrl,
-      rehydrated_from_source: rehydratedFromSource
+      rehydrated_from_source: false
     });
   } catch (e) {
     console.error("ACR route error:", e);
     res.status(500).json({ error: String(e?.message || e) });
   } finally {
     activeJobs.delete(record_id);
-    // best-effort cleanup
-    try {
-      for (const p of cleanupPaths) { if (fs.existsSync(p)) fs.unlinkSync(p); }
-    } catch {}
+    // best-effort cleanup (in case we didn't hit the poll branch)
+    try { if (fs.existsSync(workFile)) fs.unlinkSync(workFile); } catch {}
   }
 });
 
