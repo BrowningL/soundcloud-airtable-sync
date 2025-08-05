@@ -223,5 +223,8 @@ def run_now():
     return jsonify({"ok": ok, "failed": failed}), 200
 
 if __name__ == "__main__":
-    # Local run: python playlist_followers_app.py
-    sync_once()
+    import os
+    port = int(os.environ.get("PORT", "3000"))
+    # optional: set RUN_TOKEN via env instead of hardcoding
+    app.run(host="0.0.0.0", port=port)
+
