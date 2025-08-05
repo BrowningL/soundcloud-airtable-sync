@@ -19,7 +19,7 @@ PLAYLISTS_VIEW = None                 # put a view name if you want to limit, el
 PLAYLISTS_ID_FIELD = "Playlist ID"    # can be raw ID / URI / URL
 
 FOLLOWERS_TABLE = "Playlist Followers"
-FOLLOWERS_DATE_FIELD = "Date"         # date-only field
+FOLLOWERS_DATE_FIELD = "Date"         # date-only
 FOLLOWERS_COUNT_FIELD = "Followers"   # number
 FOLLOWERS_LINK_FIELD = "Playlist"     # linked-record to Playlists
 
@@ -85,26 +85,46 @@ def airtable_list_playlists() -> List[Dict[str, str]]:
             break
     return out
 
-def airtable_upsert_followers(playlist_rec_id: str, date_iso: str, followers: int) -> None:
+def airtable_find_today_row(playlist_rec_id: str, today_iso: str) -> Optional[str]:
     """
-    Idempotent upsert into Playlist Followers using Airtable's performUpsert.
-    Merge key = (Playlist, Date). This overwrites today's row for that playlist if it exists.
+    Return recordId in Playlist Followers for (Playlist = recID AND Date is today),
+    else None. Assumes Date is a *date-only* field.
     """
     url = _at_url(FOLLOWERS_TABLE)
-    payload = {
-        "performUpsert": {
-            "fieldsToMergeOn": [FOLLOWERS_LINK_FIELD, FOLLOWERS_DATE_FIELD]
-        },
-        "records": [{
-            "fields": {
-                FOLLOWERS_LINK_FIELD: [playlist_rec_id],  # link by record id
-                FOLLOWERS_DATE_FIELD: date_iso,           # 'YYYY-MM-DD'
-                FOLLOWERS_COUNT_FIELD: followers,
-            }
-        }],
-        "typecast": False
+    # Use ARRAYJOIN({Playlist}) to get the linked record id (only 1 link per row)
+    formula = (
+        f"AND(ARRAYJOIN({{{{{ {FOLLOWERS_LINK_FIELD} }}}}}) = '{playlist_rec_id}', "
+        f"IS_SAME({{{{{ {FOLLOWERS_DATE_FIELD} }}}}}, '{today_iso}', 'day'))"
+    )
+    r = requests.get(url, headers=_at_headers_bearer(), params={"filterByFormula": formula, "pageSize": 1}, timeout=30)
+    if r.status_code != 200:
+        return None
+    recs = r.json().get("records", [])
+    return recs[0]["id"] if recs else None
+
+def airtable_upsert_followers(playlist_rec_id: str, date_iso: str, followers: int) -> None:
+    """
+    Idempotent upsert for (Playlist, Date) -> Followers:
+      - Query for today's row
+      - PATCH if exists
+      - POST if not
+    """
+    url = _at_url(FOLLOWERS_TABLE)
+    existing_id = airtable_find_today_row(playlist_rec_id, date_iso)
+
+    fields = {
+        FOLLOWERS_DATE_FIELD: date_iso,
+        FOLLOWERS_COUNT_FIELD: followers,
+        FOLLOWERS_LINK_FIELD: [playlist_rec_id],
     }
-    resp = requests.patch(url, headers=_at_headers_json(), data=json.dumps(payload), timeout=30)
+
+    if existing_id:
+        payload = {"records": [{"id": existing_id, "fields": fields}], "typecast": False}
+        resp = requests.patch(url, headers=_at_headers_json(), data=json.dumps(payload), timeout=30)
+    else:
+        payload = {"records": [{"fields": fields}], "typecast": False}
+        resp = requests.post(url, headers=_at_headers_json(), data=json.dumps(payload), timeout=30)
+
     if resp.status_code not in (200, 201):
         raise RuntimeError(f"Airtable upsert failed: {resp.status_code}: {resp.text[:300]}")
     time.sleep(AIRTABLE_SLEEP_BETWEEN_WRITES)
@@ -139,7 +159,6 @@ def get_playlist_followers(playlist_id: str, bearer: str) -> Optional[int]:
             time.sleep(retry_after + 1)
             continue
         if r.status_code in (401, 403, 404):
-            # private / not found / unauthorized (client creds only see public)
             return None
         time.sleep(0.5 * attempt)
     return None
