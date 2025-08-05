@@ -32,9 +32,6 @@ AIRTABLE_SLEEP_BETWEEN_WRITES = 0.2
 SPOTIFY_SLEEP_BETWEEN_CALLS = 0.15
 MAX_RETRIES = 3
 
-# Optional protection for your /run endpoint
-RUN_TOKEN = "set-a-secret-token-here"   # change this; include it as ?token=... when calling /run
-
 # ---------- helpers
 
 def _at_headers_json() -> Dict[str, str]:
@@ -208,22 +205,27 @@ def sync_once() -> Tuple[int, int]:
 
 app = Flask(__name__)
 
+# Allow simple browser fetch/CORS + preflight so Airtable/JS can call it directly
+@app.after_request
+def add_cors(resp):
+    resp.headers["Access-Control-Allow-Origin"] = "*"
+    resp.headers["Access-Control-Allow-Headers"] = "*"
+    resp.headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS"
+    return resp
+
 @app.get("/health")
 def health():
     return {"ok": True}, 200
 
-@app.post("/run")
+@app.route("/run", methods=["POST", "OPTIONS"])
 def run_now():
-    # simple token gate so randos can’t hammer your endpoint
-    token = request.args.get("token")
-    if RUN_TOKEN and token != RUN_TOKEN:
-        return jsonify({"error": "unauthorized"}), 401
-
+    if request.method == "OPTIONS":
+        return ("", 204)
+    print("[/run] trigger received")
     ok, failed = sync_once()
     return jsonify({"ok": ok, "failed": failed}), 200
 
 if __name__ == "__main__":
     import os
     port = int(os.environ.get("PORT", "3000"))
-    # optional: set RUN_TOKEN via env instead of hardcoding
     app.run(host="0.0.0.0", port=port)
