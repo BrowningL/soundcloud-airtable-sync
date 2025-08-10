@@ -1,4 +1,5 @@
-// index.js
+// index.js (CommonJS)
+// Drop-in server for SoundCloud download → MP3 normalize → attach to Airtable (+ optional ACR)
 const express = require("express");
 const fs = require("fs");
 const path = require("path");
@@ -26,6 +27,11 @@ const BASE_ID = process.env.AIRTABLE_BASE_ID;
 const TABLE = process.env.AIRTABLE_TABLE_NAME;
 const HOST = (process.env.HOST_URL || "").trim();
 const AIRTABLE_API_KEY = process.env.AIRTABLE_API_KEY;
+
+// Attachment/report field names (override via env if needed)
+const AT_ATTACH_FIELD = process.env.AT_ATTACH_FIELD || "Raw Track Audio File";
+const AT_REPORT_FIELD = process.env.AT_REPORT_FIELD || "ACR Report";
+const AT_SOURCE_FIELD = process.env.AT_SOURCE_FIELD || "Input Track Link";
 
 // ACRCloud
 const ACR_HOST = process.env.ACR_HOST;
@@ -69,7 +75,7 @@ function normalizeHost(h) {
 }
 function resolveHostUrl(req) {
   const fromEnv = normalizeHost(HOST);
-  if (fromEnv) return fromEnv;
+  if (fromEnv) return fromEnv; // prefer explicit host
   const proto = (req.get("x-forwarded-proto") || req.protocol || "https").split(",")[0].trim();
   const host = (req.get("x-forwarded-host") || req.get("host") || "").split(",")[0].trim();
   return normalizeHost(`${proto}://${host}`);
@@ -147,12 +153,12 @@ async function ensureGoodMp3(filepath) {
 
 // ------------ ACR (low-level) ------------
 async function acrIdentifyBuffer(sampleBuf) {
+  if (!ACR_HOST || !ACR_ACCESS_KEY || !ACR_ACCESS_SECRET) return { status: { code: -1 } };
   const http_method = "POST";
   const http_uri = "/v1/identify";
   const data_type = "audio";
   const signature_version = "1";
   const timestamp = Math.floor(Date.now() / 1000);
-
   const stringToSign = [http_method, http_uri, ACR_ACCESS_KEY, data_type, signature_version, timestamp].join("\n");
   const signature = crypto.createHmac("sha1", ACR_ACCESS_SECRET).update(stringToSign).digest("base64");
 
@@ -237,7 +243,6 @@ async function runAcrPythonGuiStyle(filepath) {
     const meta = await mm.parseFile(filepath);
     dur = Math.max(0, Math.round(meta?.format?.duration || 0));
   } catch {}
-
   if (!dur) return "⚠️  Could not read duration, skipping.";
 
   const windows = selectScanWindows(dur);
@@ -248,7 +253,6 @@ async function runAcrPythonGuiStyle(filepath) {
     results.push(r);
     await wait(150);
   }
-
   const anyDetected = results.some(r => r.match);
   const header = anyDetected ? "⛔ Fingerprint detected" : "✅ No matches detected";
   const lines = results.map(r => r.line);
@@ -382,7 +386,7 @@ app.head("/dl/:filename", (req, res) => {
   res.sendStatus(200);
 });
 
-// ------------ POST /webhook (SC → attach → optional ACR via skip_acr) ------------
+// ------------ POST /webhook (SC → attach → optional ACR) ------------
 app.post("/webhook", async (req, res) => {
   const { record_id, soundcloud_url, skip_acr = false } = req.body || {};
   if (!record_id || !soundcloud_url) return res.status(400).json({ error: "Missing record_id or soundcloud_url" });
@@ -408,16 +412,17 @@ app.post("/webhook", async (req, res) => {
       acrReport = await runAcrPythonGuiStyle(filepath);
     }
 
-    for (let i = 0; i < 5; i++) {
+    // Wait until the file is publicly reachable (Railway warmup, proxies, etc.)
+    for (let i = 0; i < 6; i++) {
       const ok = await headOk(publicUrl);
       console.log(`🧪 HEAD ${publicUrl} -> ${ok ? "OK" : "FAIL"}`);
       if (ok) break;
-      await wait(500 * (i + 1));
+      await wait(600 * (i + 1));
     }
 
     const airtableUrl = airtableRecordUrl(record_id);
-    const fields = { "Raw Track Audio File": [{ url: publicUrl, filename }] };
-    if (!skip_acr && acrReport) fields["ACR Report"] = acrReport;
+    const fields = { [AT_ATTACH_FIELD]: [{ url: publicUrl, filename }] };
+    if (!skip_acr && acrReport) fields[AT_REPORT_FIELD] = acrReport;
 
     const patchResp = await fetch(airtableUrl, {
       method: "PATCH",
@@ -430,7 +435,7 @@ app.post("/webhook", async (req, res) => {
     const patchJson = await patchResp.json();
     if (!patchResp.ok) return res.status(500).json({ error: "Airtable update failed", details: patchJson });
 
-    const returnedAtt = patchJson.fields?.["Raw Track Audio File"]?.[0] || null;
+    const returnedAtt = patchJson.fields?.[AT_ATTACH_FIELD]?.[0] || null;
     res.json({
       success: true,
       message: skip_acr
@@ -442,13 +447,14 @@ app.post("/webhook", async (req, res) => {
       acr_report: skip_acr ? null : (acrReport || null)
     });
 
+    // Cleanup once Airtable re-hosts (airtableusercontent)
     const t0 = Date.now();
     while (Date.now() - t0 < CLEANUP_POLL_SECONDS * 1000) {
       await wait(CLEANUP_POLL_INTERVAL * 1000);
       try {
         const pollResp = await fetch(airtableUrl, { headers: { Authorization: `Bearer ${AIRTABLE_API_KEY}` } });
         const pollJson = await pollResp.json();
-        const att = pollJson.fields?.["Raw Track Audio File"];
+        const att = pollJson.fields?.[AT_ATTACH_FIELD];
         const currentUrl = att?.[0]?.url || null;
         console.log("🔎 Current attachment URL:", currentUrl);
         if (currentUrl && currentUrl.includes("airtableusercontent")) {
@@ -485,14 +491,14 @@ app.post("/acr", async (req, res) => {
   try {
     const rec = await fetchAirtableRecord(record_id, opts);
     const fields = rec.fields || {};
-    if (!force && fields["ACR Report"]) {
+    if (!force && fields[AT_REPORT_FIELD]) {
       activeJobs.delete(record_id);
       return res.json({ success: true, skipped: true, reason: "Report already present" });
     }
 
     // Prefer the passed URL; else use field
     let attUrl = attachment_url ||
-      (Array.isArray(fields["Raw Track Audio File"]) && fields["Raw Track Audio File"][0]?.url);
+      (Array.isArray(fields[AT_ATTACH_FIELD]) && fields[AT_ATTACH_FIELD][0]?.url);
     if (!attUrl) return res.status(400).json({ error: "No attachment URL on record" });
 
     // Robust own-host detection by hostname (env host OR current request host)
@@ -511,7 +517,7 @@ app.post("/acr", async (req, res) => {
       if (attIsOurHost) {
         // Rehydrate from a known source field
         const src =
-          fields["Input Track Link"] ||
+          fields[AT_SOURCE_FIELD] ||
           (typeof fields["Source Links"] === "string" ? fields["Source Links"].split(/\s+/)[0] : null);
         if (!src) throw new Error("Attachment dead and no source link on record");
 
@@ -536,7 +542,7 @@ app.post("/acr", async (req, res) => {
     // Prepare update
     const patchUrl = airtableRecordUrl(record_id, opts);
     const update = {};
-    if (typeof acrReport === "string") update["ACR Report"] = acrReport;
+    if (typeof acrReport === "string") update[AT_REPORT_FIELD] = acrReport;
 
     // If rehydrated, reattach so Airtable hosts it (then we can clean locally)
     if (rehydratedFromSource) {
@@ -557,7 +563,7 @@ app.post("/acr", async (req, res) => {
         if (await headOk(publicUrl)) break;
         await wait(500 * (i + 1));
       }
-      update["Raw Track Audio File"] = [{ url: publicUrl, filename: attachFilename }];
+      update[AT_ATTACH_FIELD] = [{ url: publicUrl, filename: attachFilename }];
 
       // Patch + poll until Airtable copies to airtableusercontent → then cleanup
       const patchResp = await fetch(patchUrl, {
@@ -574,7 +580,7 @@ app.post("/acr", async (req, res) => {
         try {
           const pollResp = await fetch(patchUrl, { headers: { Authorization: `Bearer ${AIRTABLE_API_KEY}` } });
           const pollJson = await pollResp.json();
-          const att = pollJson.fields?.["Raw Track Audio File"];
+          const att = pollJson.fields?.[AT_ATTACH_FIELD];
           const currentUrl = att?.[0]?.url || null;
           console.log("🔎 Current attachment URL:", currentUrl);
           if (currentUrl && currentUrl.includes("airtableusercontent")) {
@@ -617,9 +623,14 @@ app.post("/acr", async (req, res) => {
     res.status(500).json({ error: String(e?.message || e) });
   } finally {
     activeJobs.delete(record_id);
-    // best-effort cleanup (in case we didn't hit the poll branch)
-    try { if (fs.existsSync(workFile)) fs.unlinkSync(workFile); } catch {}
+    // best-effort cleanup
+    try {
+      const files = fs.readdirSync(DOWNLOAD_DIR).filter(n => n.startsWith(`acr-${record_id}`));
+      for (const f of files) {
+        try { fs.unlinkSync(path.join(DOWNLOAD_DIR, f)); } catch {}
+      }
+    } catch {}
   }
 });
 
-app.listen(PORT, () => console.log(`🚀 Server running on port ${PORT}`));
+app.listen(PORT, () => console.log(`🚀 SC server on :${PORT}`));
