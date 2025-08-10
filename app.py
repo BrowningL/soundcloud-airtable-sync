@@ -1,5 +1,4 @@
 import os
-import json
 import time
 import asyncio
 import threading
@@ -33,6 +32,7 @@ PLAYCOUNTS_KEY_FIELD = os.getenv("PLAYCOUNTS_KEY_FIELD")  # e.g., "Key"
 CLIENT_ID = os.getenv("SPOTIFY_CLIENT_ID", "YOUR_SPOTIFY_CLIENT_ID")
 CLIENT_SECRET = os.getenv("SPOTIFY_CLIENT_SECRET", "YOUR_SPOTIFY_CLIENT_SECRET")
 
+# Spotify web GraphQL
 OPERATION_NAME = "getAlbum"
 PERSISTED_HASH = "97dd13a1f28c80d66115a13697a7ffd94fe3bebdb94da42159456e1d82bfee76"
 CAPTURED_VARS = {"locale": "", "offset": 0, "limit": 50}
@@ -132,18 +132,16 @@ def find_today_by_isrc(isrc_code: str, day_iso: str) -> Optional[str]:
         params={"filterByFormula": formula, "pageSize": 1},
         timeout=60,
     )
-    if r.status_code != 200:
-        return None
+    if r.status_code != 200: return None
     recs = r.json().get("records", [])
     return recs[0]["id"] if recs else None
 
-def prev_count_by_isrc(isrc_code: str, before_iso: str, ignore_zero: bool = True) -> Optional[int]:
+def prev_count_by_isrc(isrc_code: str, before_iso: str) -> Optional[int]:
     clauses = [
         f"SEARCH('{_q(isrc_code)}', ARRAYJOIN({{{PLAYCOUNTS_LINK_FIELD}}}))",
-        f"{{{PLAYCOUNTS_DATE_FIELD}}} < '{before_iso}'"
+        f"IS_BEFORE({{{PLAYCOUNTS_DATE_FIELD}}}, '{before_iso}')",
+        f"{{{PLAYCOUNTS_COUNT_FIELD}}} > 0"
     ]
-    if ignore_zero:
-        clauses.append(f"{{{PLAYCOUNTS_COUNT_FIELD}}} > 0")
     formula = "AND(" + ",".join(clauses) + ")"
     params = {
         "filterByFormula": formula,
@@ -152,11 +150,9 @@ def prev_count_by_isrc(isrc_code: str, before_iso: str, ignore_zero: bool = True
         "sort[0][direction]": "desc",
     }
     r = requests.get(at_url(PLAYCOUNTS_TABLE), headers=at_headers(), params=params, timeout=60)
-    if r.status_code != 200:
-        return None
+    if r.status_code != 200: return None
     recs = r.json().get("records", [])
-    if not recs:
-        return None
+    if not recs: return None
     try:
         return int(recs[0]["fields"].get(PLAYCOUNTS_COUNT_FIELD, 0) or 0)
     except Exception:
@@ -191,7 +187,6 @@ def upsert_count(linked_catalogue_rec_id: str, isrc_code: str, day_iso: str, cou
         r = requests.patch(at_url(PLAYCOUNTS_TABLE), headers=at_headers(), json=payload, timeout=60)
     else:
         r = requests.post(at_url(PLAYCOUNTS_TABLE), headers=at_headers(), json=payload, timeout=60)
-
     if r.status_code not in (200, 201):
         raise RuntimeError(f"Airtable error {r.status_code}: {r.text}")
     time.sleep(airtable_sleep)
@@ -348,7 +343,8 @@ async def sync():
         js = cache[aid]
         for it in js.get("data", {}).get("albumUnion", {}).get("tracksV2", {}).get("items", []):
             track = it.get("track", {})
-            if tid in (track.get("id"), (track.get("uri", "").split(":")[-1] if track.get("uri") else None)):
+            cand = (track.get("uri", "") or "").split(":")[-1] if track.get("uri") else None
+            if tid in (track.get("id"), cand):
                 val = track.get("playcount") or 0
                 pc = int(str(val).replace(",", ""))
                 break
@@ -380,6 +376,18 @@ def run_endpoint():
 def backfill_endpoint():
     changed = backfill_deltas_for_all()
     return jsonify({"status": "backfilled", "changed": changed}), 200
+
+# Optional quick diag for a given ISRC/day
+@app.get("/diag")
+def diag():
+    isrc = request.args.get("isrc")
+    day  = request.args.get("day")
+    if not isrc or not day:
+        return jsonify({"error": "isrc & day required"}), 400
+    return jsonify({
+        "find_today_id": find_today_by_isrc(isrc, day),
+        "prev_count": prev_count_by_isrc(isrc, day)
+    })
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", "3000"))
