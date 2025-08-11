@@ -1,16 +1,18 @@
-// index.js
+// index.js (acr-node)
 const express = require("express");
 const fs = require("fs");
 const path = require("path");
 const bodyParser = require("body-parser");
-const fetch = require("node-fetch"); // ✅ v2 CommonJS
+const fetch = require("node-fetch"); // v2 CommonJS
 
 let scdlFactory;
 try { scdlFactory = require("@snwfdhmp/soundcloud-downloader"); } catch { scdlFactory = require("soundcloud-downloader"); }
 const createSCDL = scdlFactory.create || ((opts) => (scdlFactory.default ? scdlFactory.default : scdlFactory));
+
 const ffmpegPath = require("ffmpeg-static");
 const ffmpeg = require("fluent-ffmpeg");
 ffmpeg.setFfmpegPath(ffmpegPath);
+
 const mm = require("music-metadata");
 const crypto = require("crypto");
 const FormData = require("form-data");
@@ -24,11 +26,16 @@ const PORT = process.env.PORT || 3000;
 const DOWNLOAD_DIR = process.env.TRACKS_DIR || path.join(__dirname, "tracks");
 
 const BASE_ID = process.env.AIRTABLE_BASE_ID;
-const TABLE = process.env.AIRTABLE_TABLE_NAME;
+const TABLE = process.env.AIRTABLE_TABLE_NAME; // table NAME or tbl... ID
 const HOST = (process.env.HOST_URL || "").trim();
 const AIRTABLE_API_KEY = process.env.AIRTABLE_API_KEY;
 
-// ACRCloud
+// Airtable field names (rename-proof via env)
+const AT_ATTACH_FIELD = process.env.AT_ATTACH_FIELD || "Raw Track Audio File";
+const AT_REPORT_FIELD = process.env.AT_REPORT_FIELD || "ACR Report";
+const AT_SOURCE_FIELD = process.env.AT_SOURCE_FIELD || "Input Track Link";
+
+// ACRCloud (optional)
 const ACR_HOST = process.env.ACR_HOST;
 const ACR_ACCESS_KEY = process.env.ACR_ACCESS_KEY;
 const ACR_ACCESS_SECRET = process.env.ACR_ACCESS_SECRET;
@@ -409,6 +416,7 @@ app.post("/webhook", async (req, res) => {
       acrReport = await runAcrPythonGuiStyle(filepath);
     }
 
+    // Wait until the file is publicly reachable (Railway warmup, proxies, etc.)
     for (let i = 0; i < 5; i++) {
       const ok = await headOk(publicUrl);
       console.log(`🧪 HEAD ${publicUrl} -> ${ok ? "OK" : "FAIL"}`);
@@ -417,8 +425,8 @@ app.post("/webhook", async (req, res) => {
     }
 
     const airtableUrl = airtableRecordUrl(record_id);
-    const fields = { "Raw Track Audio File": [{ url: publicUrl, filename }] };
-    if (!skip_acr && acrReport) fields["ACR Report"] = acrReport;
+    const fields = { [AT_ATTACH_FIELD]: [{ url: publicUrl, filename }] };
+    if (!skip_acr && acrReport) fields[AT_REPORT_FIELD] = acrReport;
 
     const patchResp = await fetch(airtableUrl, {
       method: "PATCH",
@@ -431,7 +439,7 @@ app.post("/webhook", async (req, res) => {
     const patchJson = await patchResp.json();
     if (!patchResp.ok) return res.status(500).json({ error: "Airtable update failed", details: patchJson });
 
-    const returnedAtt = patchJson.fields?.["Raw Track Audio File"]?.[0] || null;
+    const returnedAtt = patchJson.fields?.[AT_ATTACH_FIELD]?.[0] || null;
     res.json({
       success: true,
       message: skip_acr
@@ -443,13 +451,14 @@ app.post("/webhook", async (req, res) => {
       acr_report: skip_acr ? null : (acrReport || null)
     });
 
+    // Cleanup once Airtable re-hosts (airtableusercontent)
     const t0 = Date.now();
     while (Date.now() - t0 < CLEANUP_POLL_SECONDS * 1000) {
       await wait(CLEANUP_POLL_INTERVAL * 1000);
       try {
         const pollResp = await fetch(airtableUrl, { headers: { Authorization: `Bearer ${AIRTABLE_API_KEY}` } });
         const pollJson = await pollResp.json();
-        const att = pollJson.fields?.["Raw Track Audio File"];
+        const att = pollJson.fields?.[AT_ATTACH_FIELD];
         const currentUrl = att?.[0]?.url || null;
         console.log("🔎 Current attachment URL:", currentUrl);
         if (currentUrl && currentUrl.includes("airtableusercontent")) {
@@ -486,14 +495,14 @@ app.post("/acr", async (req, res) => {
   try {
     const rec = await fetchAirtableRecord(record_id, opts);
     const fields = rec.fields || {};
-    if (!force && fields["ACR Report"]) {
+    if (!force && fields[AT_REPORT_FIELD]) {
       activeJobs.delete(record_id);
       return res.json({ success: true, skipped: true, reason: "Report already present" });
     }
 
     // Prefer the passed URL; else use field
     let attUrl = attachment_url ||
-      (Array.isArray(fields["Raw Track Audio File"]) && fields["Raw Track Audio File"][0]?.url);
+      (Array.isArray(fields[AT_ATTACH_FIELD]) && fields[AT_ATTACH_FIELD][0]?.url);
     if (!attUrl) return res.status(400).json({ error: "No attachment URL on record" });
 
     // Robust own-host detection by hostname (env host OR current request host)
@@ -512,7 +521,7 @@ app.post("/acr", async (req, res) => {
       if (attIsOurHost) {
         // Rehydrate from a known source field
         const src =
-          fields["Input Track Link"] ||
+          fields[AT_SOURCE_FIELD] ||
           (typeof fields["Source Links"] === "string" ? fields["Source Links"].split(/\s+/)[0] : null);
         if (!src) throw new Error("Attachment dead and no source link on record");
 
@@ -537,7 +546,7 @@ app.post("/acr", async (req, res) => {
     // Prepare update
     const patchUrl = airtableRecordUrl(record_id, opts);
     const update = {};
-    if (typeof acrReport === "string") update["ACR Report"] = acrReport;
+    if (typeof acrReport === "string") update[AT_REPORT_FIELD] = acrReport;
 
     // If rehydrated, reattach so Airtable hosts it (then we can clean locally)
     if (rehydratedFromSource) {
@@ -558,7 +567,7 @@ app.post("/acr", async (req, res) => {
         if (await headOk(publicUrl)) break;
         await wait(500 * (i + 1));
       }
-      update["Raw Track Audio File"] = [{ url: publicUrl, filename: attachFilename }];
+      update[AT_ATTACH_FIELD] = [{ url: publicUrl, filename: attachFilename }];
 
       // Patch + poll until Airtable copies to airtableusercontent → then cleanup
       const patchResp = await fetch(patchUrl, {
@@ -575,7 +584,7 @@ app.post("/acr", async (req, res) => {
         try {
           const pollResp = await fetch(patchUrl, { headers: { Authorization: `Bearer ${AIRTABLE_API_KEY}` } });
           const pollJson = await pollResp.json();
-          const att = pollJson.fields?.["Raw Track Audio File"];
+          const att = pollJson.fields?.[AT_ATTACH_FIELD];
           const currentUrl = att?.[0]?.url || null;
           console.log("🔎 Current attachment URL:", currentUrl);
           if (currentUrl && currentUrl.includes("airtableusercontent")) {
@@ -618,8 +627,11 @@ app.post("/acr", async (req, res) => {
     res.status(500).json({ error: String(e?.message || e) });
   } finally {
     activeJobs.delete(record_id);
-    // best-effort cleanup (in case we didn't hit the poll branch)
-    try { if (fs.existsSync(workFile)) fs.unlinkSync(workFile); } catch {}
+    // best-effort cleanup for any acr-* leftovers
+    try {
+      const files = fs.readdirSync(DOWNLOAD_DIR).filter(n => n.startsWith(`acr-${record_id}`));
+      for (const f of files) { try { fs.unlinkSync(path.join(DOWNLOAD_DIR, f)); } catch {} }
+    } catch {}
   }
 });
 
