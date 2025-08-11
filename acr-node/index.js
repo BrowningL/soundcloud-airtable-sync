@@ -3,7 +3,8 @@ const express = require("express");
 const fs = require("fs");
 const path = require("path");
 const bodyParser = require("body-parser");
-const fetch = require("node-fetch").default;
+const fetch = require("node-fetch"); // ✅ v2 CommonJS
+
 let scdlFactory;
 try { scdlFactory = require("@snwfdhmp/soundcloud-downloader"); } catch { scdlFactory = require("soundcloud-downloader"); }
 const createSCDL = scdlFactory.create || ((opts) => (scdlFactory.default ? scdlFactory.default : scdlFactory));
