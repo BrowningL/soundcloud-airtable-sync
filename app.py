@@ -21,19 +21,29 @@ if not AIRTABLE_API_KEY or not AIRTABLE_API_KEY.startswith("pat"):
         "You can also set AT_API_KEY for backward compatibility."
     )
 
+# ----- Catalogue (ISRC list) -----
 CATALOGUE_TABLE = os.getenv("CATALOGUE_TABLE", "Catalogue")
 CATALOGUE_VIEW = os.getenv("CATALOGUE_VIEW", "Inner Catalogue")
-CATALOGUE_ISRC_FIELD = os.getenv("CATALOGUE_ISRC_FIELD", "ISRC")  # plain text ISRC field in Catalogue
+CATALOGUE_ISRC_FIELD = os.getenv("CATALOGUE_ISRC_FIELD", "ISRC")  # plain text ISRC
 
+# ----- Track Playcounts (existing) -----
 PLAYCOUNTS_TABLE = os.getenv("PLAYCOUNTS_TABLE", "SpotifyPlaycounts")
 PLAYCOUNTS_LINK_FIELD = os.getenv("PLAYCOUNTS_LINK_FIELD", "ISRC")  # linked → Catalogue
 PLAYCOUNTS_DATE_FIELD = os.getenv("PLAYCOUNTS_DATE_FIELD", "Date")
 PLAYCOUNTS_COUNT_FIELD = os.getenv("PLAYCOUNTS_COUNT_FIELD", "Playcount")
 PLAYCOUNTS_DELTA_FIELD = os.getenv("PLAYCOUNTS_DELTA_FIELD", "Delta")
+PLAYCOUNTS_KEY_FIELD = os.getenv("PLAYCOUNTS_KEY_FIELD")  # optional idempotency key
 
-# Optional idempotency key field (recommended)
-PLAYCOUNTS_KEY_FIELD = os.getenv("PLAYCOUNTS_KEY_FIELD")  # e.g., "Key"
+# ----- Playlist Followers (NEW) -----
+FOLLOWERS_TABLE = os.getenv("FOLLOWERS_TABLE", "Playlist Followers")
+FOLLOWERS_LINK_FIELD = os.getenv("FOLLOWERS_LINK_FIELD", "Playlist")  # linked → Playlists
+FOLLOWERS_DATE_FIELD = os.getenv("FOLLOWERS_DATE_FIELD", "Date")
+FOLLOWERS_COUNT_FIELD = os.getenv("FOLLOWERS_COUNT_FIELD", "Followers")
+FOLLOWERS_DELTA_FIELD = os.getenv("FOLLOWERS_DELTA_FIELD", "Delta")
+# allow negative deltas for followers (unfollows happen). Set to "false" to clamp.
+FOLLOWERS_ALLOW_NEGATIVE = (os.getenv("FOLLOWERS_ALLOW_NEGATIVE", "true").lower() in ("1", "true", "yes"))
 
+# ----- Spotify creds -----
 CLIENT_ID = os.getenv("SPOTIFY_CLIENT_ID", "YOUR_SPOTIFY_CLIENT_ID")
 CLIENT_SECRET = os.getenv("SPOTIFY_CLIENT_SECRET", "YOUR_SPOTIFY_CLIENT_SECRET")
 
@@ -116,7 +126,7 @@ def list_isrcs() -> List[Dict[str, str]]:
     return rows
 
 # ────────────────────────────────────────────────────────────────────────────────
-# Find today's row / previous count (by ISRC text)
+# Track Playcounts helpers (existing)
 # ────────────────────────────────────────────────────────────────────────────────
 def _key(isrc_code: str, day_iso: str) -> str:
     return f"{isrc_code}|{day_iso}"
@@ -163,14 +173,9 @@ def prev_count_by_isrc(isrc_code: str, before_iso: str) -> Optional[int]:
     except Exception:
         return None
 
-# ────────────────────────────────────────────────────────────────────────────────
-# Upsert playcount (+ delta)
-# ────────────────────────────────────────────────────────────────────────────────
 def upsert_count(linked_catalogue_rec_id: str, isrc_code: str, day_iso: str, count: int):
     existing_id = find_today_by_isrc(isrc_code, day_iso)
     prev = prev_count_by_isrc(isrc_code, day_iso)
-
-    # Delta rule: only positive increases from positive baselines; else 0
     delta = None
     if prev is not None:
         raw = count - prev
@@ -197,7 +202,7 @@ def upsert_count(linked_catalogue_rec_id: str, isrc_code: str, day_iso: str, cou
     time.sleep(airtable_sleep)
 
 # ────────────────────────────────────────────────────────────────────────────────
-# Spotify
+# Spotify (unchanged)
 # ────────────────────────────────────────────────────────────────────────────────
 def get_search_token() -> str:
     r = requests.post(
@@ -227,7 +232,7 @@ def search_track(isrc: str, bearer: str) -> Optional[Tuple[str, str, str]]:
     return None
 
 # ────────────────────────────────────────────────────────────────────────────────
-# Sniff Spotify web token for playcount GraphQL
+# Sniff Spotify web token (unchanged)
 # ────────────────────────────────────────────────────────────────────────────────
 async def sniff_tokens() -> Tuple[str, Optional[str]]:
     async with async_playwright() as p:
@@ -253,9 +258,6 @@ async def sniff_tokens() -> Tuple[str, Optional[str]]:
         finally:
             await browser.close()
 
-# ────────────────────────────────────────────────────────────────────────────────
-# Fetch album via GraphQL v2
-# ────────────────────────────────────────────────────────────────────────────────
 def fetch_album(album_id: str, web_token: str, client_token: Optional[str]) -> Dict[str, Any]:
     sess = requests.Session()
     headers = {"Authorization": f"Bearer {web_token}", "User-Agent": USER_AGENT, "content-type": "application/json"}
@@ -276,50 +278,80 @@ def fetch_album(album_id: str, web_token: str, client_token: Optional[str]) -> D
     return {}
 
 # ────────────────────────────────────────────────────────────────────────────────
-# Backfill (recompute all deltas group-wise)
+# Generic delta recompute (used by both tables)
 # ────────────────────────────────────────────────────────────────────────────────
-def _recompute_deltas_for_groups(groups: Dict[str, List[Dict[str, Any]]]) -> int:
-    updates: List[Dict[str, Any]] = []
-    changed = 0
-    for _, items in groups.items():
-        items.sort(key=lambda r: r["fields"].get(PLAYCOUNTS_DATE_FIELD, "") or "")
-        prev_val: Optional[int] = None
-        for rec in items:
-            f = rec.get("fields", {})
-            cur = int(f.get(PLAYCOUNTS_COUNT_FIELD, 0) or 0)
-            if prev_val is None:
-                new_delta = None
-            else:
-                raw = cur - prev_val
-                new_delta = raw if (cur > 0 and prev_val > 0 and raw > 0) else 0
-            if new_delta is not None and f.get(PLAYCOUNTS_DELTA_FIELD) != new_delta:
-                updates.append({"id": rec["id"], "fields": {PLAYCOUNTS_DELTA_FIELD: new_delta}})
-                changed += 1
-            prev_val = cur
-            if len(updates) == 10:
-                at_batch_patch(PLAYCOUNTS_TABLE, updates)
-                updates.clear()
-                time.sleep(airtable_sleep)
-    if updates:
-        at_batch_patch(PLAYCOUNTS_TABLE, updates)
-    return changed
-
-def backfill_deltas_for_all() -> int:
+def backfill_table_deltas(
+    table: str,
+    link_field: str,
+    date_field: str,
+    count_field: str,
+    delta_field: str,
+    clamp_negative: bool,
+) -> int:
     recs = at_paginate(
-        PLAYCOUNTS_TABLE,
-        {"pageSize": 100, "sort[0][field]": PLAYCOUNTS_DATE_FIELD, "sort[0][direction]": "asc"}
+        table,
+        {"pageSize": 100, "sort[0][field]": date_field, "sort[0][direction]": "asc"}
     )
     groups: Dict[str, List[Dict[str, Any]]] = {}
     for rec in recs:
-        links = rec.get("fields", {}).get(PLAYCOUNTS_LINK_FIELD, [])
+        links = rec.get("fields", {}).get(link_field, [])
         if not links:
             continue
-        key = links[0]  # linked Catalogue recordId
+        key = links[0]  # first linked record id
         groups.setdefault(key, []).append(rec)
-    return _recompute_deltas_for_groups(groups)
+
+    updates: List[Dict[str, Any]] = []
+    changed = 0
+    for _, items in groups.items():
+        items.sort(key=lambda r: r.get("fields", {}).get(date_field, "") or "")
+        prev_val: Optional[int] = None
+        for rec in items:
+            f = rec.get("fields", {})
+            try:
+                cur = int(f.get(count_field, 0) or 0)
+            except Exception:
+                cur = 0
+
+            if prev_val is None:
+                new_delta = None
+            else:
+                if cur > 0 and prev_val > 0:
+                    raw = cur - prev_val
+                    new_delta = (raw if raw >= 0 else (0 if clamp_negative else raw))
+                else:
+                    new_delta = 0
+
+            if new_delta is not None and f.get(delta_field) != new_delta:
+                updates.append({"id": rec["id"], "fields": {delta_field: new_delta}})
+                changed += 1
+
+            prev_val = cur
+
+            if len(updates) == 10:
+                at_batch_patch(table, updates)
+                updates.clear()
+                time.sleep(airtable_sleep)
+
+    if updates:
+        at_batch_patch(table, updates)
+    return changed
+
+def backfill_deltas_for_all_tracks() -> int:
+    # (existing behavior) clamp negatives for track playcounts (ignore bad zero days)
+    return backfill_table_deltas(
+        PLAYCOUNTS_TABLE, PLAYCOUNTS_LINK_FIELD, PLAYCOUNTS_DATE_FIELD,
+        PLAYCOUNTS_COUNT_FIELD, PLAYCOUNTS_DELTA_FIELD, clamp_negative=True
+    )
+
+def backfill_deltas_for_followers() -> int:
+    # allow negatives by default (unfollows), unless env says otherwise
+    return backfill_table_deltas(
+        FOLLOWERS_TABLE, FOLLOWERS_LINK_FIELD, FOLLOWERS_DATE_FIELD,
+        FOLLOWERS_COUNT_FIELD, FOLLOWERS_DELTA_FIELD, clamp_negative=not FOLLOWERS_ALLOW_NEGATIVE
+    )
 
 # ────────────────────────────────────────────────────────────────────────────────
-# Main sync
+# Main sync (existing)
 # ────────────────────────────────────────────────────────────────────────────────
 async def sync():
     rows = list_isrcs()
@@ -395,12 +427,19 @@ def run_endpoint():
         asyncio.run(sync())
         return jsonify({"status": "completed"}), 200
 
+# existing backfill for playcounts
 @app.post("/backfill")
 def backfill_endpoint():
-    changed = backfill_deltas_for_all()
-    return jsonify({"status": "backfilled", "changed": changed}), 200
+    changed = backfill_deltas_for_all_tracks()
+    return jsonify({"status": "backfilled_playcounts", "changed": changed}), 200
 
-# Optional quick diag for a given ISRC/day
+# NEW: backfill for Playlist Followers
+@app.post("/backfill_followers")
+def backfill_followers_endpoint():
+    changed = backfill_deltas_for_followers()
+    return jsonify({"status": "backfilled_followers", "changed": changed}), 200
+
+# Optional quick diag for a given ISRC/day (unchanged)
 @app.get("/diag")
 def diag():
     isrc = request.args.get("isrc")
