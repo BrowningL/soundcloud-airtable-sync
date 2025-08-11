@@ -10,10 +10,16 @@ from flask import Flask, jsonify, request
 from playwright.async_api import async_playwright
 
 # ────────────────────────────────────────────────────────────────────────────────
-# CONFIG (use env vars in prod)
+# CONFIG (reads Node-style envs first; falls back to old names)
 # ────────────────────────────────────────────────────────────────────────────────
-AT_API_KEY = os.getenv("AT_API_KEY", "YOUR_AT_API_KEY")
-AT_BASE_ID = os.getenv("AT_BASE_ID", "appAmLhYAVcmKmRC3")
+AIRTABLE_API_KEY = os.getenv("AIRTABLE_API_KEY") or os.getenv("AT_API_KEY")
+AIRTABLE_BASE_ID = os.getenv("AIRTABLE_BASE_ID") or os.getenv("AT_BASE_ID") or "appAmLhYAVcmKmRC3"
+
+if not AIRTABLE_API_KEY or not AIRTABLE_API_KEY.startswith("pat"):
+    raise RuntimeError(
+        "Set AIRTABLE_API_KEY to a valid Airtable Personal Access Token (starts with 'pat'). "
+        "You can also set AT_API_KEY for backward compatibility."
+    )
 
 CATALOGUE_TABLE = os.getenv("CATALOGUE_TABLE", "Catalogue")
 CATALOGUE_VIEW = os.getenv("CATALOGUE_VIEW", "Inner Catalogue")
@@ -25,8 +31,7 @@ PLAYCOUNTS_DATE_FIELD = os.getenv("PLAYCOUNTS_DATE_FIELD", "Date")
 PLAYCOUNTS_COUNT_FIELD = os.getenv("PLAYCOUNTS_COUNT_FIELD", "Playcount")
 PLAYCOUNTS_DELTA_FIELD = os.getenv("PLAYCOUNTS_DELTA_FIELD", "Delta")
 
-# Optional: if you add a text field "Key" to SpotifyPlaycounts, set this env var to its name
-# When set, we enforce idempotency using Key = "{ISRC}|{YYYY-MM-DD}" (recommended but optional)
+# Optional idempotency key field (recommended)
 PLAYCOUNTS_KEY_FIELD = os.getenv("PLAYCOUNTS_KEY_FIELD")  # e.g., "Key"
 
 CLIENT_ID = os.getenv("SPOTIFY_CLIENT_ID", "YOUR_SPOTIFY_CLIENT_ID")
@@ -56,10 +61,10 @@ spotify_sleep = float(os.getenv("SPOTIFY_SLEEP", "0.15"))
 # Airtable helpers
 # ────────────────────────────────────────────────────────────────────────────────
 def at_headers():
-    return {"Authorization": f"Bearer {AT_API_KEY}", "Content-Type": "application/json"}
+    return {"Authorization": f"Bearer {AIRTABLE_API_KEY}", "Content-Type": "application/json"}
 
 def at_url(table: str) -> str:
-    return f"https://api.airtable.com/v0/{AT_BASE_ID}/{requests.utils.quote(table)}"
+    return f"https://api.airtable.com/v0/{AIRTABLE_BASE_ID}/{requests.utils.quote(table)}"
 
 def _q(s: str) -> str:
     return s.replace("'", "\\'")
@@ -122,7 +127,7 @@ def find_today_by_isrc(isrc_code: str, day_iso: str) -> Optional[str]:
     else:
         formula = (
             f"AND("
-            f"SEARCH('{_q(isrc_code)}', ARRAYJOIN({{{PLAYCOUNTS_LINK_FIELD}}})),"
+            f"SEARCH('{_q(isrc_code)}', ARRAYJOIN({{{PLAYCOUNTS_LINK_FIELD}}})),"  # linked field → ARR
             f"IS_SAME({{{PLAYCOUNTS_DATE_FIELD}}}, '{day_iso}', 'day')"
             f")"
         )
@@ -300,7 +305,10 @@ def _recompute_deltas_for_groups(groups: Dict[str, List[Dict[str, Any]]]) -> int
     return changed
 
 def backfill_deltas_for_all() -> int:
-    recs = at_paginate(PLAYCOUNTS_TABLE, {"pageSize": 100, "sort[0][field]": PLAYCOUNTS_DATE_FIELD, "sort[0][direction]": "asc"})
+    recs = at_paginate(
+        PLAYCOUNTS_TABLE,
+        {"pageSize": 100, "sort[0][field]": PLAYCOUNTS_DATE_FIELD, "sort[0][direction]": "asc"}
+    )
     groups: Dict[str, List[Dict[str, Any]]] = {}
     for rec in recs:
         links = rec.get("fields", {}).get(PLAYCOUNTS_LINK_FIELD, [])
@@ -360,7 +368,22 @@ app = Flask(__name__)
 
 @app.get("/health")
 def health():
-    return jsonify({"ok": True})
+    return jsonify({"ok": True, "base": AIRTABLE_BASE_ID})
+
+@app.get("/airtable/ping")
+def airtable_ping():
+    try:
+        r = requests.get(
+            at_url(PLAYCOUNTS_TABLE),
+            headers=at_headers(),
+            params={"pageSize": 1},
+            timeout=30,
+        )
+        ok = r.ok
+        body = r.json() if ok else {"error": r.text}
+        return jsonify({"ok": ok, "status": r.status_code, "table": PLAYCOUNTS_TABLE, "base": AIRTABLE_BASE_ID, "body": body}), (200 if ok else 502)
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
 
 @app.post("/run")
 def run_endpoint():
