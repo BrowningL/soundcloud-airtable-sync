@@ -27,7 +27,7 @@ CATALOGUE_VIEW = os.getenv("CATALOGUE_VIEW", "Inner Catalogue")
 CATALOGUE_ISRC_FIELD = os.getenv("CATALOGUE_ISRC_FIELD", "ISRC")  # plain text ISRC
 
 # ----- Track Playcounts (existing) -----
-PLAYCOUNTS_TABLE = os.getenv("PLAYCOUNTS_TABLE", "SpotifyPlaycounts")
+PLAYCOUNTS_TABLE = os.getenv("PLAYCOUNTS_TABLE", "Spotify Streams")
 PLAYCOUNTS_LINK_FIELD = os.getenv("PLAYCOUNTS_LINK_FIELD", "ISRC")  # linked → Catalogue
 PLAYCOUNTS_DATE_FIELD = os.getenv("PLAYCOUNTS_DATE_FIELD", "Date")
 PLAYCOUNTS_COUNT_FIELD = os.getenv("PLAYCOUNTS_COUNT_FIELD", "Playcount")
