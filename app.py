@@ -758,6 +758,31 @@ def backfill_airtable_to_postgres(days: Optional[str] = None) -> int:
                 inserted += 1
         conn.commit()
     return inserted
+# ── Timezone helpers (safe fallback) ──
+try:
+    from zoneinfo import ZoneInfo, ZoneInfoNotFoundError  # py3.9+
+except Exception:
+    ZoneInfo = None
+    class ZoneInfoNotFoundError(Exception):
+        pass
+
+DEFAULT_TZ = os.getenv("LOCAL_TZ") or "UTC"
+
+def today_iso_local(tzkey: Optional[str] = None) -> str:
+    """
+    Return YYYY-MM-DD in the requested timezone.
+    Falls back to UTC if the zone isn't available.
+    """
+    tzname = (tzkey or DEFAULT_TZ or "UTC")
+    if ZoneInfo:
+        try:
+            return datetime.now(ZoneInfo(tzname)).date().isoformat()
+        except ZoneInfoNotFoundError:
+            pass
+        except Exception:
+            pass
+    # Fallback if tzdata missing or any error
+    return datetime.utcnow().date().isoformat()
 
 # ────────────────────────────────────────────────────────────────────────────────
 # Entrypoint
