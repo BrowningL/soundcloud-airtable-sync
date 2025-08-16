@@ -1,36 +1,58 @@
-# dashboard.py (standalone)
+# dashboard.py — standalone Flask dashboard for Streams & Playlist Growth
 
 import os
 from datetime import date, timedelta
 from typing import List, Tuple
 
 from flask import Flask, jsonify, render_template_string, request
-from psycopg_pool import ConnectionPool
+from psycopg_pool import ConnectionPool, PoolClosed
 from psycopg.rows import dict_row
 
+# ── Config (env) ──────────────────────────────────────────────────────────────
 LOCAL_TZ = os.getenv("LOCAL_TZ", "Europe/London")
 DEFAULT_PLAYLIST_NAME = os.getenv("DEFAULT_PLAYLIST_NAME", "TOGI Motivation")
 DATABASE_URL = os.getenv("DATABASE_URL")
 if not DATABASE_URL:
     raise RuntimeError("DATABASE_URL is required")
 
-# Connection pool — make it lazy and configurable SSL
+# SSL note:
+# Your TCP proxy doesn't support SSL. Set DB_SSLMODE=disable in Railway vars.
+# Defaults to "prefer" so it'll still work on hosts that do support SSL.
 POOL = ConnectionPool(
     conninfo=DATABASE_URL,
-    kwargs={"sslmode": os.getenv("DB_SSLMODE", "prefer")},  # prefer/disable/require
+    kwargs={"sslmode": os.getenv("DB_SSLMODE", "prefer")},  # disable | prefer | require
     min_size=1,
     max_size=5,
-    open=False,  # don't try to connect at import time
+    open=False,  # don't connect at import time (Gunicorn spawns multiple workers)
 )
 
 app = Flask(__name__)
 
-# ------------------------------ Helpers --------------------------------------
+# ── Pool open-once hook + helper ──────────────────────────────────────────────
+@app.before_first_request
+def _open_pool_once():
+    try:
+        if not POOL.is_open:
+            POOL.open()
+    except Exception as e:
+        app.logger.error("DB pool open failed: %s", e)
 
+def _q(query: str, params: tuple | None = None):
+    """Run a query with a dict row factory; (re)open pool if needed once."""
+    try:
+        with POOL.connection() as conn, conn.cursor(row_factory=dict_row) as cur:
+            cur.execute(query, params or ())
+            return cur.fetchall()
+    except PoolClosed:
+        POOL.open()
+        with POOL.connection() as conn, conn.cursor(row_factory=dict_row) as cur:
+            cur.execute(query, params or ())
+            return cur.fetchall()
+
+# ── Helpers ───────────────────────────────────────────────────────────────────
 def _daterange(start: date, end: date) -> List[date]:
     days = (end - start).days
     return [start + timedelta(days=i) for i in range(days + 1)]
-
 
 def _fill_series(rows: List[Tuple[date, int]], start: date, end: date):
     idx = {d: int(v) for d, v in rows}
@@ -40,16 +62,23 @@ def _fill_series(rows: List[Tuple[date, int]], start: date, end: date):
         values.append(idx.get(d, 0))
     return labels, values
 
-# -------------------------------- UI -----------------------------------------
+def _clamp_days(raw: str | None, default: int = 90, min_d: int = 1, max_d: int = 365) -> int:
+    try:
+        v = int(raw or default)
+    except Exception:
+        v = default
+    return min(max(v, min_d), max_d)
+
+# ── UI route ──────────────────────────────────────────────────────────────────
 @app.get("/")
 def ui():
-    # Use a plain triple-quoted string with Jinja variables to avoid Python f-string brace issues
+    # Plain triple-quoted string + Jinja vars so JS braces don't break Python
     html = """<!doctype html>
-<html lang=\"en\"><head>
-<meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width, initial-scale=1\" />
+<html lang="en"><head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1" />
 <title>Streams & Playlists Dashboard</title>
-<script src=\"https://cdn.jsdelivr.net/npm/chart.js\"></script>
-<script src=\"https://cdn.tailwindcss.com\"></script>
+<script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+<script src="https://cdn.tailwindcss.com"></script>
 <style>
   .card { background: rgba(255,255,255,0.7); border-radius: 1rem; box-shadow: 0 8px 24px rgba(0,0,0,0.08); padding: 1.25rem; }
   @media (prefers-color-scheme: dark) { .card { background: rgba(24,24,27,0.7); color: #fff; } }
@@ -59,70 +88,70 @@ def ui():
          min-height: 100vh; }
 </style>
 </head>
-<body class=\"text-zinc-900 dark:text-zinc-100\">
-<div class=\"max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-8\">
-  <header class=\"mb-8\">
-    <h1 class=\"text-2xl sm:text-3xl font-bold\">Streams & Playlists Dashboard</h1>
-    <p class=\"text-sm opacity-70\">Timezone: {{ local_tz }}</p>
+<body class="text-zinc-900 dark:text-zinc-100">
+<div class="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-8">
+  <header class="mb-8">
+    <h1 class="text-2xl sm:text-3xl font-bold">Streams & Playlists Dashboard</h1>
+    <p class="text-sm opacity-70">Timezone: {{ local_tz }}</p>
   </header>
 
-  <section class=\"grid grid-cols-1 lg:grid-cols-3 gap-6\">
-    <div class=\"card col-span-1 lg:col-span-2\">
-      <div class=\"flex items-center justify-between mb-3\">
-        <h2 class=\"text-xl font-semibold\">Daily Streams Δ (sum)</h2>
+  <section class="grid grid-cols-1 lg:grid-cols-3 gap-6">
+    <div class="card col-span-1 lg:col-span-2">
+      <div class="flex items-center justify-between mb-3">
+        <h2 class="text-xl font-semibold">Daily Streams Δ (sum)</h2>
         <div>
-          <label class=\"mr-2 text-sm opacity-70\">Window</label>
-          <select id=\"streamsDays\" class=\"border rounded px-2 py-1 text-sm\">
-            <option value=\"30\">30 days</option>
-            <option value=\"90\" selected>90 days</option>
-            <option value=\"180\">180 days</option>
+          <label class="mr-2 text-sm opacity-70">Window</label>
+          <select id="streamsDays" class="border rounded px-2 py-1 text-sm">
+            <option value="30">30 days</option>
+            <option value="90" selected>90 days</option>
+            <option value="180">180 days</option>
           </select>
         </div>
       </div>
-      <canvas id=\"streamsChart\" height=\"110\"></canvas>
+      <canvas id="streamsChart" height="110"></canvas>
     </div>
 
-    <div class=\"card\">
-      <h2 class=\"text-xl font-semibold mb-3\">Playlists</h2>
-      <label class=\"text-sm opacity-70\">Select playlist</label>
-      <select id=\"playlistSelect\" class=\"w-full border rounded px-2 py-2 mt-1\"></select>
-      <div class=\"mt-4 text-sm\">
-        <div>Latest followers: <span id=\"plFollowers\" class=\"font-semibold\">-</span></div>
-        <div>Last daily Δ: <span id=\"plDelta\" class=\"font-semibold\">-</span></div>
-        <div class=\"mt-2\"><a id=\"plLink\" class=\"underline text-blue-600\" target=\"_blank\" rel=\"noopener\">Open in Spotify</a></div>
+    <div class="card">
+      <h2 class="text-xl font-semibold mb-3">Playlists</h2>
+      <label class="text-sm opacity-70">Select playlist</label>
+      <select id="playlistSelect" class="w-full border rounded px-2 py-2 mt-1"></select>
+      <div class="mt-4 text-sm">
+        <div>Latest followers: <span id="plFollowers" class="font-semibold">-</span></div>
+        <div>Last daily Δ: <span id="plDelta" class="font-semibold">-</span></div>
+        <div class="mt-2"><a id="plLink" class="underline text-blue-600" target="_blank" rel="noopener">Open in Spotify</a></div>
       </div>
     </div>
   </section>
 
-  <section class=\"grid grid-cols-1 lg:grid-cols-2 gap-6 mt-6\">
-    <div class=\"card\">
-      <div class=\"flex items-center justify-between mb-3\">
-        <h2 class=\"text-xl font-semibold\">Playlist Growth (followers & daily Δ)</h2>
+  <section class="grid grid-cols-1 lg:grid-cols-2 gap-6 mt-6">
+    <div class="card">
+      <div class="flex items-center justify-between mb-3">
+        <h2 class="text-xl font-semibold">Playlist Growth (followers & daily Δ)</h2>
         <div>
-          <label class=\"mr-2 text-sm opacity-70\">Window</label>
-          <select id=\"playlistDays\" class=\"border rounded px-2 py-1 text-sm\">
-            <option value=\"30\">30 days</option>
-            <option value=\"90\" selected>90 days</option>
-            <option value=\"180\">180 days</option>
+          <label class="mr-2 text-sm opacity-70">Window</label>
+          <select id="playlistDays" class="border rounded px-2 py-1 text-sm">
+            <option value="30">30 days</option>
+            <option value="90" selected>90 days</option>
+            <option value="180">180 days</option>
           </select>
         </div>
       </div>
-      <canvas id=\"playlistChart\" height=\"120\"></canvas>
+      <canvas id="playlistChart" height="120"></canvas>
     </div>
 
-    <div class=\"card\">
-      <div class=\"flex items-center justify-between mb-3\">
-        <h2 class=\"text-xl font-semibold\">Overlay: Streams Δ vs Total Followers Δ (+ cumulative)</h2>
+    <div class="card">
+      <div class="flex items-center justify-between mb-3">
+        <h2 class="text-xl font-semibold">Overlay: Streams Δ vs Total Followers Δ (+ cumulative)</h2>
         <div>
-          <label class=\"mr-2 text-sm opacity-70\">Window</label>
-          <select id=\"overlayDays\" class=\"border rounded px-2 py-1 text-sm\">
-            <option value=\"30\">30 days</option>
-            <option value=\"90\" selected>90 days</option>
-            <option value=\"180\">180 days</option>
+          <label class="mr-2 text-sm opacity-70">Window</label>
+          <select id="overlayDays" class="border rounded px-2 py-1 text-sm">
+            <option value="30">30 days</option>
+            <option value="90" selected>90 days</option>
+            <option value="180">180 days</option>
           </select>
         </div>
       </div>
-      <canvas id=\"overlayChart\" height=\"120\"></canvas>
+      <canvas id="overlayChart" height="120"></canvas>
     </div>
   </section>
 </div>
@@ -185,27 +214,18 @@ def ui():
 """
     return render_template_string(html, local_tz=LOCAL_TZ, default_playlist_name=DEFAULT_PLAYLIST_NAME)
 
-# -------------------------------- API ----------------------------------------
+# ── API routes ────────────────────────────────────────────────────────────────
 @app.get("/api/streams/total-daily")
 def api_streams_total_daily():
-    try:
-        days = int(request.args.get("days", 90))
-    except Exception:
-        days = 90
-    days = min(max(days, 1), 365)
-
-    q = (
-        """
+    days = _clamp_days(request.args.get("days"), 90)
+    q = """
         SELECT date AS d, COALESCE(SUM(GREATEST(delta,0)),0)::bigint AS v
         FROM spotify_streams_view
         WHERE date >= CURRENT_DATE - %s::int * INTERVAL '1 day'
         GROUP BY d
         ORDER BY d
-        """
-    )
-    with POOL.connection() as conn, conn.cursor(row_factory=dict_row) as cur:
-        cur.execute(q, (days,))
-        rows = cur.fetchall()
+    """
+    rows = _q(q, (days,))
     if rows:
         start, end = rows[0]["d"], rows[-1]["d"]
     else:
@@ -213,11 +233,9 @@ def api_streams_total_daily():
     labels, values = _fill_series([(r["d"], r["v"]) for r in rows], start, end)
     return jsonify({"labels": labels, "values": values})
 
-
 @app.get("/api/playlists/list")
 def api_playlists_list():
-    q = (
-        """
+    q = """
         WITH latest AS (
           SELECT DISTINCT ON (playlist_id)
             playlist_id, playlist_name, followers, snapshot_date
@@ -236,43 +254,31 @@ def api_playlists_list():
         LEFT JOIN playlist_followers_delta d
           ON d.playlist_id = l.playlist_id AND d.date = l.snapshot_date
         ORDER BY l.followers DESC;
-        """
-    )
-    with POOL.connection() as conn, conn.cursor(row_factory=dict_row) as cur:
-        cur.execute(q)
-        out = []
-        for r in cur.fetchall():
-            out.append({
-                "playlist_id": r["playlist_id"],
-                "playlist_name": r["playlist_name"],
-                "followers": int(r["followers"]) if r["followers"] is not None else None,
-                "delta": int(r["delta"]) if r["delta"] is not None else None,
-                "date": r["date"].isoformat() if r["date"] else None,
-                "web_url": r["web_url"],
-            })
+    """
+    rows = _q(q)
+    out = []
+    for r in rows:
+        out.append({
+            "playlist_id": r["playlist_id"],
+            "playlist_name": r["playlist_name"],
+            "followers": int(r["followers"]) if r["followers"] is not None else None,
+            "delta": int(r["delta"]) if r["delta"] is not None else None,
+            "date": r["date"].isoformat() if r["date"] else None,
+            "web_url": r["web_url"],
+        })
     return jsonify(out)
-
 
 @app.get("/api/playlists/<path:playlist_id>/series")
 def api_playlist_series(playlist_id: str):
-    try:
-        days = int(request.args.get("days", 90))
-    except Exception:
-        days = 90
-    days = min(max(days, 1), 365)
-
-    q = (
-        """
+    days = _clamp_days(request.args.get("days"), 90)
+    q = """
         SELECT date AS d, followers, delta
         FROM playlist_followers_delta
         WHERE playlist_id = %s
           AND date >= CURRENT_DATE - %s::int * INTERVAL '1 day'
         ORDER BY d
-        """
-    )
-    with POOL.connection() as conn, conn.cursor(row_factory=dict_row) as cur:
-        cur.execute(q, (playlist_id, days))
-        rows = cur.fetchall()
+    """
+    rows = _q(q, (playlist_id, days))
     if rows:
         start, end = rows[0]["d"], rows[-1]["d"]
     else:
@@ -281,54 +287,36 @@ def api_playlist_series(playlist_id: str):
     _, deltas = _fill_series([(r["d"], int(r["delta"] or 0)) for r in rows], start, end)
     return jsonify({"labels": labels, "followers": followers, "deltas": deltas})
 
-
 @app.get("/api/overlay/streams-vs-followers")
 def api_overlay():
-    try:
-        days = int(request.args.get("days", 90))
-    except Exception:
-        days = 90
-    days = min(max(days, 1), 365)
-
-    q_streams = (
-        """
+    days = _clamp_days(request.args.get("days"), 90)
+    q_streams = """
         SELECT date AS d, COALESCE(SUM(GREATEST(delta,0)),0)::bigint AS v
         FROM spotify_streams_view
         WHERE date >= CURRENT_DATE - %s::int * INTERVAL '1 day'
         GROUP BY d
         ORDER BY d
-        """
-    )
-    q_fdelta = (
-        """
+    """
+    q_fdelta = """
         SELECT date AS d, COALESCE(SUM(delta),0)::bigint AS v
         FROM playlist_followers_delta
         WHERE date >= CURRENT_DATE - %s::int * INTERVAL '1 day'
         GROUP BY d
         ORDER BY d
-        """
-    )
-
-    with POOL.connection() as conn, conn.cursor(row_factory=dict_row) as cur:
-        cur.execute(q_streams, (days,))
-        rows_s = cur.fetchall()
-        cur.execute(q_fdelta, (days,))
-        rows_f = cur.fetchall()
-
+    """
+    rows_s = _q(q_streams, (days,))
+    rows_f = _q(q_fdelta, (days,))
     dates = {r["d"] for r in rows_s} | {r["d"] for r in rows_f}
     if dates:
         start, end = min(dates), max(dates)
     else:
         end = date.today(); start = end - timedelta(days=days)
-
     labels, svals = _fill_series([(r["d"], int(r["v"])) for r in rows_s], start, end)
     _, fvals = _fill_series([(r["d"], int(r["v"])) for r in rows_f], start, end)
-
     fcum, total = [], 0
     for v in fvals:
         total += v
         fcum.append(total)
-
     return jsonify({
         "labels": labels,
         "streams_delta": svals,
@@ -336,19 +324,18 @@ def api_overlay():
         "followers_cum": fcum,
     })
 
-# -------------------------------- Health -------------------------------------
+# ── Health ────────────────────────────────────────────────────────────────────
 @app.get("/health")
 def health():
     try:
-        with POOL.connection() as conn, conn.cursor() as cur:
-            cur.execute("SELECT NOW()")
-            cur.fetchone()
-        return {"ok": True, "db": True}
+        rows = _q("SHOW ssl")
+        ssl = rows[0]["ssl"] if rows else "unknown"
+        _q("SELECT NOW()")  # just to validate a round-trip
+        return {"ok": True, "db": True, "ssl": ssl}
     except Exception as e:
         return {"ok": False, "db": False, "error": str(e)}
 
-
+# ── Entrypoint ────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
     port = int(os.getenv("PORT", "8080"))
     app.run(host="0.0.0.0", port=port, threaded=True)
-# dashboard.py (standalone)
