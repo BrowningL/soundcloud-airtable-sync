@@ -9,8 +9,12 @@ import requests
 from flask import Flask, jsonify, request
 from playwright.async_api import async_playwright
 
+# NEW: Postgres
+import psycopg2
+from psycopg2.extras import RealDictCursor
+
 # ────────────────────────────────────────────────────────────────────────────────
-# CONFIG (reads Node-style envs first; falls back to old names)
+# CONFIG
 # ────────────────────────────────────────────────────────────────────────────────
 AIRTABLE_API_KEY = os.getenv("AIRTABLE_API_KEY") or os.getenv("AT_API_KEY")
 AIRTABLE_BASE_ID = os.getenv("AIRTABLE_BASE_ID") or os.getenv("AT_BASE_ID") or "appAmLhYAVcmKmRC3"
@@ -20,6 +24,10 @@ if not AIRTABLE_API_KEY or not AIRTABLE_API_KEY.startswith("pat"):
         "Set AIRTABLE_API_KEY to a valid Airtable Personal Access Token (starts with 'pat'). "
         "You can also set AT_API_KEY for backward compatibility."
     )
+
+# Postgres
+DATABASE_URL = os.getenv("DATABASE_URL")  # e.g. postgresql://railway:***@timescale.railway.internal:5432/timeseriesdb
+OUTPUT_TARGET = os.getenv("OUTPUT_TARGET", "postgres").lower()  # 'postgres' | 'airtable' | 'both'
 
 # ----- Catalogue (ISRC list) -----
 CATALOGUE_TABLE = os.getenv("CATALOGUE_TABLE", "Catalogue")
@@ -34,13 +42,12 @@ PLAYCOUNTS_COUNT_FIELD = os.getenv("PLAYCOUNTS_COUNT_FIELD", "Playcount")
 PLAYCOUNTS_DELTA_FIELD = os.getenv("PLAYCOUNTS_DELTA_FIELD", "Delta")
 PLAYCOUNTS_KEY_FIELD = os.getenv("PLAYCOUNTS_KEY_FIELD")  # optional idempotency key
 
-# ----- Playlist Followers (NEW) -----
+# ----- Playlist Followers (NEW, later) -----
 FOLLOWERS_TABLE = os.getenv("FOLLOWERS_TABLE", "Playlist Followers")
 FOLLOWERS_LINK_FIELD = os.getenv("FOLLOWERS_LINK_FIELD", "Playlist")  # linked → Playlists
 FOLLOWERS_DATE_FIELD = os.getenv("FOLLOWERS_DATE_FIELD", "Date")
 FOLLOWERS_COUNT_FIELD = os.getenv("FOLLOWERS_COUNT_FIELD", "Followers")
 FOLLOWERS_DELTA_FIELD = os.getenv("FOLLOWERS_DELTA_FIELD", "Delta")
-# allow negative deltas for followers (unfollows happen). Set to "false" to clamp.
 FOLLOWERS_ALLOW_NEGATIVE = (os.getenv("FOLLOWERS_ALLOW_NEGATIVE", "true").lower() in ("1", "true", "yes"))
 
 # ----- Spotify creds -----
@@ -105,6 +112,36 @@ def at_batch_patch(table: str, records: List[Dict[str, Any]]):
         time.sleep(airtable_sleep)
 
 # ────────────────────────────────────────────────────────────────────────────────
+# Postgres helpers (NEW)
+# ────────────────────────────────────────────────────────────────────────────────
+def db_conn():
+    if not DATABASE_URL:
+        raise RuntimeError("DATABASE_URL not set")
+    return psycopg2.connect(DATABASE_URL, cursor_factory=RealDictCursor)
+
+def db_ensure_platform(cur, platform: str = "spotify"):
+    cur.execute("INSERT INTO platform_dim(platform) VALUES (%s) ON CONFLICT DO NOTHING", (platform,))
+
+def db_upsert_track(cur, isrc: str, artist: Optional[str] = None, title: Optional[str] = None) -> str:
+    cur.execute("""
+        INSERT INTO track_dim(isrc, artist, title)
+        VALUES (%s, %s, %s)
+        ON CONFLICT (isrc) DO UPDATE
+          SET artist = COALESCE(EXCLUDED.artist, track_dim.artist),
+              title  = COALESCE(EXCLUDED.title,  track_dim.title)
+        RETURNING track_uid
+    """, (isrc, artist, title))
+    return cur.fetchone()["track_uid"]
+
+def db_upsert_stream(cur, platform: str, track_uid: str, day_iso: str, playcount: int):
+    cur.execute("""
+        INSERT INTO streams(platform, track_uid, stream_date, playcount)
+        VALUES (%s, %s, %s, %s)
+        ON CONFLICT (platform, track_uid, stream_date)
+        DO UPDATE SET playcount = EXCLUDED.playcount
+    """, (platform, track_uid, day_iso, playcount))
+
+# ────────────────────────────────────────────────────────────────────────────────
 # Catalogue / ISRC list
 # ────────────────────────────────────────────────────────────────────────────────
 def list_isrcs() -> List[Dict[str, str]]:
@@ -126,7 +163,7 @@ def list_isrcs() -> List[Dict[str, str]]:
     return rows
 
 # ────────────────────────────────────────────────────────────────────────────────
-# Track Playcounts helpers (existing)
+# Track Playcounts helpers (Airtable)
 # ────────────────────────────────────────────────────────────────────────────────
 def _key(isrc_code: str, day_iso: str) -> str:
     return f"{isrc_code}|{day_iso}"
@@ -278,7 +315,7 @@ def fetch_album(album_id: str, web_token: str, client_token: Optional[str]) -> D
     return {}
 
 # ────────────────────────────────────────────────────────────────────────────────
-# Generic delta recompute (used by both tables)
+# Generic delta recompute for Airtable (unchanged)
 # ────────────────────────────────────────────────────────────────────────────────
 def backfill_table_deltas(
     table: str,
@@ -337,21 +374,19 @@ def backfill_table_deltas(
     return changed
 
 def backfill_deltas_for_all_tracks() -> int:
-    # (existing behavior) clamp negatives for track playcounts (ignore bad zero days)
     return backfill_table_deltas(
         PLAYCOUNTS_TABLE, PLAYCOUNTS_LINK_FIELD, PLAYCOUNTS_DATE_FIELD,
         PLAYCOUNTS_COUNT_FIELD, PLAYCOUNTS_DELTA_FIELD, clamp_negative=True
     )
 
 def backfill_deltas_for_followers() -> int:
-    # allow negatives by default (unfollows), unless env says otherwise
     return backfill_table_deltas(
         FOLLOWERS_TABLE, FOLLOWERS_LINK_FIELD, FOLLOWERS_DATE_FIELD,
         FOLLOWERS_COUNT_FIELD, FOLLOWERS_DELTA_FIELD, clamp_negative=not FOLLOWERS_ALLOW_NEGATIVE
     )
 
 # ────────────────────────────────────────────────────────────────────────────────
-# Main sync (existing)
+# Main sync (now writes to Postgres and/or Airtable)
 # ────────────────────────────────────────────────────────────────────────────────
 async def sync():
     rows = list_isrcs()
@@ -369,29 +404,97 @@ async def sync():
     cache: Dict[str, Dict[str, Any]] = {}
     today_iso = date.today().isoformat()
 
-    for isrc in order:
-        tr = search_track(isrc, search_tok)
-        if not tr:
-            upsert_count(linkmap[isrc], isrc, today_iso, 0)
-            continue
-        tid, aid, _ = tr
-        if aid not in cache:
-            time.sleep(spotify_sleep)
-            cache[aid] = fetch_album(aid, web_tok, cli_tok)
+    # Open one DB connection for the whole run (only if needed)
+    conn = None
+    cur = None
+    if OUTPUT_TARGET in ("postgres", "both"):
+        conn = db_conn()
+        cur = conn.cursor()
+        db_ensure_platform(cur, "spotify")
 
-        pc = 0
-        js = cache[aid]
-        for it in js.get("data", {}).get("albumUnion", {}).get("tracksV2", {}).get("items", []):
-            track = it.get("track", {})
-            cand = (track.get("uri", "") or "").split(":")[-1] if track.get("uri") else None
-            if tid in (track.get("id"), cand):
-                val = track.get("playcount") or 0
-                pc = int(str(val).replace(",", ""))
-                break
+    try:
+        for isrc in order:
+            tr = search_track(isrc, search_tok)
+            if not tr:
+                if OUTPUT_TARGET in ("airtable", "both"):
+                    upsert_count(linkmap[isrc], isrc, today_iso, 0)
+                if OUTPUT_TARGET in ("postgres", "both"):
+                    track_uid = db_upsert_track(cur, isrc, None, None)
+                    db_upsert_stream(cur, "spotify", track_uid, today_iso, 0)
+                continue
 
-        upsert_count(linkmap[isrc], isrc, today_iso, pc)
+            tid, aid, _ = tr
+            if aid not in cache:
+                time.sleep(spotify_sleep)
+                cache[aid] = fetch_album(aid, web_tok, cli_tok)
+
+            pc = 0
+            js = cache[aid]
+            for it in js.get("data", {}).get("albumUnion", {}).get("tracksV2", {}).get("items", []):
+                track = it.get("track", {})
+                cand = (track.get("uri", "") or "").split(":")[-1] if track.get("uri") else None
+                if tid in (track.get("id"), cand):
+                    val = track.get("playcount") or 0
+                    pc = int(str(val).replace(",", ""))
+                    break
+
+            if OUTPUT_TARGET in ("airtable", "both"):
+                upsert_count(linkmap[isrc], isrc, today_iso, pc)
+
+            if OUTPUT_TARGET in ("postgres", "both"):
+                track_uid = db_upsert_track(cur, isrc, None, None)  # pass artist/title later if you have them
+                db_upsert_stream(cur, "spotify", track_uid, today_iso, pc)
+
+        if conn:
+            conn.commit()
+    finally:
+        if cur: cur.close()
+        if conn: conn.close()
 
     print("Completed sync.")
+
+# ────────────────────────────────────────────────────────────────────────────────
+# Backfill Airtable → Postgres (one-shot)
+# ────────────────────────────────────────────────────────────────────────────────
+def backfill_airtable_to_postgres(days: int = 14) -> int:
+    # Build Catalogue id → ISRC map
+    recs = at_paginate(CATALOGUE_TABLE, {
+        "view": CATALOGUE_VIEW, "pageSize": 100, "fields[]": CATALOGUE_ISRC_FIELD
+    })
+    cat_id_to_isrc = {r["id"]: r["fields"].get(CATALOGUE_ISRC_FIELD)
+                      for r in recs if r.get("fields", {}).get(CATALOGUE_ISRC_FIELD)}
+
+    # Pull recent Spotify Streams rows
+    params = {
+        "pageSize": 100,
+        "sort[0][field]": PLAYCOUNTS_DATE_FIELD,
+        "sort[0][direction]": "asc",
+        "filterByFormula": f"IS_AFTER({{{PLAYCOUNTS_DATE_FIELD}}}, DATEADD(TODAY(), -{days}, 'days'))"
+    }
+    rows = at_paginate(PLAYCOUNTS_TABLE, params)
+
+    inserted = 0
+    with db_conn() as conn:
+        with conn.cursor() as cur:
+            db_ensure_platform(cur, "spotify")
+            for r in rows:
+                f = r.get("fields", {})
+                links = f.get(PLAYCOUNTS_LINK_FIELD) or []
+                if not links:
+                    continue
+                isrc = cat_id_to_isrc.get(links[0])
+                if not isrc:
+                    continue
+                day_iso = f.get(PLAYCOUNTS_DATE_FIELD)
+                try:
+                    count = int(f.get(PLAYCOUNTS_COUNT_FIELD, 0) or 0)
+                except Exception:
+                    count = 0
+                track_uid = db_upsert_track(cur, isrc, None, None)
+                db_upsert_stream(cur, "spotify", track_uid, day_iso, count)
+                inserted += 1
+        conn.commit()
+    return inserted
 
 # ────────────────────────────────────────────────────────────────────────────────
 # Flask
@@ -400,7 +503,7 @@ app = Flask(__name__)
 
 @app.get("/health")
 def health():
-    return jsonify({"ok": True, "base": AIRTABLE_BASE_ID})
+    return jsonify({"ok": True, "base": AIRTABLE_BASE_ID, "output_target": OUTPUT_TARGET})
 
 @app.get("/airtable/ping")
 def airtable_ping():
@@ -417,6 +520,17 @@ def airtable_ping():
     except Exception as e:
         return jsonify({"ok": False, "error": str(e)}), 500
 
+# NEW: DB ping
+@app.get("/db/ping")
+def db_ping():
+    try:
+        with db_conn() as conn, conn.cursor() as cur:
+            cur.execute("SELECT 1 AS ok")
+            row = cur.fetchone()
+        return jsonify({"ok": True, "row": row}), 200
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
+
 @app.post("/run")
 def run_endpoint():
     async_flag = request.args.get("async", "0").lower() in ("1", "true", "yes")
@@ -427,19 +541,24 @@ def run_endpoint():
         asyncio.run(sync())
         return jsonify({"status": "completed"}), 200
 
-# existing backfill for playcounts
+# Airtable delta backfills (existing)
 @app.post("/backfill")
 def backfill_endpoint():
     changed = backfill_deltas_for_all_tracks()
     return jsonify({"status": "backfilled_playcounts", "changed": changed}), 200
 
-# NEW: backfill for Playlist Followers
 @app.post("/backfill_followers")
 def backfill_followers_endpoint():
     changed = backfill_deltas_for_followers()
     return jsonify({"status": "backfilled_followers", "changed": changed}), 200
 
-# Optional quick diag for a given ISRC/day (unchanged)
+# NEW: backfill Airtable → Postgres for recent days
+@app.post("/backfill_to_db")
+def backfill_to_db_endpoint():
+    days = int(request.args.get("days", "14"))
+    n = backfill_airtable_to_postgres(days=days)
+    return jsonify({"status": "ok", "inserted_or_updated": n, "window_days": days}), 200
+
 @app.get("/diag")
 def diag():
     isrc = request.args.get("isrc")
