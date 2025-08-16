@@ -9,7 +9,7 @@ import requests
 from flask import Flask, jsonify, request
 from playwright.async_api import async_playwright
 
-# NEW: Postgres
+# Postgres
 import psycopg2
 from psycopg2.extras import RealDictCursor
 
@@ -18,31 +18,31 @@ from psycopg2.extras import RealDictCursor
 # ────────────────────────────────────────────────────────────────────────────────
 AIRTABLE_API_KEY = os.getenv("AIRTABLE_API_KEY") or os.getenv("AT_API_KEY")
 AIRTABLE_BASE_ID = os.getenv("AIRTABLE_BASE_ID") or os.getenv("AT_BASE_ID") or "appAmLhYAVcmKmRC3"
-
 if not AIRTABLE_API_KEY or not AIRTABLE_API_KEY.startswith("pat"):
-    raise RuntimeError(
-        "Set AIRTABLE_API_KEY to a valid Airtable Personal Access Token (starts with 'pat'). "
-        "You can also set AT_API_KEY for backward compatibility."
-    )
+    raise RuntimeError("Set AIRTABLE_API_KEY to a valid Airtable Personal Access Token (starts with 'pat').")
 
-# Postgres
-DATABASE_URL = os.getenv("DATABASE_URL")  # e.g. postgresql://railway:***@timescale.railway.internal:5432/timeseriesdb
+DATABASE_URL = os.getenv("DATABASE_URL")  # e.g. postgresql://railway:***@trolley.proxy.rlwy.net:33798/timeseriesdb
 OUTPUT_TARGET = os.getenv("OUTPUT_TARGET", "postgres").lower()  # 'postgres' | 'airtable' | 'both'
 
 # ----- Catalogue (ISRC list) -----
 CATALOGUE_TABLE = os.getenv("CATALOGUE_TABLE", "Catalogue")
 CATALOGUE_VIEW = os.getenv("CATALOGUE_VIEW", "Inner Catalogue")
-CATALOGUE_ISRC_FIELD = os.getenv("CATALOGUE_ISRC_FIELD", "ISRC")  # plain text ISRC
+CATALOGUE_ISRC_FIELD = os.getenv("CATALOGUE_ISRC_FIELD", "ISRC")
 
-# ----- Track Playcounts (existing) -----
+# ----- Track Playcounts (Airtable) -----
 PLAYCOUNTS_TABLE = os.getenv("PLAYCOUNTS_TABLE", "Spotify Streams")
-PLAYCOUNTS_LINK_FIELD = os.getenv("PLAYCOUNTS_LINK_FIELD", "ISRC")  # linked → Catalogue
+PLAYCOUNTS_LINK_FIELD = os.getenv("PLAYCOUNTS_LINK_FIELD", "ISRC")
 PLAYCOUNTS_DATE_FIELD = os.getenv("PLAYCOUNTS_DATE_FIELD", "Date")
 PLAYCOUNTS_COUNT_FIELD = os.getenv("PLAYCOUNTS_COUNT_FIELD", "Playcount")
 PLAYCOUNTS_DELTA_FIELD = os.getenv("PLAYCOUNTS_DELTA_FIELD", "Delta")
-PLAYCOUNTS_KEY_FIELD = os.getenv("PLAYCOUNTS_KEY_FIELD")  # optional idempotency key
+PLAYCOUNTS_KEY_FIELD = os.getenv("PLAYCOUNTS_KEY_FIELD")
 
-# ----- Playlist Followers (NEW, later) -----
+# ----- Playlists master (Airtable is source of truth) -----
+PLAYLISTS_TABLE = os.getenv("PLAYLISTS_TABLE", "Playlists")
+PLAYLISTS_NAME_FIELD = os.getenv("PLAYLISTS_NAME_FIELD", "Playlist Name")
+PLAYLISTS_ID_FIELD = os.getenv("PLAYLISTS_ID_FIELD", "Playlist ID")
+
+# ----- Playlist Followers (Airtable) -----
 FOLLOWERS_TABLE = os.getenv("FOLLOWERS_TABLE", "Playlist Followers")
 FOLLOWERS_LINK_FIELD = os.getenv("FOLLOWERS_LINK_FIELD", "Playlist")  # linked → Playlists
 FOLLOWERS_DATE_FIELD = os.getenv("FOLLOWERS_DATE_FIELD", "Date")
@@ -50,7 +50,7 @@ FOLLOWERS_COUNT_FIELD = os.getenv("FOLLOWERS_COUNT_FIELD", "Followers")
 FOLLOWERS_DELTA_FIELD = os.getenv("FOLLOWERS_DELTA_FIELD", "Delta")
 FOLLOWERS_ALLOW_NEGATIVE = (os.getenv("FOLLOWERS_ALLOW_NEGATIVE", "true").lower() in ("1", "true", "yes"))
 
-# ----- Spotify creds -----
+# Spotify creds
 CLIENT_ID = os.getenv("SPOTIFY_CLIENT_ID", "YOUR_SPOTIFY_CLIENT_ID")
 CLIENT_SECRET = os.getenv("SPOTIFY_CLIENT_SECRET", "YOUR_SPOTIFY_CLIENT_SECRET")
 
@@ -112,7 +112,7 @@ def at_batch_patch(table: str, records: List[Dict[str, Any]]):
         time.sleep(airtable_sleep)
 
 # ────────────────────────────────────────────────────────────────────────────────
-# Postgres helpers (NEW)
+# Postgres helpers
 # ────────────────────────────────────────────────────────────────────────────────
 def db_conn():
     if not DATABASE_URL:
@@ -140,6 +140,15 @@ def db_upsert_stream(cur, platform: str, track_uid: str, day_iso: str, playcount
         ON CONFLICT (platform, track_uid, stream_date)
         DO UPDATE SET playcount = EXCLUDED.playcount
     """, (platform, track_uid, day_iso, playcount))
+
+def db_upsert_playlist_followers(cur, platform: str, playlist_id: str, day_iso: str, followers: int, playlist_name: str = None):
+    cur.execute("""
+        INSERT INTO playlist_followers(platform, playlist_id, snapshot_date, followers, playlist_name)
+        VALUES (%s, %s, %s, %s, %s)
+        ON CONFLICT (platform, playlist_id, snapshot_date)
+        DO UPDATE SET followers = EXCLUDED.followers,
+                      playlist_name = COALESCE(EXCLUDED.playlist_name, playlist_followers.playlist_name)
+    """, (platform, playlist_id, day_iso, followers, playlist_name))
 
 # ────────────────────────────────────────────────────────────────────────────────
 # Catalogue / ISRC list
@@ -174,16 +183,11 @@ def find_today_by_isrc(isrc_code: str, day_iso: str) -> Optional[str]:
     else:
         formula = (
             f"AND("
-            f"SEARCH('{_q(isrc_code)}', ARRAYJOIN({{{PLAYCOUNTS_LINK_FIELD}}})),"  # linked field → ARR
+            f"SEARCH('{_q(isrc_code)}', ARRAYJOIN({{{PLAYCOUNTS_LINK_FIELD}}})),"  # linked → ARRAY
             f"IS_SAME({{{PLAYCOUNTS_DATE_FIELD}}}, '{day_iso}', 'day')"
             f")"
         )
-    r = requests.get(
-        at_url(PLAYCOUNTS_TABLE),
-        headers=at_headers(),
-        params={"filterByFormula": formula, "pageSize": 1},
-        timeout=60,
-    )
+    r = requests.get(at_url(PLAYCOUNTS_TABLE), headers=at_headers(), params={"filterByFormula": formula, "pageSize": 1}, timeout=60)
     if r.status_code != 200: return None
     recs = r.json().get("records", [])
     return recs[0]["id"] if recs else None
@@ -239,25 +243,33 @@ def upsert_count(linked_catalogue_rec_id: str, isrc_code: str, day_iso: str, cou
     time.sleep(airtable_sleep)
 
 # ────────────────────────────────────────────────────────────────────────────────
-# Spotify (unchanged)
+# Playlists master (Airtable → list of IDs to track)
+# ────────────────────────────────────────────────────────────────────────────────
+def playlists_index_from_airtable():
+    rows = at_paginate(PLAYLISTS_TABLE, {
+        "pageSize": 100,
+        "fields[]": [PLAYLISTS_NAME_FIELD, PLAYLISTS_ID_FIELD]
+    })
+    out = {}
+    for r in rows:
+        f = r.get("fields", {})
+        pid = f.get(PLAYLISTS_ID_FIELD)
+        name = f.get(PLAYLISTS_NAME_FIELD)
+        if pid:
+            out[r["id"]] = {"playlist_id": pid, "name": name}
+    return out
+
+# ────────────────────────────────────────────────────────────────────────────────
+# Spotify helpers (unchanged)
 # ────────────────────────────────────────────────────────────────────────────────
 def get_search_token() -> str:
-    r = requests.post(
-        "https://accounts.spotify.com/api/token",
-        data={"grant_type": "client_credentials"},
-        auth=(CLIENT_ID, CLIENT_SECRET),
-        timeout=60,
-    )
+    r = requests.post("https://accounts.spotify.com/api/token", data={"grant_type": "client_credentials"}, auth=(CLIENT_ID, CLIENT_SECRET), timeout=60)
     r.raise_for_status()
     return r.json()["access_token"]
 
 def search_track(isrc: str, bearer: str) -> Optional[Tuple[str, str, str]]:
-    r = requests.get(
-        "https://api.spotify.com/v1/search",
-        headers={"Authorization": f"Bearer {bearer}"},
-        params={"q": f"isrc:{isrc}", "type": "track", "limit": 5},
-        timeout=60,
-    )
+    r = requests.get("https://api.spotify.com/v1/search", headers={"Authorization": f"Bearer {bearer}"},
+                     params={"q": f"isrc:{isrc}", "type": "track", "limit": 5}, timeout=60)
     if r.status_code != 200:
         return None
     for t in r.json().get("tracks", {}).get("items", []):
@@ -268,16 +280,12 @@ def search_track(isrc: str, bearer: str) -> Optional[Tuple[str, str, str]]:
         return items[0]["id"], items[0]["album"]["id"], items[0]["name"]
     return None
 
-# ────────────────────────────────────────────────────────────────────────────────
-# Sniff Spotify web token (unchanged)
-# ────────────────────────────────────────────────────────────────────────────────
 async def sniff_tokens() -> Tuple[str, Optional[str]]:
     async with async_playwright() as p:
         browser = await p.chromium.launch(headless=True, args=["--no-sandbox"])
         ctx = await browser.new_context(user_agent=USER_AGENT)
         page = await ctx.new_page()
         fut = asyncio.get_event_loop().create_future()
-
         def on_resp(resp):
             if "/pathfinder/v2/query" in resp.url and resp.status == 200:
                 hdrs = resp.request.headers
@@ -287,7 +295,6 @@ async def sniff_tokens() -> Tuple[str, Optional[str]]:
                     cli = hdrs.get("client-token")
                     if not fut.done():
                         fut.set_result((tok, cli))
-
         page.on("response", on_resp)
         await page.goto("https://open.spotify.com/album/2noRn2Aes5aoNVsU6iWThc")
         try:
@@ -315,26 +322,16 @@ def fetch_album(album_id: str, web_token: str, client_token: Optional[str]) -> D
     return {}
 
 # ────────────────────────────────────────────────────────────────────────────────
-# Generic delta recompute for Airtable (unchanged)
+# Generic Airtable delta recompute (unchanged)
 # ────────────────────────────────────────────────────────────────────────────────
-def backfill_table_deltas(
-    table: str,
-    link_field: str,
-    date_field: str,
-    count_field: str,
-    delta_field: str,
-    clamp_negative: bool,
-) -> int:
-    recs = at_paginate(
-        table,
-        {"pageSize": 100, "sort[0][field]": date_field, "sort[0][direction]": "asc"}
-    )
+def backfill_table_deltas(table: str, link_field: str, date_field: str, count_field: str, delta_field: str, clamp_negative: bool) -> int:
+    recs = at_paginate(table, {"pageSize": 100, "sort[0][field]": date_field, "sort[0][direction]": "asc"})
     groups: Dict[str, List[Dict[str, Any]]] = {}
     for rec in recs:
         links = rec.get("fields", {}).get(link_field, [])
         if not links:
             continue
-        key = links[0]  # first linked record id
+        key = links[0]
         groups.setdefault(key, []).append(rec)
 
     updates: List[Dict[str, Any]] = []
@@ -374,19 +371,13 @@ def backfill_table_deltas(
     return changed
 
 def backfill_deltas_for_all_tracks() -> int:
-    return backfill_table_deltas(
-        PLAYCOUNTS_TABLE, PLAYCOUNTS_LINK_FIELD, PLAYCOUNTS_DATE_FIELD,
-        PLAYCOUNTS_COUNT_FIELD, PLAYCOUNTS_DELTA_FIELD, clamp_negative=True
-    )
+    return backfill_table_deltas(PLAYCOUNTS_TABLE, PLAYCOUNTS_LINK_FIELD, PLAYCOUNTS_DATE_FIELD, PLAYCOUNTS_COUNT_FIELD, PLAYCOUNTS_DELTA_FIELD, clamp_negative=True)
 
 def backfill_deltas_for_followers() -> int:
-    return backfill_table_deltas(
-        FOLLOWERS_TABLE, FOLLOWERS_LINK_FIELD, FOLLOWERS_DATE_FIELD,
-        FOLLOWERS_COUNT_FIELD, FOLLOWERS_DELTA_FIELD, clamp_negative=not FOLLOWERS_ALLOW_NEGATIVE
-    )
+    return backfill_table_deltas(FOLLOWERS_TABLE, FOLLOWERS_LINK_FIELD, FOLLOWERS_DATE_FIELD, FOLLOWERS_COUNT_FIELD, FOLLOWERS_DELTA_FIELD, clamp_negative=not FOLLOWERS_ALLOW_NEGATIVE)
 
 # ────────────────────────────────────────────────────────────────────────────────
-# Main sync (now writes to Postgres and/or Airtable)
+# Main sync for Spotify streams (writes to Postgres and/or Airtable)
 # ────────────────────────────────────────────────────────────────────────────────
 async def sync():
     rows = list_isrcs()
@@ -404,7 +395,6 @@ async def sync():
     cache: Dict[str, Dict[str, Any]] = {}
     today_iso = date.today().isoformat()
 
-    # Open one DB connection for the whole run (only if needed)
     conn = None
     cur = None
     if OUTPUT_TARGET in ("postgres", "both"):
@@ -440,9 +430,8 @@ async def sync():
 
             if OUTPUT_TARGET in ("airtable", "both"):
                 upsert_count(linkmap[isrc], isrc, today_iso, pc)
-
             if OUTPUT_TARGET in ("postgres", "both"):
-                track_uid = db_upsert_track(cur, isrc, None, None)  # pass artist/title later if you have them
+                track_uid = db_upsert_track(cur, isrc, None, None)
                 db_upsert_stream(cur, "spotify", track_uid, today_iso, pc)
 
         if conn:
@@ -454,7 +443,7 @@ async def sync():
     print("Completed sync.")
 
 # ────────────────────────────────────────────────────────────────────────────────
-# Backfill Airtable → Postgres (one-shot)
+# Backfills (Airtable → Postgres)
 # ────────────────────────────────────────────────────────────────────────────────
 def backfill_airtable_to_postgres(days: Optional[str] = None) -> int:
     """
@@ -462,14 +451,9 @@ def backfill_airtable_to_postgres(days: Optional[str] = None) -> int:
       - 'all' (or None/0/negative) => backfill ALL rows
       - positive integer string => only last N days
     """
-    # Build Catalogue id → ISRC map
-    recs = at_paginate(CATALOGUE_TABLE, {
-        "view": CATALOGUE_VIEW, "pageSize": 100, "fields[]": CATALOGUE_ISRC_FIELD
-    })
-    cat_id_to_isrc = {r["id"]: r["fields"].get(CATALOGUE_ISRC_FIELD)
-                      for r in recs if r.get("fields", {}).get(CATALOGUE_ISRC_FIELD)}
+    recs = at_paginate(CATALOGUE_TABLE, {"view": CATALOGUE_VIEW, "pageSize": 100, "fields[]": CATALOGUE_ISRC_FIELD})
+    cat_id_to_isrc = {r["id"]: r["fields"].get(CATALOGUE_ISRC_FIELD) for r in recs if r.get("fields", {}).get(CATALOGUE_ISRC_FIELD)}
 
-    # Decide query scope
     all_data = False
     d_val: Optional[int] = None
     if days is None:
@@ -481,20 +465,12 @@ def backfill_airtable_to_postgres(days: Optional[str] = None) -> int:
         except Exception:
             all_data = str(days).lower() in ("all", "everything", "full")
 
-    params = {
-        "pageSize": 100,
-        "sort[0][field]": PLAYCOUNTS_DATE_FIELD,
-        "sort[0][direction]": "asc",
-    }
+    params = {"pageSize": 100, "sort[0][field]": PLAYCOUNTS_DATE_FIELD, "sort[0][direction]": "asc"}
     if not all_data and d_val is not None and d_val > 0:
-        params["filterByFormula"] = (
-            f"IS_AFTER({{{PLAYCOUNTS_DATE_FIELD}}}, DATEADD(TODAY(), -{d_val}, 'days'))"
-        )
+        params["filterByFormula"] = f"IS_AFTER({{{PLAYCOUNTS_DATE_FIELD}}}, DATEADD(TODAY(), -{d_val}, 'days'))"
 
-    # Pull rows (all or last N days)
     rows = at_paginate(PLAYCOUNTS_TABLE, params)
 
-    # Upsert into Postgres
     inserted = 0
     with db_conn() as conn:
         with conn.cursor() as cur:
@@ -518,6 +494,34 @@ def backfill_airtable_to_postgres(days: Optional[str] = None) -> int:
         conn.commit()
     return inserted
 
+def backfill_playlist_followers_all(platform: str = "spotify") -> int:
+    idx = playlists_index_from_airtable()
+    params = {"pageSize": 100, "sort[0][field]": FOLLOWERS_DATE_FIELD, "sort[0][direction]": "asc"}
+    rows = at_paginate(FOLLOWERS_TABLE, params)
+
+    inserted = 0
+    with db_conn() as conn, conn.cursor() as cur:
+        db_ensure_platform(cur, platform)
+        for r in rows:
+            f = r.get("fields", {})
+            links = f.get(FOLLOWERS_LINK_FIELD) or []
+            if not links:
+                continue
+            meta = idx.get(links[0])
+            if not meta:
+                continue
+            playlist_id = meta["playlist_id"]
+            playlist_name = meta.get("name")
+            day_iso = f.get(FOLLOWERS_DATE_FIELD)
+            try:
+                followers = int(f.get(FOLLOWERS_COUNT_FIELD, 0) or 0)
+            except Exception:
+                followers = 0
+            db_upsert_playlist_followers(cur, platform, playlist_id, day_iso, followers, playlist_name)
+            inserted += 1
+        conn.commit()
+    return inserted
+
 # ────────────────────────────────────────────────────────────────────────────────
 # Flask
 # ────────────────────────────────────────────────────────────────────────────────
@@ -530,19 +534,13 @@ def health():
 @app.get("/airtable/ping")
 def airtable_ping():
     try:
-        r = requests.get(
-            at_url(PLAYCOUNTS_TABLE),
-            headers=at_headers(),
-            params={"pageSize": 1},
-            timeout=30,
-        )
+        r = requests.get(at_url(PLAYCOUNTS_TABLE), headers=at_headers(), params={"pageSize": 1}, timeout=30)
         ok = r.ok
         body = r.json() if ok else {"error": r.text}
         return jsonify({"ok": ok, "status": r.status_code, "table": PLAYCOUNTS_TABLE, "base": AIRTABLE_BASE_ID, "body": body}), (200 if ok else 502)
     except Exception as e:
         return jsonify({"ok": False, "error": str(e)}), 500
 
-# NEW: DB ping
 @app.get("/db/ping")
 def db_ping():
     try:
@@ -563,7 +561,6 @@ def run_endpoint():
         asyncio.run(sync())
         return jsonify({"status": "completed"}), 200
 
-# Airtable delta backfills (existing)
 @app.post("/backfill")
 def backfill_endpoint():
     changed = backfill_deltas_for_all_tracks()
@@ -574,12 +571,38 @@ def backfill_followers_endpoint():
     changed = backfill_deltas_for_followers()
     return jsonify({"status": "backfilled_followers", "changed": changed}), 200
 
-# NEW: backfill Airtable → Postgres for recent days
 @app.post("/backfill_to_db")
 def backfill_to_db_endpoint():
-    days = request.args.get("days", "all")  # default to ALL
+    days = request.args.get("days", "all")
     n = backfill_airtable_to_postgres(days=days)
     return jsonify({"status": "ok", "inserted_or_updated": n, "window_days": days}), 200
+
+@app.post("/backfill_followers_to_db")
+def backfill_followers_to_db():
+    n = backfill_playlist_followers_all(platform="spotify")
+    return jsonify({"ok": True, "inserted_or_updated": n}), 200
+
+# Optional push-mode ingest for followers
+# Body: { "platform":"spotify", "records":[{"playlist_id":"5KV...","date":"YYYY-MM-DD","followers":1234,"playlist_name":"optional"}] }
+@app.post("/ingest/playlist_followers")
+def ingest_playlist_followers():
+    data = request.get_json(force=True) or {}
+    platform = (data.get("platform") or "spotify").lower()
+    records = data.get("records") or []
+    if not records:
+        return jsonify({"ok": False, "error": "no records"}), 400
+    with db_conn() as conn, conn.cursor() as cur:
+        db_ensure_platform(cur, platform)
+        for rec in records:
+            pid = rec.get("playlist_id")
+            day = rec.get("date")
+            followers = int(rec.get("followers") or 0)
+            name = rec.get("playlist_name")
+            if not (pid and day):
+                continue
+            db_upsert_playlist_followers(cur, platform, pid, day, followers, name)
+        conn.commit()
+    return jsonify({"ok": True, "count": len(records)}), 200
 
 @app.get("/diag")
 def diag():
@@ -587,10 +610,7 @@ def diag():
     day  = request.args.get("day")
     if not isrc or not day:
         return jsonify({"error": "isrc & day required"}), 400
-    return jsonify({
-        "find_today_id": find_today_by_isrc(isrc, day),
-        "prev_count": prev_count_by_isrc(isrc, day)
-    })
+    return jsonify({"find_today_id": find_today_by_isrc(isrc, day), "prev_count": prev_count_by_isrc(isrc, day)})
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", "3000"))
