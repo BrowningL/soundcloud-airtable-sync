@@ -1,3 +1,5 @@
+# dashboard.py (standalone)
+
 import os
 from datetime import date, timedelta
 from typing import List, Tuple
@@ -12,12 +14,13 @@ DATABASE_URL = os.getenv("DATABASE_URL")
 if not DATABASE_URL:
     raise RuntimeError("DATABASE_URL is required")
 
-# Connection pool (Railway proxy typically needs SSL)
+# Connection pool — make it lazy and configurable SSL
 POOL = ConnectionPool(
     conninfo=DATABASE_URL,
-    kwargs={"sslmode": "prefer"},
+    kwargs={"sslmode": os.getenv("DB_SSLMODE", "prefer")},  # prefer/disable/require
     min_size=1,
     max_size=5,
+    open=False,  # don't try to connect at import time
 )
 
 app = Flask(__name__)
@@ -364,12 +367,13 @@ DATABASE_URL = os.getenv("DATABASE_URL")
 if not DATABASE_URL:
     raise RuntimeError("DATABASE_URL is required")
 
-# Connection pool (Railway proxy typically needs SSL)
+# Connection pool — make it lazy and configurable SSL
 POOL = ConnectionPool(
     conninfo=DATABASE_URL,
-    kwargs={"sslmode": "require"},
+    kwargs={"sslmode": os.getenv("DB_SSLMODE", "prefer")},  # prefer/disable/require
     min_size=1,
     max_size=5,
+    open=False,  # don't try to connect at import time
 )
 
 app = Flask(__name__)
