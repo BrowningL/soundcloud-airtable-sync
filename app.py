@@ -549,22 +549,21 @@ def fetch_playlist_followers_spotify(plain_id: str, bearer: str) -> Optional[int
         return None
     return int(r.json().get("followers", {}).get("total", 0) or 0)
 
-def run_followers_today(platform: str = "spotify") -> Dict[str, Any]:
-    idx = playlists_index_from_airtable()  # Airtable = which playlists to track
+def run_followers_today(platform: str = "spotify", tzkey: Optional[str] = None) -> Dict[str, Any]:
+    idx = playlists_index_from_airtable()
     if not idx:
         return {"inserted": 0, "skipped": 0, "reason": "no_playlists"}
 
     bearer = get_client_bearer()
-    today = today_iso_local()
+    today = today_iso_local(tzkey)
 
     inserted = 0
     skipped = 0
-
     with db_conn() as conn, conn.cursor() as cur:
         db_ensure_platform(cur, platform)
         for meta in idx.values():
-            urn = meta["playlist_id_urn"]              # we store URN in DB
-            plain = urn_to_plain_id(urn)               # API needs plain id
+            urn = meta["playlist_id_urn"]
+            plain = urn_to_plain_id(urn)
             followers = fetch_playlist_followers_spotify(plain, bearer)
             if followers is None:
                 skipped += 1
@@ -574,6 +573,7 @@ def run_followers_today(platform: str = "spotify") -> Dict[str, Any]:
         conn.commit()
 
     return {"inserted": inserted, "skipped": skipped, "date": today}
+
 
 # ────────────────────────────────────────────────────────────────────────────────
 # Flask
