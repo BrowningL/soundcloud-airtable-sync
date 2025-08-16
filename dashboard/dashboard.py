@@ -5,7 +5,6 @@ from typing import List, Tuple
 from flask import Flask, jsonify, render_template_string, request
 from psycopg_pool import ConnectionPool
 from psycopg.rows import dict_row
-import psycopg
 
 LOCAL_TZ = os.getenv("LOCAL_TZ", "Europe/London")
 DEFAULT_PLAYLIST_NAME = os.getenv("DEFAULT_PLAYLIST_NAME", "TOGI Motivation")
@@ -41,26 +40,27 @@ def _fill_series(rows: List[Tuple[date, int]], start: date, end: date):
 # -------------------------------- UI -----------------------------------------
 @app.get("/")
 def ui():
-    html = f"""<!doctype html>
+    # Use a plain triple-quoted string with Jinja variables to avoid Python f-string brace issues
+    html = """<!doctype html>
 <html lang=\"en\"><head>
 <meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width, initial-scale=1\" />
 <title>Streams & Playlists Dashboard</title>
 <script src=\"https://cdn.jsdelivr.net/npm/chart.js\"></script>
 <script src=\"https://cdn.tailwindcss.com\"></script>
 <style>
-  .card {{ background: rgba(255,255,255,0.7); border-radius: 1rem; box-shadow: 0 8px 24px rgba(0,0,0,0.08); padding: 1.25rem; }}
-  @media (prefers-color-scheme: dark) {{ .card {{ background: rgba(24,24,27,0.7); color: #fff; }} }}
-  body {{ background: radial-gradient(1200px 600px at 10% -10%, #f0f9ff 0%, transparent 60%),
+  .card { background: rgba(255,255,255,0.7); border-radius: 1rem; box-shadow: 0 8px 24px rgba(0,0,0,0.08); padding: 1.25rem; }
+  @media (prefers-color-scheme: dark) { .card { background: rgba(24,24,27,0.7); color: #fff; } }
+  body { background: radial-gradient(1200px 600px at 10% -10%, #f0f9ff 0%, transparent 60%),
                   radial-gradient(1200px 600px at 110% -10%, #fef3c7 0%, transparent 60%),
                   radial-gradient(1200px 600px at 50% 120%, #e9d5ff 0%, transparent 60%);
-         min-height: 100vh; }}
+         min-height: 100vh; }
 </style>
 </head>
 <body class=\"text-zinc-900 dark:text-zinc-100\">
 <div class=\"max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-8\">
   <header class=\"mb-8\">
     <h1 class=\"text-2xl sm:text-3xl font-bold\">Streams & Playlists Dashboard</h1>
-    <p class=\"text-sm opacity-70\">Timezone: {LOCAL_TZ}</p>
+    <p class=\"text-sm opacity-70\">Timezone: {{ local_tz }}</p>
   </header>
 
   <section class=\"grid grid-cols-1 lg:grid-cols-3 gap-6\">
@@ -84,8 +84,8 @@ def ui():
       <label class=\"text-sm opacity-70\">Select playlist</label>
       <select id=\"playlistSelect\" class=\"w-full border rounded px-2 py-2 mt-1\"></select>
       <div class=\"mt-4 text-sm\">
-        <div>Latest followers: <span id=\"plFollowers\" class=\"font-semibold\">–</span></div>
-        <div>Last daily Δ: <span id=\"plDelta\" class=\"font-semibold\">–</span></div>
+        <div>Latest followers: <span id=\"plFollowers\" class=\"font-semibold\">-</span></div>
+        <div>Last daily Δ: <span id=\"plDelta\" class=\"font-semibold\">-</span></div>
         <div class=\"mt-2\"><a id=\"plLink\" class=\"underline text-blue-600\" target=\"_blank\" rel=\"noopener\">Open in Spotify</a></div>
       </div>
     </div>
@@ -125,7 +125,7 @@ def ui():
 </div>
 
 <script>
-  const DEFAULT_PLAYLIST_NAME = {DEFAULT_PLAYLIST_NAME!r};
+  const DEFAULT_PLAYLIST_NAME = {{ default_playlist_name | tojson }};
   let streamsChart, playlistChart, overlayChart;
   const fmt = (n) => Number(n).toLocaleString();
 
@@ -152,7 +152,7 @@ def ui():
     const list = await api('/api/playlists/list');
     const id = document.getElementById('playlistSelect').value; const p = list.find(x => x.playlist_id === id); if (!p) return;
     document.getElementById('plFollowers').textContent = fmt(p.followers ?? 0);
-    document.getElementById('plDelta').textContent = (p.delta == null) ? '–' : fmt(p.delta);
+    document.getElementById('plDelta').textContent = (p.delta == null) ? '-' : fmt(p.delta);
     const a = document.getElementById('plLink'); a.href = p.web_url;
   }
 
@@ -180,7 +180,7 @@ def ui():
 </script>
 </body></html>
 """
-    return render_template_string(html)
+    return render_template_string(html, local_tz=LOCAL_TZ, default_playlist_name=DEFAULT_PLAYLIST_NAME)
 
 # -------------------------------- API ----------------------------------------
 @app.get("/api/streams/total-daily")
@@ -357,7 +357,6 @@ from typing import List, Tuple
 from flask import Flask, jsonify, render_template_string, request
 from psycopg_pool import ConnectionPool
 from psycopg.rows import dict_row
-import psycopg
 
 LOCAL_TZ = os.getenv("LOCAL_TZ", "Europe/London")
 DEFAULT_PLAYLIST_NAME = os.getenv("DEFAULT_PLAYLIST_NAME", "TOGI Motivation")
@@ -393,26 +392,27 @@ def _fill_series(rows: List[Tuple[date, int]], start: date, end: date):
 # -------------------------------- UI -----------------------------------------
 @app.get("/")
 def ui():
-    html = f"""<!doctype html>
+    # Use a plain triple-quoted string with Jinja variables to avoid Python f-string brace issues
+    html = """<!doctype html>
 <html lang=\"en\"><head>
 <meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width, initial-scale=1\" />
 <title>Streams & Playlists Dashboard</title>
 <script src=\"https://cdn.jsdelivr.net/npm/chart.js\"></script>
 <script src=\"https://cdn.tailwindcss.com\"></script>
 <style>
-  .card {{ background: rgba(255,255,255,0.7); border-radius: 1rem; box-shadow: 0 8px 24px rgba(0,0,0,0.08); padding: 1.25rem; }}
-  @media (prefers-color-scheme: dark) {{ .card {{ background: rgba(24,24,27,0.7); color: #fff; }} }}
-  body {{ background: radial-gradient(1200px 600px at 10% -10%, #f0f9ff 0%, transparent 60%),
+  .card { background: rgba(255,255,255,0.7); border-radius: 1rem; box-shadow: 0 8px 24px rgba(0,0,0,0.08); padding: 1.25rem; }
+  @media (prefers-color-scheme: dark) { .card { background: rgba(24,24,27,0.7); color: #fff; } }
+  body { background: radial-gradient(1200px 600px at 10% -10%, #f0f9ff 0%, transparent 60%),
                   radial-gradient(1200px 600px at 110% -10%, #fef3c7 0%, transparent 60%),
                   radial-gradient(1200px 600px at 50% 120%, #e9d5ff 0%, transparent 60%);
-         min-height: 100vh; }}
+         min-height: 100vh; }
 </style>
 </head>
 <body class=\"text-zinc-900 dark:text-zinc-100\">
 <div class=\"max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-8\">
   <header class=\"mb-8\">
     <h1 class=\"text-2xl sm:text-3xl font-bold\">Streams & Playlists Dashboard</h1>
-    <p class=\"text-sm opacity-70\">Timezone: {LOCAL_TZ}</p>
+    <p class=\"text-sm opacity-70\">Timezone: {{ local_tz }}</p>
   </header>
 
   <section class=\"grid grid-cols-1 lg:grid-cols-3 gap-6\">
@@ -436,8 +436,8 @@ def ui():
       <label class=\"text-sm opacity-70\">Select playlist</label>
       <select id=\"playlistSelect\" class=\"w-full border rounded px-2 py-2 mt-1\"></select>
       <div class=\"mt-4 text-sm\">
-        <div>Latest followers: <span id=\"plFollowers\" class=\"font-semibold\">–</span></div>
-        <div>Last daily Δ: <span id=\"plDelta\" class=\"font-semibold\">–</span></div>
+        <div>Latest followers: <span id=\"plFollowers\" class=\"font-semibold\">-</span></div>
+        <div>Last daily Δ: <span id=\"plDelta\" class=\"font-semibold\">-</span></div>
         <div class=\"mt-2\"><a id=\"plLink\" class=\"underline text-blue-600\" target=\"_blank\" rel=\"noopener\">Open in Spotify</a></div>
       </div>
     </div>
@@ -477,7 +477,7 @@ def ui():
 </div>
 
 <script>
-  const DEFAULT_PLAYLIST_NAME = {DEFAULT_PLAYLIST_NAME!r};
+  const DEFAULT_PLAYLIST_NAME = {{ default_playlist_name | tojson }};
   let streamsChart, playlistChart, overlayChart;
   const fmt = (n) => Number(n).toLocaleString();
 
@@ -504,7 +504,7 @@ def ui():
     const list = await api('/api/playlists/list');
     const id = document.getElementById('playlistSelect').value; const p = list.find(x => x.playlist_id === id); if (!p) return;
     document.getElementById('plFollowers').textContent = fmt(p.followers ?? 0);
-    document.getElementById('plDelta').textContent = (p.delta == null) ? '–' : fmt(p.delta);
+    document.getElementById('plDelta').textContent = (p.delta == null) ? '-' : fmt(p.delta);
     const a = document.getElementById('plLink'); a.href = p.web_url;
   }
 
@@ -532,7 +532,7 @@ def ui():
 </script>
 </body></html>
 """
-    return render_template_string(html)
+    return render_template_string(html, local_tz=LOCAL_TZ, default_playlist_name=DEFAULT_PLAYLIST_NAME)
 
 # -------------------------------- API ----------------------------------------
 @app.get("/api/streams/total-daily")
