@@ -22,7 +22,7 @@ AIRTABLE_BASE_ID = os.getenv("AIRTABLE_BASE_ID") or os.getenv("AT_BASE_ID") or "
 if not AIRTABLE_API_KEY or not AIRTABLE_API_KEY.startswith("pat"):
     raise RuntimeError("Set AIRTABLE_API_KEY to a valid Airtable Personal Access Token (starts with 'pat').")
 
-DATABASE_URL = os.getenv("DATABASE_URL")  # e.g. postgresql://railway:***@trolley.proxy.rlwy.net:33798/timeseriesdb
+DATABASE_URL = os.getenv("DATABASE_URL")  # e.g. postgresql://railway:***@.../timeseriesdb?sslmode=require
 OUTPUT_TARGET = os.getenv("OUTPUT_TARGET", "postgres").lower()  # 'postgres' | 'airtable' | 'both'
 AUTOMATION_TOKEN = os.getenv("AUTOMATION_TOKEN")  # optional: set to protect write routes
 LOCAL_TZ = os.getenv("LOCAL_TZ", "Europe/London")
@@ -121,6 +121,9 @@ def _check_token():
     token = request.headers.get("x-automation-token") or request.args.get("token")
     if token != AUTOMATION_TOKEN:
         abort(403)
+
+def _has_spotify_creds():
+    return bool(CLIENT_ID and CLIENT_SECRET and CLIENT_ID != "YOUR_SPOTIFY_CLIENT_ID" and CLIENT_SECRET != "YOUR_SPOTIFY_CLIENT_SECRET")
 
 # ────────────────────────────────────────────────────────────────────────────────
 # Airtable helpers
@@ -302,7 +305,7 @@ def playlists_index_from_airtable():
     for r in rows:
         f = r.get("fields", {})
         raw = f.get(PLAYLISTS_ID_FIELD) or f.get(PLAYLISTS_WEB_URL_FIELD)
-        urn = to_spotify_playlist_urn(raw)  # store URN in DB (as requested)
+        urn = to_spotify_playlist_urn(raw)  # store URN in DB (per your preference)
         name = f.get(PLAYLISTS_NAME_FIELD)
         if urn:
             out[r["id"]] = {"playlist_id_urn": urn, "name": name}
@@ -531,7 +534,8 @@ def get_client_bearer() -> str:
         auth=(CLIENT_ID, CLIENT_SECRET),
         timeout=60,
     )
-    r.raise_for_status()
+    if not r.ok:
+        raise RuntimeError(f"spotify_token_error: {r.status_code} {r.text}")
     return r.json()["access_token"]
 
 def fetch_playlist_followers_spotify(plain_id: str, bearer: str) -> Optional[int]:
@@ -578,7 +582,12 @@ app = Flask(__name__)
 
 @app.get("/health")
 def health():
-    return jsonify({"ok": True, "base": AIRTABLE_BASE_ID, "output_target": OUTPUT_TARGET})
+    return jsonify({
+        "ok": True,
+        "base": AIRTABLE_BASE_ID,
+        "output_target": OUTPUT_TARGET,
+        "has_spotify_creds": _has_spotify_creds()
+    })
 
 @app.get("/airtable/ping")
 def airtable_ping():
@@ -597,6 +606,31 @@ def db_ping():
             cur.execute("SELECT 1 AS ok")
             row = cur.fetchone()
         return jsonify({"ok": True, "row": row}), 200
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+@app.get("/diag/playlists")
+def diag_playlists():
+    idx = playlists_index_from_airtable()
+    return jsonify({"ok": True, "count": len(idx), "sample": list(idx.values())[:5]}), 200
+
+@app.get("/diag/spotify_token")
+def diag_spotify_token():
+    try:
+        tok = get_client_bearer()
+        return jsonify({"ok": True, "token_prefix": tok[:12]}), 200
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+@app.get("/diag/spotify")
+def diag_spotify():
+    pid = request.args.get("pid")  # plain id like 5KVr4LVBAKjPWb5h8q0hub
+    if not pid:
+        return jsonify({"ok": False, "error": "pid required"}), 400
+    try:
+        bearer = get_client_bearer()
+        val = fetch_playlist_followers_spotify(pid, bearer)
+        return jsonify({"ok": True, "followers": val}), 200
     except Exception as e:
         return jsonify({"ok": False, "error": str(e)}), 500
 
@@ -640,8 +674,12 @@ def backfill_followers_to_db():
 @app.post("/run_followers_today")
 def _run_followers_today():
     _check_token()
-    res = run_followers_today(platform="spotify")
-    return jsonify({"ok": True, **res}), 200
+    try:
+        res = run_followers_today(platform="spotify")
+        return jsonify({"ok": True, **res}), 200
+    except Exception as e:
+        app.logger.exception("run_followers_today failed")
+        return jsonify({"ok": False, "error": str(e)}), 500
 
 # Optional: push-mode ingest for followers
 # Body: { "platform":"spotify", "records":[{"playlist_id":"spotify:playlist:5KV...","date":"YYYY-MM-DD","followers":1234,"playlist_name":"optional"}] }
