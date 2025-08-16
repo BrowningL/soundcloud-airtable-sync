@@ -17,7 +17,7 @@ if not DATABASE_URL:
 
 # SSL note:
 # Your TCP proxy doesn't support SSL. Set DB_SSLMODE=disable in Railway vars.
-# Defaults to "prefer" so it'll still work on hosts that do support SSL.
+# Defaults to "prefer" so it'll still work on hosts that DO support SSL.
 POOL = ConnectionPool(
     conninfo=DATABASE_URL,
     kwargs={"sslmode": os.getenv("DB_SSLMODE", "prefer")},  # disable | prefer | require
@@ -28,23 +28,24 @@ POOL = ConnectionPool(
 
 app = Flask(__name__)
 
-# ── Pool open-once hook + helper ──────────────────────────────────────────────
-@app.before_first_request
-def _open_pool_once():
-    try:
-        if not POOL.is_open:
+# ── Pool helper ───────────────────────────────────────────────────────────────
+def _ensure_pool_open():
+    if not POOL.is_open:
+        try:
             POOL.open()
-    except Exception as e:
-        app.logger.error("DB pool open failed: %s", e)
+        except Exception as e:
+            app.logger.error("DB pool open failed: %s", e)
+            raise
 
 def _q(query: str, params: tuple | None = None):
     """Run a query with a dict row factory; (re)open pool if needed once."""
+    _ensure_pool_open()
     try:
         with POOL.connection() as conn, conn.cursor(row_factory=dict_row) as cur:
             cur.execute(query, params or ())
             return cur.fetchall()
     except PoolClosed:
-        POOL.open()
+        _ensure_pool_open()
         with POOL.connection() as conn, conn.cursor(row_factory=dict_row) as cur:
             cur.execute(query, params or ())
             return cur.fetchall()
@@ -328,9 +329,9 @@ def api_overlay():
 @app.get("/health")
 def health():
     try:
-        rows = _q("SHOW ssl")
-        ssl = rows[0]["ssl"] if rows else "unknown"
-        _q("SELECT NOW()")  # just to validate a round-trip
+        ssl_row = _q("SHOW ssl")
+        ssl = ssl_row[0]["ssl"] if ssl_row else "unknown"
+        _q("SELECT NOW()")  # validate a round-trip
         return {"ok": True, "db": True, "ssl": ssl}
     except Exception as e:
         return {"ok": False, "db": False, "error": str(e)}
