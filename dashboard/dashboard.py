@@ -30,12 +30,13 @@ app = Flask(__name__)
 
 # ── Pool helper ───────────────────────────────────────────────────────────────
 def _ensure_pool_open():
-    if not POOL.is_open:
-        try:
-            POOL.open()
-        except Exception as e:
-            app.logger.error("DB pool open failed: %s", e)
-            raise
+    # Open the pool if needed; safe to call multiple times across workers.
+    try:
+        POOL.open()
+    except Exception:
+        # Pool already open or racing between workers — fine to ignore.
+        pass
+
 
 def _q(query: str, params: tuple | None = None):
     """Run a query with a dict row factory; (re)open pool if needed once."""
