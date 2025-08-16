@@ -456,7 +456,12 @@ async def sync():
 # ────────────────────────────────────────────────────────────────────────────────
 # Backfill Airtable → Postgres (one-shot)
 # ────────────────────────────────────────────────────────────────────────────────
-def backfill_airtable_to_postgres(days: int = 14) -> int:
+def backfill_airtable_to_postgres(days: Optional[str] = None) -> int:
+    """
+    days:
+      - 'all' (or None/0/negative) => backfill ALL rows
+      - positive integer string => only last N days
+    """
     # Build Catalogue id → ISRC map
     recs = at_paginate(CATALOGUE_TABLE, {
         "view": CATALOGUE_VIEW, "pageSize": 100, "fields[]": CATALOGUE_ISRC_FIELD
@@ -464,15 +469,32 @@ def backfill_airtable_to_postgres(days: int = 14) -> int:
     cat_id_to_isrc = {r["id"]: r["fields"].get(CATALOGUE_ISRC_FIELD)
                       for r in recs if r.get("fields", {}).get(CATALOGUE_ISRC_FIELD)}
 
-    # Pull recent Spotify Streams rows
+    # Decide query scope
+    all_data = False
+    d_val: Optional[int] = None
+    if days is None:
+        all_data = True
+    else:
+        try:
+            d_val = int(days)
+            all_data = (d_val <= 0)
+        except Exception:
+            all_data = str(days).lower() in ("all", "everything", "full")
+
     params = {
         "pageSize": 100,
         "sort[0][field]": PLAYCOUNTS_DATE_FIELD,
         "sort[0][direction]": "asc",
-        "filterByFormula": f"IS_AFTER({{{PLAYCOUNTS_DATE_FIELD}}}, DATEADD(TODAY(), -{days}, 'days'))"
     }
+    if not all_data and d_val is not None and d_val > 0:
+        params["filterByFormula"] = (
+            f"IS_AFTER({{{PLAYCOUNTS_DATE_FIELD}}}, DATEADD(TODAY(), -{d_val}, 'days'))"
+        )
+
+    # Pull rows (all or last N days)
     rows = at_paginate(PLAYCOUNTS_TABLE, params)
 
+    # Upsert into Postgres
     inserted = 0
     with db_conn() as conn:
         with conn.cursor() as cur:
@@ -555,7 +577,7 @@ def backfill_followers_endpoint():
 # NEW: backfill Airtable → Postgres for recent days
 @app.post("/backfill_to_db")
 def backfill_to_db_endpoint():
-    days = int(request.args.get("days", "14"))
+    days = request.args.get("days", "all")  # default to ALL
     n = backfill_airtable_to_postgres(days=days)
     return jsonify({"status": "ok", "inserted_or_updated": n, "window_days": days}), 200
 
