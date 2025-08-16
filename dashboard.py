@@ -1,54 +1,5 @@
-# README.md
+# dashboard.py (standalone)
 
-## Standalone Flask Dashboard (separate Railway service)
-
-This is a **self‑contained Flask app** you can deploy as a new Railway service without touching your existing Flask code. It connects to the same TimescaleDB (attach the existing DB plugin so `DATABASE_URL` is injected automatically).
-
-**What you get**
-- **Daily Streams Δ (sum across ISRCs)** — bar chart
-- **Playlist Growth (followers + daily Δ)** — playlist selector (defaults to **TOGI Motivation**)
-- **Overlay:** Streams Δ (sum) vs Total Followers Δ (+ cumulative) on shared axis
-
----
-
-## Deploy — fastest path
-
-1) **Add these files** into your repo root (or a subfolder) as shown below.
-2) In Railway, create a **new service → Deploy from Repo** (this repo). 
-3) **Attach your existing TimescaleDB plugin** to this new service (Railway ➜ Variables ➜ "Add from Plugin" ➜ pick the DB). That sets `DATABASE_URL` automatically.
-4) Set optional envs:
-   - `DEFAULT_PLAYLIST_NAME=TOGI Motivation`
-   - `LOCAL_TZ=Europe/London` (label only)
-5) Choose one of the Procfile options below and deploy.
-
----
-
-## Files
-
-### `requirements.txt`
-```
-Flask==3.0.3
-psycopg[binary,pool]>=3.1.18,<3.3
-python-dateutil==2.9.0.post0
-pytz==2024.1
-# Optional (recommended for production run)
-gunicorn==22.0.0
-```
-
-> You can keep your existing extras (playwright, requests, etc.) — they won’t interfere. If not needed, omit for a lighter image.
-
-### `Procfile` (pick ONE)
-**Simplest:**
-```
-web: python dashboard.py
-```
-**Production-ish (recommended):**
-```
-web: gunicorn dashboard:app -b 0.0.0.0:$PORT -w 2 --timeout 120
-```
-
-### `dashboard.py`
-```python
 import os
 from datetime import date, timedelta
 from typing import List, Tuple
@@ -62,7 +13,7 @@ LOCAL_TZ = os.getenv("LOCAL_TZ", "Europe/London")
 DEFAULT_PLAYLIST_NAME = os.getenv("DEFAULT_PLAYLIST_NAME", "TOGI Motivation")
 DATABASE_URL = os.getenv("DATABASE_URL")
 if not DATABASE_URL:
-    raise RuntimeError("DATABASE_URL is required (attach your Railway Postgres/Timescale plugin)")
+    raise RuntimeError("DATABASE_URL is required")
 
 # Connection pool (Railway proxy typically needs SSL)
 POOL = ConnectionPool(
@@ -103,11 +54,12 @@ def ui():
 <script src=\"https://cdn.jsdelivr.net/npm/chart.js\"></script>
 <script src=\"https://cdn.tailwindcss.com\"></script>
 <style>
-  .card {{ @apply bg-white/70 dark:bg-zinc-900/70 backdrop-blur rounded-2xl shadow p-5; }}
-  body {{ background: radial-gradient(1200px 600px at 10% -10%, #f0f9ff 0%, transparent 60%),
-                      radial-gradient(1200px 600px at 110% -10%, #fef3c7 0%, transparent 60%),
-                      radial-gradient(1200px 600px at 50% 120%, #e9d5ff 0%, transparent 60%);
-         min-height: 100vh; }}
+  .card { background: rgba(255,255,255,0.7); border-radius: 1rem; box-shadow: 0 8px 24px rgba(0,0,0,0.08); padding: 1.25rem; }
+  @media (prefers-color-scheme: dark) { .card { background: rgba(24,24,27,0.7); color: #fff; } }
+  body { background: radial-gradient(1200px 600px at 10% -10%, #f0f9ff 0%, transparent 60%),
+                  radial-gradient(1200px 600px at 110% -10%, #fef3c7 0%, transparent 60%),
+                  radial-gradient(1200px 600px at 50% 120%, #e9d5ff 0%, transparent 60%);
+         min-height: 100vh; }
 </style>
 </head>
 <body class=\"text-zinc-900 dark:text-zinc-100\">
@@ -406,67 +358,8 @@ def health():
 if __name__ == "__main__":
     port = int(os.getenv("PORT", "8080"))
     app.run(host="0.0.0.0", port=port, threaded=True)
-```
+# dashboard.py (standalone)
 
----
-
-## Notes
-- No changes to your existing Flask service. This is a **new, independent service**.
-- Attach the same TimescaleDB plugin so `DATABASE_URL` is present. Nothing else is required.
-- Streams Δ are clamped to ≥ 0; follower deltas can be negative.
-- Windows: 30/90/180 days (tweak in the HTML if you want more).
-- Default playlist resolves by name prefix match; override with `DEFAULT_PLAYLIST_NAME`.
-# README.md
-
-## Standalone Flask Dashboard (separate Railway service)
-
-This is a **self‑contained Flask app** you can deploy as a new Railway service without touching your existing Flask code. It connects to the same TimescaleDB (attach the existing DB plugin so `DATABASE_URL` is injected automatically).
-
-**What you get**
-- **Daily Streams Δ (sum across ISRCs)** — bar chart
-- **Playlist Growth (followers + daily Δ)** — playlist selector (defaults to **TOGI Motivation**)
-- **Overlay:** Streams Δ (sum) vs Total Followers Δ (+ cumulative) on shared axis
-
----
-
-## Deploy — fastest path
-
-1) **Add these files** into your repo root (or a subfolder) as shown below.
-2) In Railway, create a **new service → Deploy from Repo** (this repo). 
-3) **Attach your existing TimescaleDB plugin** to this new service (Railway ➜ Variables ➜ "Add from Plugin" ➜ pick the DB). That sets `DATABASE_URL` automatically.
-4) Set optional envs:
-   - `DEFAULT_PLAYLIST_NAME=TOGI Motivation`
-   - `LOCAL_TZ=Europe/London` (label only)
-5) Choose one of the Procfile options below and deploy.
-
----
-
-## Files
-
-### `requirements.txt`
-```
-Flask==3.0.3
-psycopg[binary,pool]>=3.1.18,<3.3
-python-dateutil==2.9.0.post0
-pytz==2024.1
-# Optional (recommended for production run)
-gunicorn==22.0.0
-```
-
-> You can keep your existing extras (playwright, requests, etc.) — they won’t interfere. If not needed, omit for a lighter image.
-
-### `Procfile` (pick ONE)
-**Simplest:**
-```
-web: python dashboard.py
-```
-**Production-ish (recommended):**
-```
-web: gunicorn dashboard:app -b 0.0.0.0:$PORT -w 2 --timeout 120
-```
-
-### `dashboard.py`
-```python
 import os
 from datetime import date, timedelta
 from typing import List, Tuple
@@ -480,7 +373,7 @@ LOCAL_TZ = os.getenv("LOCAL_TZ", "Europe/London")
 DEFAULT_PLAYLIST_NAME = os.getenv("DEFAULT_PLAYLIST_NAME", "TOGI Motivation")
 DATABASE_URL = os.getenv("DATABASE_URL")
 if not DATABASE_URL:
-    raise RuntimeError("DATABASE_URL is required (attach your Railway Postgres/Timescale plugin)")
+    raise RuntimeError("DATABASE_URL is required")
 
 # Connection pool (Railway proxy typically needs SSL)
 POOL = ConnectionPool(
@@ -521,11 +414,12 @@ def ui():
 <script src=\"https://cdn.jsdelivr.net/npm/chart.js\"></script>
 <script src=\"https://cdn.tailwindcss.com\"></script>
 <style>
-  .card {{ @apply bg-white/70 dark:bg-zinc-900/70 backdrop-blur rounded-2xl shadow p-5; }}
-  body {{ background: radial-gradient(1200px 600px at 10% -10%, #f0f9ff 0%, transparent 60%),
-                      radial-gradient(1200px 600px at 110% -10%, #fef3c7 0%, transparent 60%),
-                      radial-gradient(1200px 600px at 50% 120%, #e9d5ff 0%, transparent 60%);
-         min-height: 100vh; }}
+  .card { background: rgba(255,255,255,0.7); border-radius: 1rem; box-shadow: 0 8px 24px rgba(0,0,0,0.08); padding: 1.25rem; }
+  @media (prefers-color-scheme: dark) { .card { background: rgba(24,24,27,0.7); color: #fff; } }
+  body { background: radial-gradient(1200px 600px at 10% -10%, #f0f9ff 0%, transparent 60%),
+                  radial-gradient(1200px 600px at 110% -10%, #fef3c7 0%, transparent 60%),
+                  radial-gradient(1200px 600px at 50% 120%, #e9d5ff 0%, transparent 60%);
+         min-height: 100vh; }
 </style>
 </head>
 <body class=\"text-zinc-900 dark:text-zinc-100\">
@@ -824,13 +718,3 @@ def health():
 if __name__ == "__main__":
     port = int(os.getenv("PORT", "8080"))
     app.run(host="0.0.0.0", port=port, threaded=True)
-```
-
----
-
-## Notes
-- No changes to your existing Flask service. This is a **new, independent service**.
-- Attach the same TimescaleDB plugin so `DATABASE_URL` is present. Nothing else is required.
-- Streams Δ are clamped to ≥ 0; follower deltas can be negative.
-- Windows: 30/90/180 days (tweak in the HTML if you want more).
-- Default playlist resolves by name prefix match; override with `DEFAULT_PLAYLIST_NAME`.
