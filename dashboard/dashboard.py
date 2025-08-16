@@ -15,7 +15,7 @@ if not DATABASE_URL:
 # Connection pool (Railway proxy typically needs SSL)
 POOL = ConnectionPool(
     conninfo=DATABASE_URL,
-    kwargs={"sslmode": "require"},
+    kwargs={"sslmode": "prefer"},
     min_size=1,
     max_size=5,
 )
