@@ -22,8 +22,10 @@ app = Flask(__name__)
 
 # ── DB helpers ────────────────────────────────────────────────────────────────
 def _ensure_pool_open():
-    try: POOL.open()
-    except Exception: pass
+    try:
+        POOL.open()
+    except Exception:
+        pass
 
 def _q(sql: str, params: tuple | None = None):
     _ensure_pool_open()
@@ -44,8 +46,10 @@ def _exec(sql: str):
         conn.commit()
 
 def _clamp_days(raw: str | None, default=30, lo=1, hi=365) -> int:
-    try: v = int(raw or default)
-    except: v = default
+    try:
+        v = int(raw or default)
+    except:
+        v = default
     return min(max(v, lo), hi)
 
 def _fill_series(rows, start: date, end: date):
@@ -61,16 +65,16 @@ def _fill_series(rows, start: date, end: date):
 # ── One-time view creation (idempotent) ───────────────────────────────────────
 CREATE_VIEWS_SQL = r"""
 -- Per-track, per-day gap-adjusted deltas:
---   Take each snapshot (d, playcount), look back to the previous snapshot (prev_d, prev_pc),
---   compute inc = GREATEST(playcount - prev_pc, 0), and distribute evenly across (prev_d, d].
+-- Keep dates as DATE to get integer day gaps, then distribute across gap days.
+
 CREATE OR REPLACE VIEW public.spotify_streams_delta_adjusted AS
 WITH base AS (
   SELECT
     s.track_uid,
-    s.stream_date::date AS d,
+    s.stream_date::date AS d,                         -- DATE
     s.playcount::bigint AS playcount,
-    LAG(s.playcount)   OVER (PARTITION BY s.track_uid ORDER BY s.stream_date)      AS prev_pc,
-    LAG(s.stream_date) OVER (PARTITION BY s.track_uid ORDER BY s.stream_date)      AS prev_d
+    LAG(s.playcount)   OVER (PARTITION BY s.track_uid ORDER BY s.stream_date) AS prev_pc,
+    LAG(s.stream_date) OVER (PARTITION BY s.track_uid ORDER BY s.stream_date) AS prev_d   -- DATE
   FROM public.streams s
   WHERE s.platform = 'spotify'
 ),
@@ -79,26 +83,30 @@ norm AS (
     track_uid,
     d,
     playcount,
-    COALESCE(prev_pc, playcount)                              AS prev_pc_norm,
-    COALESCE(prev_d,  d - INTERVAL '1 day')                   AS prev_d_norm
+    COALESCE(prev_pc, playcount)             AS prev_pc_norm,
+    COALESCE(prev_d, d - 1)::date            AS prev_d_norm   -- ensure DATE; first snapshot uses d-1
   FROM base
 ),
 spans AS (
   SELECT
     track_uid,
     d,
-    prev_d_norm AS prev_d,
-    GREATEST(playcount - prev_pc_norm, 0)::numeric            AS inc,
-    GREATEST((d - prev_d_norm)::int, 1)                       AS days_in_span
+    prev_d_norm AS prev_d,                   -- DATE
+    GREATEST(playcount - prev_pc_norm, 0)::numeric AS inc,
+    GREATEST((d - prev_d_norm), 1)           AS days_in_span  -- INTEGER days (DATE - DATE)
   FROM norm
 ),
 distributed AS (
   SELECT
     s.track_uid,
     (gs)::date AS date,
-    (CASE WHEN s.days_in_span > 0 THEN s.inc / s.days_in_span ELSE 0 END) AS delta_share
+    CASE WHEN s.days_in_span > 0 THEN s.inc / s.days_in_span ELSE 0 END AS delta_share
   FROM spans s
-  JOIN LATERAL generate_series(s.prev_d + INTERVAL '1 day', s.d, INTERVAL '1 day') gs ON true
+  JOIN LATERAL generate_series(
+        (s.prev_d::timestamp) + interval '1 day',
+        (s.d::timestamp),
+        interval '1 day'
+      ) gs ON true
 )
 SELECT track_uid, date, delta_share
 FROM distributed;
@@ -342,7 +350,6 @@ def ui():
 # ── API (uses the views) ──────────────────────────────────────────────────────
 @app.before_request
 def _views_guard():
-    # Fast, idempotent on every request; cheap in Postgres
     _ensure_views()
 
 @app.get("/api/streams/total-daily")
@@ -378,7 +385,6 @@ def api_streams_available_dates():
 def api_streams_daily_leaders():
     day = request.args.get("date") or date.today().isoformat()
     limit = int(request.args.get("limit", 25))
-    # Use per-track distributed share for that day
     q = """
       WITH d AS (
         SELECT sda.track_uid, sda.delta_share::bigint AS delta
