@@ -15,13 +15,12 @@ DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
 if not DATABASE_URL:
     raise RuntimeError("DATABASE_URL is required")
 
-# Your TCP proxy usually has no SSL; set DB_SSLMODE=disable in env.
 POOL = ConnectionPool(
     conninfo=DATABASE_URL,
     kwargs={"sslmode": os.getenv("DB_SSLMODE", "prefer")},  # disable | prefer | require
     min_size=1,
     max_size=5,
-    open=False,  # don't connect at import time
+    open=False,
 )
 
 app = Flask(__name__)
@@ -31,7 +30,7 @@ def _ensure_pool_open():
     try:
         POOL.open()
     except Exception:
-        pass  # already open or racing
+        pass
 
 def _q(query: str, params: tuple | None = None):
     _ensure_pool_open()
@@ -65,7 +64,7 @@ def _clamp_days(raw: str | None, default: int = 30, min_d: int = 1, max_d: int =
         v = default
     return min(max(v, min_d), max_d)
 
-# ── UI route ──────────────────────────────────────────────────────────────────
+# ── UI ────────────────────────────────────────────────────────────────────────
 @app.get("/")
 def ui():
     html = """<!doctype html>
@@ -158,7 +157,7 @@ def ui():
 
   async function api(path) { const r = await fetch(path); if (!r.ok) throw new Error(await r.text()); return r.json(); }
 
-  // STREAMS: LINE chart using sum of per-track daily deltas
+  // STREAMS: LINE chart using sum of per-track daily deltas (only if previous day exists)
   async function loadStreams(days) {
     const data = await api('/api/streams/total-daily?days=' + days);
     const ctx = document.getElementById('streamsChart').getContext('2d');
@@ -261,15 +260,28 @@ def ui():
 """
     return render_template_string(html, local_tz=LOCAL_TZ, default_playlist_name=DEFAULT_PLAYLIST_NAME)
 
-# ── API routes ────────────────────────────────────────────────────────────────
+# ── API ───────────────────────────────────────────────────────────────────────
 @app.get("/api/streams/total-daily")
 def api_streams_total_daily():
     days = _clamp_days(request.args.get("days"), 30)
-    # Sum of per-track daily deltas from the view (ignores first snapshots).
+    # Sum per-track daily Δ, but ONLY when the previous snapshot is exactly yesterday.
     q = """
-        SELECT date AS d, COALESCE(SUM(GREATEST(delta,0)),0)::bigint AS v
-        FROM public.spotify_streams_view
-        WHERE date >= CURRENT_DATE - %s::int * INTERVAL '1 day'
+        WITH s AS (
+          SELECT t.isrc,
+                 s.stream_date AS d,
+                 s.playcount,
+                 LAG(s.playcount) OVER (PARTITION BY t.isrc ORDER BY s.stream_date)  AS prev_pc,
+                 LAG(s.stream_date) OVER (PARTITION BY t.isrc ORDER BY s.stream_date) AS prev_d
+          FROM public.streams s
+          JOIN public.track_dim t USING (track_uid)
+          WHERE s.platform = 'spotify'
+            AND s.stream_date >= CURRENT_DATE - %s::int * INTERVAL '1 day'
+        )
+        SELECT d,
+               COALESCE(SUM(
+                 GREATEST(CASE WHEN prev_d = d - INTERVAL '1 day' THEN (playcount - prev_pc) ELSE 0 END, 0)
+               ),0)::bigint AS v
+        FROM s
         GROUP BY d
         ORDER BY d
     """
@@ -338,10 +350,24 @@ def api_playlist_series(playlist_id: str):
 @app.get("/api/overlay/streams-vs-followers")
 def api_overlay():
     days = _clamp_days(request.args.get("days"), 30)
+    # Same consecutive-day rule for streams Δ to keep overlay consistent.
     q_streams = """
-        SELECT date AS d, COALESCE(SUM(GREATEST(delta,0)),0)::bigint AS v
-        FROM public.spotify_streams_view
-        WHERE date >= CURRENT_DATE - %s::int * INTERVAL '1 day'
+        WITH s AS (
+          SELECT t.isrc,
+                 s.stream_date AS d,
+                 s.playcount,
+                 LAG(s.playcount) OVER (PARTITION BY t.isrc ORDER BY s.stream_date)  AS prev_pc,
+                 LAG(s.stream_date) OVER (PARTITION BY t.isrc ORDER BY s.stream_date) AS prev_d
+          FROM public.streams s
+          JOIN public.track_dim t USING (track_uid)
+          WHERE s.platform = 'spotify'
+            AND s.stream_date >= CURRENT_DATE - %s::int * INTERVAL '1 day'
+        )
+        SELECT d,
+               COALESCE(SUM(
+                 GREATEST(CASE WHEN prev_d = d - INTERVAL '1 day' THEN (playcount - prev_pc) ELSE 0 END, 0)
+               ),0)::bigint AS v
+        FROM s
         GROUP BY d
         ORDER BY d
     """
