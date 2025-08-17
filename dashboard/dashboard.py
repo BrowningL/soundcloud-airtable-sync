@@ -1,4 +1,4 @@
-# dashboard.py — standalone Flask dashboard for Streams & Playlist Growth
+# dashboard.py — standalone Flask dashboard (gap-adjusted deltas, no capping)
 
 import os
 from datetime import date, timedelta
@@ -13,10 +13,7 @@ DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
 if not DATABASE_URL:
     raise RuntimeError("DATABASE_URL is required")
 
-# Streams delta controls (env-tunable)
-STREAMS_MAX_DELTA = int(os.getenv("STREAMS_MAX_DELTA", "250000"))          # hard cap per-track/day (for "clean" mode)
-STREAMS_OUTLIER_PCTL = float(os.getenv("STREAMS_OUTLIER_PCTL", "0.995"))   # 99.5th pct trim (for "clean" mode)
-DB_SSLMODE = os.getenv("DB_SSLMODE", "prefer")                             # "disable" for Railway TCP proxy
+DB_SSLMODE = os.getenv("DB_SSLMODE", "prefer")  # use "disable" for Railway TCP proxy
 
 POOL = ConnectionPool(conninfo=DATABASE_URL, kwargs={"sslmode": DB_SSLMODE},
                       min_size=1, max_size=5, open=False)
@@ -88,7 +85,7 @@ def ui():
       <div class="flex items-center justify-between mb-3">
         <div class="flex items-center gap-4">
           <h2 class="text-xl font-semibold">Daily Streams Δ (sum)</h2>
-          <label class="text-sm flex items-center gap-2"><input id="streamsClean" type="checkbox" checked> Clean spikes</label>
+          <label class="text-sm flex items-center gap-2"><input id="streamsMode" type="checkbox" checked> Gap-adjust</label>
         </div>
         <div>
           <label class="mr-2 text-sm muted">Window</label>
@@ -152,7 +149,7 @@ def ui():
       <div class="flex items-center justify-between mb-3">
         <div class="flex items-center gap-3">
           <h2 class="text-xl font-semibold">Top track deltas (by day)</h2>
-          <label class="text-sm flex items-center gap-2"><input id="leadersClean" type="checkbox"> Clean spikes</label>
+          <label class="text-sm flex items-center gap-2"><input id="leadersMode" type="checkbox"> Gap-adjust</label>
         </div>
         <div class="flex items-center gap-3">
           <label class="text-sm muted">Date</label>
@@ -169,7 +166,7 @@ def ui():
           <tbody></tbody>
         </table>
       </div>
-      <p class="text-xs muted mt-2">Δ is day-over-day: max(today - yesterday, 0) only when yesterday exists.</p>
+      <p class="text-xs muted mt-2">Δ is day-over-day. “Gap-adjust” spreads growth evenly across missed days using the last known snapshot.</p>
     </div>
   </section>
 </div>
@@ -180,9 +177,9 @@ def ui():
   const fmt = (n) => Number(n).toLocaleString();
   async function api(path){ const r=await fetch(path); if(!r.ok) throw new Error(await r.text()); return r.json(); }
 
-  // ── Streams (with clean/raw toggle)
+  // ── Streams (gap-adjust toggle)
   async function loadStreams(days){
-    const mode = document.getElementById('streamsClean').checked ? 'clean' : 'raw';
+    const mode = document.getElementById('streamsMode').checked ? 'adjusted' : 'raw';
     const data = await api('/api/streams/total-daily?mode='+mode+'&days='+days);
     streamsLabels = data.labels;
     const ctx = document.getElementById('streamsChart').getContext('2d');
@@ -253,7 +250,7 @@ def ui():
   function setLeadersDate(d){ const sel=document.getElementById('leadersDate'); if([...sel.options].some(o=>o.value===d)) sel.value=d; }
   async function loadLeaders(){
     const d = document.getElementById('leadersDate').value;
-    const mode = document.getElementById('leadersClean').checked ? 'clean' : 'raw';
+    const mode = document.getElementById('leadersMode').checked ? 'adjusted' : 'raw';
     const r = await api('/api/streams/daily-leaders?date='+d+'&limit=25&mode='+mode);
     const tb = document.querySelector('#leadersTable tbody'); tb.innerHTML='';
     r.rows.forEach((row, i) => {
@@ -270,12 +267,12 @@ def ui():
 
   // Events
   document.getElementById('streamsDays').addEventListener('change', e=>loadStreams(e.target.value));
-  document.getElementById('streamsClean').addEventListener('change', _=>loadStreams(document.getElementById('streamsDays').value));
+  document.getElementById('streamsMode').addEventListener('change', _=>loadStreams(document.getElementById('streamsDays').value));
   document.getElementById('playlistDays').addEventListener('change', e=>loadPlaylistChart(e.target.value));
   document.getElementById('overlayDays').addEventListener('change', e=>loadOverlay(e.target.value));
   document.getElementById('playlistSelect').addEventListener('change', async()=>{ await updatePlaylistCard(); await loadPlaylistChart(document.getElementById('playlistDays').value); });
   document.getElementById('leadersDate').addEventListener('change', loadLeaders);
-  document.getElementById('leadersClean').addEventListener('change', loadLeaders);
+  document.getElementById('leadersMode').addEventListener('change', loadLeaders);
 
   // Boot
   (async()=>{
@@ -290,52 +287,86 @@ def ui():
 """
     return render_template_string(html, local_tz=LOCAL_TZ, default_playlist_name=DEFAULT_PLAYLIST_NAME)
 
-# ── Streams: total daily (raw vs clean) ───────────────────────────────────────
+# ── Streams: total daily (raw vs gap-adjusted) ────────────────────────────────
 @app.get("/api/streams/total-daily")
 def api_streams_total_daily():
     days = _clamp_days(request.args.get("days"), 30)
-    mode = (request.args.get("mode") or "clean").lower()
+    mode = (request.args.get("mode") or "adjusted").lower()
 
-    # Base: per-track delta_raw = max(today - yesterday, 0) only when prev day exists
-    base = """
-        WITH s AS (
-          SELECT t.isrc,
-                 s.stream_date AS d,
-                 s.playcount,
-                 LAG(s.playcount)  OVER (PARTITION BY t.isrc ORDER BY s.stream_date) AS prev_pc,
-                 LAG(s.stream_date) OVER (PARTITION BY t.isrc ORDER BY s.stream_date) AS prev_d
-          FROM public.streams s
-          JOIN public.track_dim t USING (track_uid)
-          WHERE s.platform='spotify'
-            AND s.stream_date >= CURRENT_DATE - %s::int * INTERVAL '1 day'
-        ),
-        deltas AS (
-          SELECT d,
-                 GREATEST(CASE WHEN prev_d = d - INTERVAL '1 day'
-                               THEN (playcount - prev_pc)
-                               ELSE 0 END, 0)::bigint AS delta_raw
-          FROM s
-        )
-    """
     if mode == "raw":
-        q = base + """
-          SELECT d, COALESCE(SUM(delta_raw),0)::bigint AS v
-          FROM deltas GROUP BY d ORDER BY d
+        # Yesterday-only delta: 0 unless yesterday exists.
+        q = """
+          SELECT d, COALESCE(SUM(v),0)::bigint AS v
+          FROM (
+            SELECT s.stream_date AS d,
+                   GREATEST(
+                     s.playcount - (
+                       SELECT s2.playcount
+                       FROM public.streams s2
+                       WHERE s2.platform=s.platform
+                         AND s2.track_uid=s.track_uid
+                         AND s2.stream_date = s.stream_date - INTERVAL '1 day'
+                       LIMIT 1
+                     ), 0
+                   )::bigint AS v
+            FROM public.streams s
+            WHERE s.platform='spotify'
+              AND s.stream_date >= CURRENT_DATE - %s::int * INTERVAL '1 day'
+          ) x
+          GROUP BY d
+          ORDER BY d;
         """
         rows = _q(q, (days,))
-    else:  # clean: cap per-track and trim high tail across the window
-        q = base + """
-        , capped AS (
-          SELECT d, LEAST(delta_raw, %s)::bigint AS delta
-          FROM deltas
-        ), pctl AS (
-          SELECT PERCENTILE_CONT(%s) WITHIN GROUP (ORDER BY delta) AS p
-          FROM capped
-        )
-        SELECT d, COALESCE(SUM(CASE WHEN delta <= pctl.p THEN delta ELSE 0 END),0)::bigint AS v
-        FROM capped, pctl GROUP BY d ORDER BY d
+    else:
+        # Gap-adjusted: look back to last known snapshot and spread across (prev_d, d]
+        q = """
+          WITH bounds AS (
+            SELECT (CURRENT_DATE - %s::int * INTERVAL '1 day')::date AS start_date,
+                   CURRENT_DATE::date AS end_date
+          ),
+          s AS (
+            SELECT
+              s.track_uid,
+              s.stream_date AS d,
+              s.playcount,
+              -- last known snapshot before d (no window limit)
+              (
+                SELECT s2.playcount FROM public.streams s2
+                WHERE s2.platform=s.platform AND s2.track_uid=s.track_uid AND s2.stream_date < s.stream_date
+                ORDER BY s2.stream_date DESC LIMIT 1
+              ) AS prev_pc,
+              (
+                SELECT s2.stream_date FROM public.streams s2
+                WHERE s2.platform=s.platform AND s2.track_uid=s.track_uid AND s2.stream_date < s.stream_date
+                ORDER BY s2.stream_date DESC LIMIT 1
+              ) AS prev_d
+            FROM public.streams s
+            WHERE s.platform='spotify'
+              AND s.stream_date >= (SELECT start_date FROM bounds)
+          ),
+          spans AS (
+            SELECT d, prev_d, playcount, prev_pc,
+                   GREATEST(playcount - COALESCE(prev_pc, playcount), 0)::numeric AS total_inc,
+                   GREATEST((d - COALESCE(prev_d, d))::int, 1) AS days_in_span
+            FROM s
+          ),
+          distributed AS (
+            SELECT
+              (gs)::date AS d,
+              (total_inc / days_in_span)::bigint AS inc
+            FROM spans, bounds,
+            LATERAL generate_series(
+              GREATEST(COALESCE(prev_d + INTERVAL '1 day', d), (SELECT start_date FROM bounds)),
+              LEAST(d, (SELECT end_date FROM bounds)),
+              INTERVAL '1 day'
+            ) AS gs
+          )
+          SELECT d, COALESCE(SUM(inc),0)::bigint AS v
+          FROM distributed
+          GROUP BY d
+          ORDER BY d;
         """
-        rows = _q(q, (days, STREAMS_MAX_DELTA, STREAMS_OUTLIER_PCTL))
+        rows = _q(q, (days,))
 
     if rows:
         start, end = rows[0]["d"], rows[-1]["d"]
@@ -344,77 +375,108 @@ def api_streams_total_daily():
     labels, values = _fill_series([(r["d"], r["v"]) for r in rows], start, end)
     return jsonify({"labels": labels, "values": values})
 
-# ── Streams: available dates (for picker) ─────────────────────────────────────
+# Dates for leaders dropdown (simply list days with any streams rows)
 @app.get("/api/streams/available-dates")
 def api_streams_available_dates():
     days = _clamp_days(request.args.get("days"), 90)
     q = """
-      WITH s AS (
-        SELECT s.stream_date AS d,
-               LAG(s.playcount) OVER (PARTITION BY t.isrc ORDER BY s.stream_date) AS prev_pc,
-               LAG(s.stream_date) OVER (PARTITION BY t.isrc ORDER BY s.stream_date) AS prev_d,
-               s.playcount
-        FROM public.streams s JOIN public.track_dim t USING (track_uid)
-        WHERE s.platform='spotify'
-          AND s.stream_date >= CURRENT_DATE - %s::int * INTERVAL '1 day'
-      )
-      SELECT d::date AS day
-      FROM (
-        SELECT d, GREATEST(CASE WHEN prev_d = d - INTERVAL '1 day' THEN (playcount - prev_pc) ELSE 0 END, 0)::bigint AS delta
-        FROM s
-      ) x
-      GROUP BY day
+      SELECT DISTINCT s.stream_date::date AS day
+      FROM public.streams s
+      WHERE s.platform='spotify'
+        AND s.stream_date >= CURRENT_DATE - %s::int * INTERVAL '1 day'
       ORDER BY day;
     """
     rows = _q(q, (days,))
     return jsonify({"dates": [r["day"].isoformat() for r in rows]})
 
-# ── Streams: daily leaders table (raw or clean) ───────────────────────────────
+# Leaders (raw vs gap-adjusted) for a single day
 @app.get("/api/streams/daily-leaders")
 def api_streams_daily_leaders():
     day = request.args.get("date") or date.today().isoformat()
     limit = int(request.args.get("limit", 25))
-    mode = (request.args.get("mode") or "raw").lower()
+    mode = (request.args.get("mode") or "adjusted").lower()
 
-    base = """
-      WITH s AS (
-        SELECT t.isrc, t.title, t.artist,
-               s.stream_date AS d, s.playcount,
-               LAG(s.playcount)  OVER (PARTITION BY t.isrc ORDER BY s.stream_date) AS prev_pc,
-               LAG(s.stream_date) OVER (PARTITION BY t.isrc ORDER BY s.stream_date) AS prev_d
-        FROM public.streams s JOIN public.track_dim t USING (track_uid)
-        WHERE s.platform='spotify'
-      ),
-      deltas AS (
-        SELECT isrc, title, artist, d, playcount, COALESCE(prev_pc,0) AS prev_pc,
-               GREATEST(CASE WHEN prev_d = d - INTERVAL '1 day' THEN (playcount - prev_pc) ELSE 0 END, 0)::bigint AS delta_raw
-        FROM s
-      )
-    """
-    if mode == "clean":
-        q = base + """
-          , capped AS (SELECT *, LEAST(delta_raw, %s)::bigint AS delta FROM deltas WHERE d=%s::date),
-            pctl AS (SELECT PERCENTILE_CONT(%s) WITHIN GROUP (ORDER BY delta) AS p FROM capped)
-          SELECT isrc, title, artist, playcount, prev_pc,
-                 CASE WHEN delta <= pctl.p THEN delta ELSE 0 END AS delta
-          FROM capped, pctl
+    if mode == "raw":
+        q = """
+          WITH s AS (
+            SELECT t.isrc, t.title, t.artist,
+                   s.stream_date AS d, s.playcount,
+                   (
+                     SELECT s2.playcount FROM public.streams s2
+                     WHERE s2.platform=s.platform AND s2.track_uid=s.track_uid
+                       AND s2.stream_date = s.stream_date - INTERVAL '1 day'
+                     LIMIT 1
+                   ) AS prev_pc
+            FROM public.streams s
+            JOIN public.track_dim t USING (track_uid)
+            WHERE s.platform='spotify' AND s.stream_date = %s::date
+          )
+          SELECT isrc, title, artist, playcount,
+                 COALESCE(prev_pc,0)::bigint AS prev_pc,
+                 GREATEST(playcount - COALESCE(prev_pc,0), 0)::bigint AS delta
+          FROM s
           ORDER BY delta DESC
-          LIMIT %s
-        """
-        rows = _q(q, (STREAMS_MAX_DELTA, day, STREAMS_OUTLIER_PCTL, limit))
-    else:
-        q = base + """
-          SELECT isrc, title, artist, playcount, prev_pc, delta_raw AS delta
-          FROM deltas
-          WHERE d=%s::date
-          ORDER BY delta DESC
-          LIMIT %s
+          LIMIT %s;
         """
         rows = _q(q, (day, limit))
+    else:
+        # For a given day, find the first snapshot on/after that day per track,
+        # get its previous snapshot (before that), and distribute across the span.
+        q = """
+          WITH per_track_after AS (
+            SELECT DISTINCT ON (s.track_uid)
+                   s.track_uid, s.stream_date AS d, s.playcount
+            FROM public.streams s
+            WHERE s.platform='spotify' AND s.stream_date >= %s::date
+            ORDER BY s.track_uid, s.stream_date ASC
+          ),
+          joined AS (
+            SELECT a.track_uid, a.d, a.playcount,
+                   (
+                     SELECT s2.playcount FROM public.streams s2
+                     WHERE s2.platform='spotify' AND s2.track_uid=a.track_uid AND s2.stream_date < a.d
+                     ORDER BY s2.stream_date DESC LIMIT 1
+                   ) AS prev_pc,
+                   (
+                     SELECT s2.stream_date FROM public.streams s2
+                     WHERE s2.platform='spotify' AND s2.track_uid=a.track_uid AND s2.stream_date < a.d
+                     ORDER BY s2.stream_date DESC LIMIT 1
+                   ) AS prev_d
+            FROM per_track_after a
+          ),
+          spans AS (
+            SELECT track_uid, d, prev_d, playcount, prev_pc,
+                   GREATEST(playcount - COALESCE(prev_pc, playcount), 0)::numeric AS total_inc,
+                   GREATEST((d - COALESCE(prev_d, d))::int, 1) AS days_in_span
+            FROM joined
+          ),
+          distributed AS (
+            SELECT track_uid,
+                   (gs)::date AS day,
+                   (total_inc / days_in_span)::bigint AS inc
+            FROM spans
+            LATERAL generate_series(
+              GREATEST(COALESCE(prev_d + INTERVAL '1 day', d), %s::date),
+              LEAST(d, %s::date),
+              INTERVAL '1 day'
+            ) AS gs
+          )
+          SELECT t.isrc, t.title, t.artist,
+                 j.playcount::bigint AS playcount,
+                 COALESCE(j.prev_pc,0)::bigint AS prev_pc,
+                 COALESCE(d.inc,0)::bigint AS delta
+          FROM distributed d
+          JOIN spans j USING (track_uid)
+          JOIN public.track_dim t USING (track_uid)
+          WHERE d.day = %s::date
+          ORDER BY delta DESC
+          LIMIT %s;
+        """
+        rows = _q(q, (day, day, day, limit))
 
     return jsonify({"date": day, "rows": rows})
 
-# ── Playlists & overlay (unchanged) ───────────────────────────────────────────
+# ── Playlists & overlay (streams use gap-adjusted series) ─────────────────────
 @app.get("/api/playlists/list")
 def api_playlists_list():
     q = """
@@ -464,36 +526,52 @@ def api_playlist_series(playlist_id: str):
 @app.get("/api/overlay/streams-vs-followers")
 def api_overlay():
     days = _clamp_days(request.args.get("days"), 30)
-    q_streams = f"""
-        WITH s AS (
-          SELECT t.isrc, s.stream_date AS d, s.playcount,
-                 LAG(s.playcount)  OVER (PARTITION BY t.isrc ORDER BY s.stream_date) AS prev_pc,
-                 LAG(s.stream_date) OVER (PARTITION BY t.isrc ORDER BY s.stream_date) AS prev_d
-          FROM public.streams s JOIN public.track_dim t USING (track_uid)
-          WHERE s.platform='spotify'
-            AND s.stream_date >= CURRENT_DATE - %s::int * INTERVAL '1 day'
-        ),
-        deltas AS (
-          SELECT d, GREATEST(CASE WHEN prev_d = d - INTERVAL '1 day'
-                                  THEN (playcount - prev_pc)
-                                  ELSE 0 END, 0)::bigint AS raw_delta
-          FROM s
-        ),
-        capped AS (SELECT d, LEAST(raw_delta, %s)::bigint AS delta FROM deltas),
-        pctl AS (SELECT PERCENTILE_CONT({STREAMS_OUTLIER_PCTL}) WITHIN GROUP (ORDER BY delta) AS p FROM capped),
-        daily AS (
-          SELECT d, COALESCE(SUM(CASE WHEN delta <= pctl.p THEN delta ELSE 0 END),0)::bigint AS v
-          FROM capped, pctl GROUP BY d
-        )
-        SELECT d, v FROM daily ORDER BY d;
+    # use the same gap-adjusted method for streams on the overlay
+    q_streams = """
+      WITH bounds AS (
+        SELECT (CURRENT_DATE - %s::int * INTERVAL '1 day')::date AS start_date,
+               CURRENT_DATE::date AS end_date
+      ),
+      s AS (
+        SELECT s.track_uid, s.stream_date AS d, s.playcount,
+               (SELECT s2.playcount FROM public.streams s2
+                WHERE s2.platform=s.platform AND s2.track_uid=s.track_uid AND s2.stream_date < s.stream_date
+                ORDER BY s2.stream_date DESC LIMIT 1) AS prev_pc,
+               (SELECT s2.stream_date FROM public.streams s2
+                WHERE s2.platform=s.platform AND s2.track_uid=s.track_uid AND s2.stream_date < s.stream_date
+                ORDER BY s2.stream_date DESC LIMIT 1) AS prev_d
+        FROM public.streams s
+        WHERE s.platform='spotify'
+          AND s.stream_date >= (SELECT start_date FROM bounds)
+      ),
+      spans AS (
+        SELECT d, prev_d, playcount, prev_pc,
+               GREATEST(playcount - COALESCE(prev_pc, playcount), 0)::numeric AS total_inc,
+               GREATEST((d - COALESCE(prev_d, d))::int, 1) AS days_in_span
+        FROM s
+      ),
+      distributed AS (
+        SELECT (gs)::date AS d, (total_inc / days_in_span)::bigint AS inc
+        FROM spans, bounds,
+        LATERAL generate_series(
+          GREATEST(COALESCE(prev_d + INTERVAL '1 day', d), (SELECT start_date FROM bounds)),
+          LEAST(d, (SELECT end_date FROM bounds)),
+          INTERVAL '1 day'
+        ) AS gs
+      )
+      SELECT d, COALESCE(SUM(inc),0)::bigint AS v
+      FROM distributed
+      GROUP BY d
+      ORDER BY d;
     """
     q_fdelta = """
-        SELECT date AS d, COALESCE(SUM(delta),0)::bigint AS v
-        FROM public.playlist_followers_delta
-        WHERE date >= CURRENT_DATE - %s::int * INTERVAL '1 day'
-        GROUP BY d ORDER BY d;
+      SELECT date AS d, COALESCE(SUM(delta),0)::bigint AS v
+      FROM public.playlist_followers_delta
+      WHERE date >= CURRENT_DATE - %s::int * INTERVAL '1 day'
+      GROUP BY d
+      ORDER BY d;
     """
-    rows_s = _q(q_streams, (days, STREAMS_MAX_DELTA))
+    rows_s = _q(q_streams, (days,))
     rows_f = _q(q_fdelta, (days,))
     dates = {r["d"] for r in rows_s} | {r["d"] for r in rows_f}
     if dates:
