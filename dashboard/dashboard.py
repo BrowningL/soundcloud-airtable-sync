@@ -15,28 +15,25 @@ DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
 if not DATABASE_URL:
     raise RuntimeError("DATABASE_URL is required")
 
-# Your cross-project TCP proxy typically has no SSL; keep DB_SSLMODE=disable.
+# Your TCP proxy usually has no SSL; set DB_SSLMODE=disable in env.
 POOL = ConnectionPool(
     conninfo=DATABASE_URL,
     kwargs={"sslmode": os.getenv("DB_SSLMODE", "prefer")},  # disable | prefer | require
     min_size=1,
     max_size=5,
-    open=False,  # don't connect at import time (Gunicorn spawns multiple workers)
+    open=False,  # don't connect at import time
 )
 
 app = Flask(__name__)
 
-# ── Pool helper ───────────────────────────────────────────────────────────────
+# ── Pool helpers ──────────────────────────────────────────────────────────────
 def _ensure_pool_open():
-    # Safe to call repeatedly across workers.
     try:
         POOL.open()
     except Exception:
-        # Already open or racing — fine to ignore.
-        pass
+        pass  # already open or racing
 
 def _q(query: str, params: tuple | None = None):
-    """Run a query with a dict row factory; (re)open pool if needed once."""
     _ensure_pool_open()
     try:
         with POOL.connection() as conn, conn.cursor(row_factory=dict_row) as cur:
@@ -161,7 +158,7 @@ def ui():
 
   async function api(path) { const r = await fetch(path); if (!r.ok) throw new Error(await r.text()); return r.json(); }
 
-  // STREAMS: use a LINE chart, values come from "delta of total" query
+  // STREAMS: LINE chart using sum of per-track daily deltas
   async function loadStreams(days) {
     const data = await api('/api/streams/total-daily?days=' + days);
     const ctx = document.getElementById('streamsChart').getContext('2d');
@@ -268,22 +265,12 @@ def ui():
 @app.get("/api/streams/total-daily")
 def api_streams_total_daily():
     days = _clamp_days(request.args.get("days"), 30)
-    # Compute DAILY Δ as the Δ of the TOTAL across all tracks (avoid per-track lumping issues).
+    # Sum of per-track daily deltas from the view (ignores first snapshots).
     q = """
-        WITH agg AS (
-          SELECT s.stream_date AS d, SUM(s.playcount)::bigint AS total
-          FROM public.streams s
-          WHERE s.platform = 'spotify'
-            AND s.stream_date >= CURRENT_DATE - %s::int * INTERVAL '1 day'
-          GROUP BY s.stream_date
-        ),
-        dd AS (
-          SELECT d,
-                 GREATEST(total - LAG(total) OVER (ORDER BY d), 0)::bigint AS v
-          FROM agg
-        )
-        SELECT d, COALESCE(v, 0)::bigint AS v
-        FROM dd
+        SELECT date AS d, COALESCE(SUM(GREATEST(delta,0)),0)::bigint AS v
+        FROM public.spotify_streams_view
+        WHERE date >= CURRENT_DATE - %s::int * INTERVAL '1 day'
+        GROUP BY d
         ORDER BY d
     """
     rows = _q(q, (days,))
@@ -351,22 +338,11 @@ def api_playlist_series(playlist_id: str):
 @app.get("/api/overlay/streams-vs-followers")
 def api_overlay():
     days = _clamp_days(request.args.get("days"), 30)
-    # Streams Δ via "delta of totals" to align with the main panel
     q_streams = """
-        WITH agg AS (
-          SELECT s.stream_date AS d, SUM(s.playcount)::bigint AS total
-          FROM public.streams s
-          WHERE s.platform = 'spotify'
-            AND s.stream_date >= CURRENT_DATE - %s::int * INTERVAL '1 day'
-          GROUP BY s.stream_date
-        ),
-        dd AS (
-          SELECT d,
-                 GREATEST(total - LAG(total) OVER (ORDER BY d), 0)::bigint AS v
-          FROM agg
-        )
-        SELECT d, COALESCE(v, 0)::bigint AS v
-        FROM dd
+        SELECT date AS d, COALESCE(SUM(GREATEST(delta,0)),0)::bigint AS v
+        FROM public.spotify_streams_view
+        WHERE date >= CURRENT_DATE - %s::int * INTERVAL '1 day'
+        GROUP BY d
         ORDER BY d
     """
     q_fdelta = """
@@ -402,7 +378,7 @@ def health():
     try:
         ssl_row = _q("SHOW ssl")
         ssl = ssl_row[0]["ssl"] if ssl_row else "unknown"
-        _q("SELECT NOW()")  # validate a round-trip
+        _q("SELECT NOW()")
         return {"ok": True, "db": True, "ssl": ssl}
     except Exception as e:
         return {"ok": False, "db": False, "error": str(e)}
