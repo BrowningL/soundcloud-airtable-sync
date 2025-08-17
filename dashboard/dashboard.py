@@ -1,124 +1,76 @@
-# dashboard.py — Streams & Playlists dashboard with gap-adjusted deltas
+# dashboard.py — standalone Flask dashboard (Streams & Playlist Growth)
 import os
 from datetime import date, timedelta
-from flask import Flask, jsonify, render_template_string, request
+from typing import List, Tuple
+
+from flask import Flask, jsonify, render_template_string, request, abort
 from psycopg_pool import ConnectionPool, PoolClosed
 from psycopg.rows import dict_row
 
 # ── Config ────────────────────────────────────────────────────────────────────
 LOCAL_TZ = os.getenv("LOCAL_TZ", "Europe/London")
 DEFAULT_PLAYLIST_NAME = os.getenv("DEFAULT_PLAYLIST_NAME", "TOGI Motivation")
-DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
+
+DATABASE_URL = os.getenv("DATABASE_URL")
 if not DATABASE_URL:
     raise RuntimeError("DATABASE_URL is required")
 
-DB_SSLMODE = os.getenv("DB_SSLMODE", "prefer")  # set "disable" if your TCP proxy needs it
-
-POOL = ConnectionPool(conninfo=DATABASE_URL, kwargs={"sslmode": DB_SSLMODE},
-                      min_size=1, max_size=5, open=False)
+# TCP proxy on Railway typically needs sslmode=disable (you already set DB_SSLMODE=disable)
+POOL = ConnectionPool(
+    conninfo=DATABASE_URL,
+    kwargs={"sslmode": os.getenv("DB_SSLMODE", "prefer")},  # "disable" for your proxy, else "prefer"/"require"
+    min_size=1,
+    max_size=5,
+    open=False,  # open lazily (works well with Gunicorn workers)
+)
 
 app = Flask(__name__)
+
 
 # ── DB helpers ────────────────────────────────────────────────────────────────
 def _ensure_pool_open():
     try:
         POOL.open()
     except Exception:
+        # already open or racing; fine
         pass
 
-def _q(sql: str, params: tuple | None = None):
+
+def _q(query: str, params: tuple | None = None):
     _ensure_pool_open()
     try:
         with POOL.connection() as conn, conn.cursor(row_factory=dict_row) as cur:
-            cur.execute(sql, params or ())
+            cur.execute(query, params or ())
             return cur.fetchall()
     except PoolClosed:
         _ensure_pool_open()
         with POOL.connection() as conn, conn.cursor(row_factory=dict_row) as cur:
-            cur.execute(sql, params or ())
+            cur.execute(query, params or ())
             return cur.fetchall()
 
-def _exec(sql: str):
-    _ensure_pool_open()
-    with POOL.connection() as conn, conn.cursor() as cur:
-        cur.execute(sql)
-        conn.commit()
 
-def _clamp_days(raw: str | None, default=30, lo=1, hi=365) -> int:
-    try:
-        v = int(raw or default)
-    except:
-        v = default
-    return min(max(v, lo), hi)
+# ── Series helpers ────────────────────────────────────────────────────────────
+def _daterange(start: date, end: date) -> List[date]:
+    days = (end - start).days
+    return [start + timedelta(days=i) for i in range(days + 1)]
 
-def _fill_series(rows, start: date, end: date):
+
+def _fill_series(rows: List[Tuple[date, int]], start: date, end: date):
     idx = {d: int(v) for d, v in rows}
     labels, values = [], []
-    for i in range((end - start).days + 1):
-        d = start + timedelta(days=i)
+    for d in _daterange(start, end):
         labels.append(d.isoformat())
         values.append(idx.get(d, 0))
     return labels, values
 
-# ── Views (idempotent) — skip 0s, distribute growth over gaps ────────────────
-CREATE_VIEWS_SQL = r"""
-/*
-We treat 0 playcounts as failed snapshots. For each snapshot:
-  prev_valid_pc  = max(playcount) of prior rows where playcount>0
-  prev_valid_d   = max(stream_date) of prior rows where playcount>0
-Then:
-  inc            = GREATEST(pc - prev_valid_pc, 0)
-  days           = GREATEST(d - COALESCE(prev_valid_d, d - 1), 1)
-We distribute inc / days over each day in (prev_valid_d, d].
-*/
 
-CREATE OR REPLACE VIEW public.spotify_streams_delta_adjusted AS
-WITH s AS (
-  SELECT
-    track_uid,
-    stream_date::date AS d,
-    playcount::bigint AS pc,
-    max(playcount) FILTER (WHERE playcount > 0)
-      OVER (PARTITION BY track_uid ORDER BY stream_date
-            ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING)        AS prev_valid_pc,
-    max(stream_date) FILTER (WHERE playcount > 0)
-      OVER (PARTITION BY track_uid ORDER BY stream_date
-            ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING)        AS prev_valid_d
-  FROM public.streams
-  WHERE platform = 'spotify'
-),
-spans AS (
-  SELECT
-    track_uid,
-    d,
-    COALESCE(prev_valid_d, d - 1)::date                                   AS start_d,
-    GREATEST(pc - COALESCE(prev_valid_pc, pc), 0)::numeric                AS inc,
-    GREATEST(d - COALESCE(prev_valid_d, d - 1), 1)                         AS days
-  FROM s
-),
-dist AS (
-  SELECT
-    track_uid,
-    gs::date AS date,
-    CASE WHEN days > 0 THEN inc / days ELSE 0 END AS delta_share
-  FROM spans
-  JOIN LATERAL generate_series(
-        (start_d::timestamp) + interval '1 day',
-        (spans.d::timestamp),
-        interval '1 day'
-      ) gs ON true
-)
-SELECT track_uid, date, delta_share
-FROM dist;
+def _clamp_days(raw: str | None, default: int = 90, min_d: int = 1, max_d: int = 365) -> int:
+    try:
+        v = int(raw or default)
+    except Exception:
+        v = default
+    return min(max(v, min_d), max_d)
 
-CREATE OR REPLACE VIEW public.spotify_streams_daily_adjusted AS
-SELECT date, SUM(delta_share)::bigint AS delta
-FROM public.spotify_streams_delta_adjusted
-GROUP BY date;
-"""
-
-def _ensure_views():
-    _exec(CREATE_VIEWS_SQL)
 
 # ── UI ────────────────────────────────────────────────────────────────────────
 @app.get("/")
@@ -131,21 +83,21 @@ def ui():
 <script src="https://cdn.tailwindcss.com"></script>
 <style>
   .card { background: rgba(255,255,255,0.7); border-radius: 1rem; box-shadow: 0 8px 24px rgba(0,0,0,0.08); padding: 1.25rem; }
-  @media (prefers-color-scheme: dark) { .card { background: rgba(24,24,27,0.7); color:#fff; } }
+  @media (prefers-color-scheme: dark) { .card { background: rgba(24,24,27,0.7); color: #fff; } }
   body { background: radial-gradient(1200px 600px at 10% -10%, #f0f9ff 0%, transparent 60%),
                   radial-gradient(1200px 600px at 110% -10%, #fef3c7 0%, transparent 60%),
                   radial-gradient(1200px 600px at 50% 120%, #e9d5ff 0%, transparent 60%);
          min-height: 100vh; }
-  table { width:100%; border-collapse: collapse; }
-  th, td { padding: 0.5rem; border-bottom: 1px solid rgba(0,0,0,0.06); }
-  .muted { opacity:.7 }
+  table { width: 100%; border-collapse: collapse; }
+  th, td { padding: 0.5rem; border-bottom: 1px solid rgba(0,0,0,0.05); }
+  .scroll { max-height: 420px; overflow: auto; }
 </style>
 </head>
 <body class="text-zinc-900 dark:text-zinc-100">
 <div class="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-8">
   <header class="mb-8">
     <h1 class="text-2xl sm:text-3xl font-bold">Streams & Playlists Dashboard</h1>
-    <p class="text-sm muted">Timezone: {{ local_tz }}</p>
+    <p class="text-sm opacity-70">Timezone: {{ local_tz }}</p>
   </header>
 
   <section class="grid grid-cols-1 lg:grid-cols-3 gap-6">
@@ -153,21 +105,20 @@ def ui():
       <div class="flex items-center justify-between mb-3">
         <h2 class="text-xl font-semibold">Daily Streams Δ (sum)</h2>
         <div>
-          <label class="mr-2 text-sm muted">Window</label>
+          <label class="mr-2 text-sm opacity-70">Window</label>
           <select id="streamsDays" class="border rounded px-2 py-1 text-sm">
-            <option value="30" selected>30 days</option>
-            <option value="90">90 days</option>
+            <option value="30">30 days</option>
+            <option value="90" selected>90 days</option>
             <option value="180">180 days</option>
           </select>
         </div>
       </div>
       <canvas id="streamsChart" height="110"></canvas>
-      <p class="text-xs muted mt-2">Click a point to see that day's top track deltas below.</p>
     </div>
 
     <div class="card">
       <h2 class="text-xl font-semibold mb-3">Playlists</h2>
-      <label class="text-sm muted">Select playlist</label>
+      <label class="text-sm opacity-70">Select playlist</label>
       <select id="playlistSelect" class="w-full border rounded px-2 py-2 mt-1"></select>
       <div class="mt-4 text-sm">
         <div>Latest followers: <span id="plFollowers" class="font-semibold">-</span></div>
@@ -182,10 +133,10 @@ def ui():
       <div class="flex items-center justify-between mb-3">
         <h2 class="text-xl font-semibold">Playlist Growth (followers & daily Δ)</h2>
         <div>
-          <label class="mr-2 text-sm muted">Window</label>
+          <label class="mr-2 text-sm opacity-70">Window</label>
           <select id="playlistDays" class="border rounded px-2 py-1 text-sm">
-            <option value="30" selected>30 days</option>
-            <option value="90">90 days</option>
+            <option value="30">30 days</option>
+            <option value="90" selected>90 days</option>
             <option value="180">180 days</option>
           </select>
         </div>
@@ -197,10 +148,10 @@ def ui():
       <div class="flex items-center justify-between mb-3">
         <h2 class="text-xl font-semibold">Overlay: Streams Δ vs Total Followers Δ (+ cumulative)</h2>
         <div>
-          <label class="mr-2 text-sm muted">Window</label>
+          <label class="mr-2 text-sm opacity-70">Window</label>
           <select id="overlayDays" class="border rounded px-2 py-1 text-sm">
-            <option value="30" selected>30 days</option>
-            <option value="90">90 days</option>
+            <option value="30">30 days</option>
+            <option value="90" selected>90 days</option>
             <option value="180">180 days</option>
           </select>
         </div>
@@ -212,147 +163,155 @@ def ui():
   <section class="grid grid-cols-1 gap-6 mt-6">
     <div class="card">
       <div class="flex items-center justify-between mb-3">
-        <h2 class="text-xl font-semibold">Top track deltas (by day)</h2>
-        <div class="flex items-center gap-3">
-          <label class="text-sm muted">Date</label>
-          <select id="leadersDate" class="border rounded px-2 py-1 text-sm"></select>
+        <h2 class="text-xl font-semibold">Top track deltas by day</h2>
+        <div class="flex items-center gap-2">
+          <label class="text-sm opacity-70">Date</label>
+          <select id="deltaDate" class="border rounded px-2 py-1 text-sm"></select>
+          <button id="btnReloadDeltas" class="border rounded px-3 py-1 text-sm">Reload</button>
         </div>
       </div>
-      <div class="overflow-x-auto">
-        <table id="leadersTable">
+      <div class="scroll">
+        <table>
           <thead>
-            <tr class="text-left text-sm muted">
-              <th>#</th><th>ISRC</th><th>Title</th><th>Artist</th><th>Δ</th><th>Prev → Today</th>
-            </tr>
+            <tr><th class="text-left">#</th><th class="text-left">ISRC</th><th class="text-left">Title</th><th class="text-left">Artist</th><th class="text-right">Δ</th></tr>
           </thead>
-          <tbody></tbody>
+          <tbody id="deltaTableBody"></tbody>
         </table>
       </div>
-      <p class="text-xs muted mt-2">Δ is gap-adjusted (evenly split over missed days). No filters.</p>
     </div>
   </section>
 </div>
 
 <script>
   const DEFAULT_PLAYLIST_NAME = {{ default_playlist_name | tojson }};
-  let streamsChart, playlistChart, overlayChart, streamsLabels = [];
+  let streamsChart, playlistChart, overlayChart;
   const fmt = (n) => Number(n).toLocaleString();
-  async function api(path){ const r=await fetch(path); if(!r.ok) throw new Error(await r.text()); return r.json(); }
 
-  async function loadStreams(days){
-    const data = await api('/api/streams/total-daily?days='+days);
-    streamsLabels = data.labels;
+  async function api(path) { const r = await fetch(path); if (!r.ok) throw new Error(await r.text()); return r.json(); }
+
+  // Streams (LINE chart, from streams.daily_delta)
+  async function loadStreams(days) {
+    const data = await api('/api/streams/total-daily?days=' + days);
     const ctx = document.getElementById('streamsChart').getContext('2d');
-    const cfg = { type:'line', data:{ labels:data.labels, datasets:[{ label:'Streams Δ (sum)', data:data.values }]},
-      options:{ responsive:true, onClick:(_,els)=>{ if(els.length){ const i=els[0].index; const d=streamsLabels[i]; setLeadersDate(d); loadLeaders(); } },
-        scales:{ x:{ ticks:{ maxRotation:0, autoSkip:true }}, y:{ beginAtZero:true }},
-        plugins:{ tooltip:{ callbacks:{ label:(c)=>' '+fmt(c.parsed.y) }}}};
-    if(streamsChart) streamsChart.destroy(); streamsChart = new Chart(ctx, cfg);
+    const cfg = {
+      type: 'line',
+      data: { labels: data.labels, datasets: [{ label: 'Streams Δ (sum)', data: data.values, tension: 0.3, fill: false }] },
+      options: { responsive: true, scales: { x: { ticks: { maxRotation: 0, autoSkip: true } }, y: { beginAtZero: true } },
+                 plugins: { tooltip: { callbacks: { label: (c) => ' ' + fmt(c.parsed.y) } } } }
+    };
+    if (streamsChart) streamsChart.destroy(); streamsChart = new Chart(ctx, cfg);
   }
 
-  async function loadPlaylists(){
+  // Playlists list
+  async function loadPlaylists() {
     const list = await api('/api/playlists/list');
-    const sel = document.getElementById('playlistSelect'); sel.innerHTML='';
+    const sel = document.getElementById('playlistSelect'); sel.innerHTML = '';
     let defaultId = list.length ? list[0].playlist_id : null;
-    for(const p of list){ const o=document.createElement('option'); o.value=p.playlist_id; o.textContent=p.playlist_name||p.playlist_id; sel.appendChild(o); }
-    const def = list.find(p => (p.playlist_name||'').toLowerCase().startsWith(DEFAULT_PLAYLIST_NAME.toLowerCase()));
-    if(def) defaultId = def.playlist_id; if(defaultId) sel.value = defaultId;
+    for (const p of list) { const opt = document.createElement('option'); opt.value = p.playlist_id; opt.textContent = p.playlist_name || p.playlist_id; sel.appendChild(opt); }
+    const def = list.find(p => (p.playlist_name || '').toLowerCase().startsWith(DEFAULT_PLAYLIST_NAME.toLowerCase()));
+    if (def) defaultId = def.playlist_id; if (defaultId) sel.value = defaultId;
     await updatePlaylistCard(); await loadPlaylistChart(document.getElementById('playlistDays').value);
   }
-  async function updatePlaylistCard(){
+
+  async function updatePlaylistCard() {
     const list = await api('/api/playlists/list');
-    const id = document.getElementById('playlistSelect').value;
-    const p = list.find(x => x.playlist_id===id); if(!p) return;
+    const id = document.getElementById('playlistSelect').value; const p = list.find(x => x.playlist_id === id); if (!p) return;
     document.getElementById('plFollowers').textContent = fmt(p.followers ?? 0);
-    document.getElementById('plDelta').textContent = (p.delta==null)?'-':fmt(p.delta);
-    document.getElementById('plLink').href = p.web_url;
+    document.getElementById('plDelta').textContent = (p.delta == null) ? '-' : fmt(p.delta);
+    const a = document.getElementById('plLink'); a.href = p.web_url;
   }
-  async function loadPlaylistChart(days){
-    const id = document.getElementById('playlistSelect').value; if(!id) return;
-    const data = await api('/api/playlists/'+encodeURIComponent(id)+'/series?days='+days);
+
+  // Playlist chart
+  async function loadPlaylistChart(days) {
+    const id = document.getElementById('playlistSelect').value; if (!id) return;
+    const data = await api('/api/playlists/' + encodeURIComponent(id) + '/series?days=' + days);
     const ctx = document.getElementById('playlistChart').getContext('2d');
-    const cfg = { data:{ labels:data.labels, datasets:[
-        { type:'line', label:'Followers', data:data.followers, yAxisID:'y1' },
-        { type:'bar',  label:'Daily Δ',  data:data.deltas,    yAxisID:'y2' }
+    const cfg = {
+      data: { labels: data.labels, datasets: [
+        { type: 'line', label: 'Followers', data: data.followers, yAxisID: 'y1', tension: 0.25 },
+        { type: 'bar',  label: 'Daily Δ',  data: data.deltas,    yAxisID: 'y2' }
       ]},
-      options:{ responsive:true, scales:{
-        x:{ ticks:{ maxRotation:0, autoSkip:true }},
-        y1:{ type:'linear', position:'left', beginAtZero:true },
-        y2:{ type:'linear', position:'right', beginAtZero:true, grid:{ drawOnChartArea:false }}
-      }, plugins:{ tooltip:{ callbacks:{ label:(c)=>' '+fmt(c.parsed.y) }}}}};
-    if(playlistChart) playlistChart.destroy(); playlistChart = new Chart(ctx, cfg); await updatePlaylistCard();
+      options: { responsive: true, scales: {
+        x: { ticks: { maxRotation: 0, autoSkip: true } },
+        y1: { type: 'linear', position: 'left', beginAtZero: true },
+        y2: { type: 'linear', position: 'right', beginAtZero: true, grid: { drawOnChartArea: false } }
+      }, plugins: { tooltip: { callbacks: { label: (c) => ' ' + fmt(c.parsed.y) } } } }
+    };
+    if (playlistChart) playlistChart.destroy(); playlistChart = new Chart(ctx, cfg); await updatePlaylistCard();
   }
 
-  async function loadOverlay(days){
-    const data = await api('/api/overlay/streams-vs-followers?days='+days);
+  // Overlay: streams Δ vs followers Δ
+  async function loadOverlay(days) {
+    const data = await api('/api/overlay/streams-vs-followers?days=' + days);
     const ctx = document.getElementById('overlayChart').getContext('2d');
-    const cfg = { data:{ labels:data.labels, datasets:[
-        { type:'line', label:'Streams Δ (sum)', data:data.streams_delta, yAxisID:'yL' },
-        { type:'line', label:'Followers Δ (total)', data:data.followers_delta, yAxisID:'yR' },
-        { type:'line', label:'Followers Δ (cumulative)', data:data.followers_cum, yAxisID:'yR' }
+    const cfg = {
+      data: { labels: data.labels, datasets: [
+        { type: 'bar',  label: 'Streams Δ (sum)',           data: data.streams_delta,  yAxisID: 'yL' },
+        { type: 'line', label: 'Followers Δ (total)',       data: data.followers_delta, yAxisID: 'yR', tension: 0.25 },
+        { type: 'line', label: 'Followers Δ (cumulative)',  data: data.followers_cum,   yAxisID: 'yR', tension: 0.25 }
       ]},
-      options:{ responsive:true, scales:{
-        x:{ ticks:{ maxRotation:0, autoSkip:true }},
-        yL:{ type:'linear', position:'left', beginAtZero:true },
-        yR:{ type:'linear', position:'right', beginAtZero:true, grid:{ drawOnChartArea:false }}
-      }, plugins:{ tooltip:{ callbacks:{ label:(c)=>' '+fmt(c.parsed.y) }}}}};
-    if(overlayChart) overlayChart.destroy(); overlayChart = new Chart(ctx, cfg);
+      options: { responsive: true, scales: {
+        x: { ticks: { maxRotation: 0, autoSkip: true } },
+        yL: { type: 'linear', position: 'left', beginAtZero: true },
+        yR: { type: 'linear', position: 'right', beginAtZero: true, grid: { drawOnChartArea: false } }
+      }, plugins: { tooltip: { callbacks: { label: (c) => ' ' + fmt(c.parsed.y) } } } }
+    };
+    if (overlayChart) overlayChart.destroy(); overlayChart = new Chart(ctx, cfg);
   }
 
-  async function loadAvailableDates(){
-    const r = await api('/api/streams/available-dates?days=90');
-    const sel = document.getElementById('leadersDate'); sel.innerHTML='';
-    for(const d of r.dates){ const o=document.createElement('option'); o.value=d; o.textContent=d; sel.appendChild(o); }
-    if(r.dates.length){ sel.value = r.dates[r.dates.length-1]; }
+  // Deltas-by-day table
+  async function loadDeltaDates(days) {
+    const data = await api('/api/streams/dates?days=' + days);
+    const sel = document.getElementById('deltaDate'); sel.innerHTML = '';
+    for (const d of data.dates) { const opt = document.createElement('option'); opt.value = d; opt.textContent = d; sel.appendChild(opt); }
+    if (data.dates.length) sel.value = data.dates[0];
   }
-  function setLeadersDate(d){ const sel=document.getElementById('leadersDate'); if([...sel.options].some(o=>o.value===d)) sel.value=d; }
-  async function loadLeaders(){
-    const d = document.getElementById('leadersDate').value;
-    const r = await api('/api/streams/daily-leaders?date='+d+'&limit=50');
-    const tb = document.querySelector('#leadersTable tbody'); tb.innerHTML='';
-    r.rows.forEach((row, i) => {
+  async function loadDeltaTable() {
+    const day = document.getElementById('deltaDate').value;
+    const data = await api('/api/streams/top-deltas?date=' + encodeURIComponent(day));
+    const body = document.getElementById('deltaTableBody'); body.innerHTML = '';
+    data.rows.forEach((r, i) => {
       const tr = document.createElement('tr');
-      tr.innerHTML = `<td class="muted">${i+1}</td>
-        <td>${row.isrc||''}</td>
-        <td>${(row.title||'').replaceAll('<','&lt;')}</td>
-        <td>${(row.artist||'').replaceAll('<','&lt;')}</td>
-        <td><strong>${fmt(row.delta)}</strong></td>
-        <td class="muted">${fmt(row.prev_pc)} → ${fmt(row.playcount)}</td>`;
-      tb.appendChild(tr);
+      tr.innerHTML = `<td>${i+1}</td><td>${r.isrc ?? ''}</td><td>${r.title ?? ''}</td><td>${r.artist ?? ''}</td><td class="text-right">${fmt(r.delta ?? 0)}</td>`;
+      body.appendChild(tr);
     });
   }
 
-  document.getElementById('streamsDays').addEventListener('change', e=>loadStreams(e.target.value));
-  document.getElementById('playlistDays').addEventListener('change', e=>loadPlaylistChart(e.target.value));
-  document.getElementById('overlayDays').addEventListener('change', e=>loadOverlay(e.target.value));
-  document.getElementById('playlistSelect').addEventListener('change', async()=>{ await updatePlaylistCard(); await loadPlaylistChart(document.getElementById('playlistDays').value); });
-  document.getElementById('leadersDate').addEventListener('change', loadLeaders);
+  document.getElementById('streamsDays').addEventListener('change', e => loadStreams(e.target.value));
+  document.getElementById('playlistDays').addEventListener('change', e => loadPlaylistChart(e.target.value));
+  document.getElementById('overlayDays').addEventListener('change', e => loadOverlay(e.target.value));
+  document.getElementById('playlistSelect').addEventListener('change', async () => { await updatePlaylistCard(); await loadPlaylistChart(document.getElementById('playlistDays').value); });
+  document.getElementById('btnReloadDeltas').addEventListener('click', loadDeltaTable);
 
-  (async()=>{
+  (async () => {
     await loadStreams(document.getElementById('streamsDays').value);
     await loadPlaylists();
     await loadOverlay(document.getElementById('overlayDays').value);
-    await loadAvailableDates();
-    await loadLeaders();
+    await loadDeltaDates(90);
+    await loadDeltaTable();
   })();
 </script>
 </body></html>
 """
-    return render_template_string(html, local_tz=LOCAL_TZ, default_playlist_name=DEFAULT_PLAYLIST_NAME)
+    return render_template_string(
+        html,
+        local_tz=LOCAL_TZ,
+        default_playlist_name=DEFAULT_PLAYLIST_NAME
+    )
 
-# ── API (reads the adjusted views) ────────────────────────────────────────────
-@app.before_request
-def _views_guard():
-    _ensure_views()
 
+# ── API: streams (from streams.daily_delta) ────────────────────────────────────
 @app.get("/api/streams/total-daily")
 def api_streams_total_daily():
-    days = _clamp_days(request.args.get("days"), 30)
+    days = _clamp_days(request.args.get("days"), 90)
     q = """
-      SELECT date AS d, delta AS v
-      FROM public.spotify_streams_daily_adjusted
-      WHERE date >= CURRENT_DATE - %s::int * INTERVAL '1 day'
-      ORDER BY d;
+        SELECT s.stream_date AS d,
+               COALESCE(SUM(GREATEST(s.daily_delta, 0)), 0)::bigint AS v
+        FROM streams s
+        WHERE s.platform = 'spotify'
+          AND s.stream_date >= CURRENT_DATE - %s::int * INTERVAL '1 day'
+        GROUP BY s.stream_date
+        ORDER BY s.stream_date
     """
     rows = _q(q, (days,))
     if rows:
@@ -362,91 +321,99 @@ def api_streams_total_daily():
     labels, values = _fill_series([(r["d"], r["v"]) for r in rows], start, end)
     return jsonify({"labels": labels, "values": values})
 
-@app.get("/api/streams/available-dates")
-def api_streams_available_dates():
+
+@app.get("/api/streams/dates")
+def api_streams_dates():
     days = _clamp_days(request.args.get("days"), 90)
     q = """
-      SELECT date AS day
-      FROM public.spotify_streams_daily_adjusted
-      WHERE date >= CURRENT_DATE - %s::int * INTERVAL '1 day'
-      ORDER BY day;
+        SELECT DISTINCT s.stream_date AS d
+        FROM streams s
+        WHERE s.platform='spotify'
+          AND s.stream_date >= CURRENT_DATE - %s::int * INTERVAL '1 day'
+        ORDER BY d DESC
     """
     rows = _q(q, (days,))
-    return jsonify({"dates": [r["day"].isoformat() for r in rows]})
+    return jsonify({"dates": [r["d"].isoformat() for r in rows]})
 
-@app.get("/api/streams/daily-leaders")
-def api_streams_daily_leaders():
-    day = request.args.get("date") or date.today().isoformat()
-    limit = int(request.args.get("limit", 50))
+
+@app.get("/api/streams/top-deltas")
+def api_streams_top_deltas():
+    day = request.args.get("date")
+    if not day:
+        return jsonify({"rows": []})
+    try:
+        # Default limit large enough to show “all” for most catalogs, tunable via ?limit=
+        limit = int(request.args.get("limit", 10000))
+    except Exception:
+        limit = 10000
     q = """
-      WITH d AS (
-        SELECT sda.track_uid, sda.delta_share::bigint AS delta
-        FROM public.spotify_streams_delta_adjusted sda
-        WHERE sda.date = %s::date
-      ),
-      prevsnap AS (
-        SELECT x.track_uid,
-               (SELECT s2.playcount FROM public.streams s2
-                WHERE s2.platform='spotify' AND s2.track_uid=x.track_uid
-                  AND s2.playcount>0 AND s2.stream_date < %s::date
-                ORDER BY s2.stream_date DESC LIMIT 1) AS prev_pc
-        FROM d x
-      ),
-      todaysnap AS (
-        SELECT x.track_uid,
-               (SELECT s2.playcount FROM public.streams s2
-                WHERE s2.platform='spotify' AND s2.track_uid=x.track_uid
-                  AND s2.stream_date >= %s::date
-                ORDER BY s2.stream_date ASC LIMIT 1) AS playcount
-        FROM d x
-      )
-      SELECT t.isrc, t.title, t.artist,
-             COALESCE(ts.playcount, ps.prev_pc, 0)::bigint AS playcount,
-             COALESCE(ps.prev_pc, 0)::bigint            AS prev_pc,
-             d.delta
-      FROM d
-      JOIN public.track_dim t USING (track_uid)
-      LEFT JOIN prevsnap ps USING (track_uid)
-      LEFT JOIN todaysnap ts USING (track_uid)
-      ORDER BY d.delta DESC
-      LIMIT %s;
+        SELECT
+          t.isrc,
+          t.title,
+          t.artist,
+          COALESCE(s.daily_delta, 0)::bigint AS delta
+        FROM streams s
+        JOIN track_dim t ON t.track_uid = s.track_uid
+        WHERE s.platform='spotify'
+          AND s.stream_date = %s
+        ORDER BY COALESCE(s.daily_delta,0) DESC, t.isrc
+        LIMIT %s
     """
-    rows = _q(q, (day, day, day, limit))
-    return jsonify({"date": day, "rows": rows})
+    rows = _q(q, (day, limit))
+    out = []
+    for r in rows:
+        out.append({
+            "isrc": r.get("isrc"),
+            "title": r.get("title"),
+            "artist": r.get("artist"),
+            "delta": int(r.get("delta") or 0),
+        })
+    return jsonify({"rows": out})
 
+
+# ── API: playlists (unchanged: uses playlist_followers & playlist_followers_delta) ─
 @app.get("/api/playlists/list")
 def api_playlists_list():
     q = """
         WITH latest AS (
           SELECT DISTINCT ON (playlist_id)
             playlist_id, playlist_name, followers, snapshot_date
-          FROM public.playlist_followers
-          WHERE platform='spotify'
+          FROM playlist_followers
+          WHERE platform = 'spotify'
           ORDER BY playlist_id, snapshot_date DESC
         )
-        SELECT l.playlist_id, l.playlist_name, l.followers, d.delta, l.snapshot_date AS date,
-               'https://open.spotify.com/playlist/' || split_part(l.playlist_id, ':', 3) AS web_url
+        SELECT
+          l.playlist_id,
+          l.playlist_name,
+          l.followers,
+          d.delta,
+          l.snapshot_date AS date,
+          'https://open.spotify.com/playlist/' || split_part(l.playlist_id, ':', 3) AS web_url
         FROM latest l
-        LEFT JOIN public.playlist_followers_delta d
+        LEFT JOIN playlist_followers_delta d
           ON d.playlist_id = l.playlist_id AND d.date = l.snapshot_date
         ORDER BY l.followers DESC;
     """
     rows = _q(q)
-    return jsonify([{
-        "playlist_id": r["playlist_id"],
-        "playlist_name": r["playlist_name"],
-        "followers": int(r["followers"]) if r["followers"] is not None else None,
-        "delta": int(r["delta"]) if r["delta"] is not None else None,
-        "date": r["date"].isoformat() if r["date"] else None,
-        "web_url": r["web_url"],
-    } for r in rows])
+    out = []
+    for r in rows:
+        out.append({
+            "playlist_id": r["playlist_id"],
+            "playlist_name": r["playlist_name"],
+            "followers": int(r["followers"]) if r["followers"] is not None else None,
+            "delta": int(r["delta"]) if r["delta"] is not None else None,
+            "date": r["date"].isoformat() if r["date"] else None,
+            "web_url": r["web_url"],
+        })
+    return jsonify(out)
+
 
 @app.get("/api/playlists/<path:playlist_id>/series")
 def api_playlist_series(playlist_id: str):
-    days = _clamp_days(request.args.get("days"), 30)
+    days = _clamp_days(request.args.get("days"), 90)
     q = """
         SELECT date AS d, followers, delta
-        FROM public.playlist_followers_delta
+        FROM playlist_followers_delta
         WHERE playlist_id = %s
           AND date >= CURRENT_DATE - %s::int * INTERVAL '1 day'
         ORDER BY d
@@ -460,48 +427,67 @@ def api_playlist_series(playlist_id: str):
     _, deltas = _fill_series([(r["d"], int(r["delta"] or 0)) for r in rows], start, end)
     return jsonify({"labels": labels, "followers": followers, "deltas": deltas})
 
+
+# ── API: overlay (streams.daily_delta vs followers_delta) ──────────────────────
 @app.get("/api/overlay/streams-vs-followers")
 def api_overlay():
-    days = _clamp_days(request.args.get("days"), 30)
+    days = _clamp_days(request.args.get("days"), 90)
+
     q_streams = """
-      SELECT date AS d, delta AS v
-      FROM public.spotify_streams_daily_adjusted
-      WHERE date >= CURRENT_DATE - %s::int * INTERVAL '1 day'
-      ORDER BY d;
+        SELECT s.stream_date AS d,
+               COALESCE(SUM(GREATEST(s.daily_delta, 0)), 0)::bigint AS v
+        FROM streams s
+        WHERE s.platform='spotify'
+          AND s.stream_date >= CURRENT_DATE - %s::int * INTERVAL '1 day'
+        GROUP BY s.stream_date
+        ORDER BY s.stream_date
     """
+
     q_fdelta = """
-      SELECT date AS d, COALESCE(SUM(delta),0)::bigint AS v
-      FROM public.playlist_followers_delta
-      WHERE date >= CURRENT_DATE - %s::int * INTERVAL '1 day'
-      GROUP BY d
-      ORDER BY d;
+        SELECT date AS d, COALESCE(SUM(delta),0)::bigint AS v
+        FROM playlist_followers_delta
+        WHERE date >= CURRENT_DATE - %s::int * INTERVAL '1 day'
+        GROUP BY d
+        ORDER BY d
     """
+
     rows_s = _q(q_streams, (days,))
     rows_f = _q(q_fdelta, (days,))
+
     dates = {r["d"] for r in rows_s} | {r["d"] for r in rows_f}
     if dates:
         start, end = min(dates), max(dates)
     else:
         end = date.today(); start = end - timedelta(days=days)
+
     labels, svals = _fill_series([(r["d"], int(r["v"])) for r in rows_s], start, end)
     _, fvals = _fill_series([(r["d"], int(r["v"])) for r in rows_f], start, end)
+
     fcum, total = [], 0
     for v in fvals:
         total += v
         fcum.append(total)
-    return jsonify({"labels": labels, "streams_delta": svals, "followers_delta": fvals, "followers_cum": fcum})
+
+    return jsonify({
+        "labels": labels,
+        "streams_delta": svals,
+        "followers_delta": fvals,
+        "followers_cum": fcum,
+    })
+
 
 # ── Health ────────────────────────────────────────────────────────────────────
 @app.get("/health")
 def health():
     try:
-        ssl_row = _q("SHOW ssl")
-        ssl = ssl_row[0]["ssl"] if ssl_row else "unknown"
         _q("SELECT NOW()")
-        return {"ok": True, "db": True, "ssl": ssl}
+        ssl = _q("SHOW ssl")
+        return {"ok": True, "db": True, "ssl": (ssl[0]["ssl"] if ssl else "unknown")}
     except Exception as e:
         return {"ok": False, "db": False, "error": str(e)}
 
+
+# ── Entrypoint ────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
     port = int(os.getenv("PORT", "8080"))
     app.run(host="0.0.0.0", port=port, threaded=True)
