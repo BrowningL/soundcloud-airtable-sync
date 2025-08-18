@@ -32,7 +32,7 @@ CATALOGUE_TABLE = os.getenv("CATALOGUE_TABLE", "Catalogue")
 CATALOGUE_VIEW = os.getenv("CATALOGUE_VIEW", "Inner Catalogue")
 CATALOGUE_ISRC_FIELD = os.getenv("CATALOGUE_ISRC_FIELD", "ISRC")
 CATALOGUE_ARTIST_FIELD = os.getenv("CATALOGUE_ARTIST_FIELD", "Artist")  # lookup/rollup or text
-CATALOGUE_TITLE_FIELD  = os.getenv("CATALOGUE_TITLE_FIELD",  "Title")   # lookup/rollup or text
+CATALOGUE_TITLE_FIELD  = os.getenv("CATALOGUE_TITLE_FIELD",  "Track Title")   # lookup/rollup or text
 
 # ----- Track Playcounts (Airtable) -----
 PLAYCOUNTS_TABLE = os.getenv("PLAYCOUNTS_TABLE", "Spotify Streams")
