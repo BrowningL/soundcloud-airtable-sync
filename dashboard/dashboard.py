@@ -15,16 +15,15 @@ DATABASE_URL = os.getenv("DATABASE_URL")
 if not DATABASE_URL:
     raise RuntimeError("DATABASE_URL is required")
 
-# Railway TCP proxy often needs sslmode=disable (you set DB_SSLMODE=disable)
 POOL = ConnectionPool(
     conninfo=DATABASE_URL,
-    kwargs={"sslmode": os.getenv("DB_SSLMODE", "prefer")},
+    kwargs={"sslmode": os.getenv("DB_SSLMODE", "prefer")},  # "disable" if needed
     min_size=1,
     max_size=5,
-    open=False,  # lazy open; good with gunicorn workers
+    open=False,
 )
 
-app = Flask(__name__)  # static folder defaults to "./static"
+app = Flask(__name__)  # serves /static/* by default
 
 
 # ── DB helpers ────────────────────────────────────────────────────────────────
@@ -32,7 +31,7 @@ def _ensure_pool_open():
     try:
         POOL.open()
     except Exception:
-        pass  # already open or racing
+        pass
 
 def _q(query: str, params: tuple | None = None):
     _ensure_pool_open()
@@ -74,360 +73,280 @@ def ui():
     html = """<!doctype html>
 <html lang="en">
 <head>
-  <meta charset="utf-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>KAIZEN — Streams & Playlists Dashboard</title>
-
-  <!-- Vendors -->
+  <meta charset="utf-8" /><meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>KAIZEN — Catalogue Dashboard</title>
   <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
   <script src="https://cdn.tailwindcss.com"></script>
-
-  <!-- Your brand CSS (contains the clock/reveal animation + font-face) -->
   <link rel="stylesheet" href="/static/styles.css" />
-
   <style>
-    /* ===== KAIZEN frame + layout ===== */
+    /* Fixed black frame that always shows during scroll */
+    .fixed-frame {
+      position: fixed; inset: 0;
+      pointer-events: none;
+      border: 18px solid #000;   /* frame thickness */
+      box-sizing: border-box;
+      z-index: 9999;
+    }
+
     html, body { height: 100%; }
-    body { margin: 0; background: #000; color: #111; }
+    body { margin: 0; background: #fff; color: #111; }
+    .content { padding: 24px; }  /* keeps content away from the frame edges */
 
-    /* Black border (like the site) */
-    .frame {
-      position: relative;
-      background: #fff;
-      margin: 18px;                    /* thickness of the outer black border */
-      min-height: calc(100vh - 36px);
-      border: 2px solid #000;          /* crisp inner line */
-      overflow: hidden;
-    }
+    /* Header */
+    .brand-header { display:flex; align-items:center; gap:.85rem; margin-bottom: .75rem; }
+    .brand-logo { height: 64px; width: 64px; object-fit: contain; } /* larger ring top-left */
+    .brand-title { font-weight: 800; letter-spacing: -0.02em; }     /* title only; charts keep defaults */
 
-    /* Header (logo lockup top-left) */
-    .brand-header {
-      display: flex; align-items: center; gap: .75rem;
-      padding: 14px 16px 10px 16px;
-    }
-    .brand-logo { height: 44px; width: 44px; object-fit: contain; }
-    .brand-title { font-weight: 900; letter-spacing: -0.02em; }
-
-    /* Cards */
+    /* Cards (keep your previous feel; not ultra-bold titles) */
     .card {
       background: #fff;
       border-radius: 16px;
       box-shadow: 0 10px 28px rgba(0,0,0,.08);
       padding: 1.1rem;
     }
+    h2 { font-size: 1.125rem; font-weight: 600; }  /* same as before, not heavy */
+    table { width:100%; border-collapse: collapse; }
+    th, td { padding:.5rem; border-bottom:1px solid rgba(0,0,0,.06); }
+    .scroll { max-height: 420px; overflow:auto; }
 
-    /* Tables */
-    table { width: 100%; border-collapse: collapse; }
-    th, td { padding: .5rem; border-bottom: 1px solid rgba(0,0,0,.06); }
-    .scroll { max-height: 420px; overflow: auto; }
+    /* Use THE BOLD FONT only on the playlist dropdown for a branded touch */
+    .kaizen-bold { font-family: "THE BOLD FONT - FREE VERSION - 2023", ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, "Helvetica Neue", Arial, "Noto Sans", "Apple Color Emoji","Segoe UI Emoji"; }
 
-    /* Dark scheme polish */
     @media (prefers-color-scheme: dark) {
-      .frame { background: #111; color: #f6f6f6; }
-      .card { background: rgba(24,24,27,.82); color: #f6f6f6; }
-      table th, table td { border-color: rgba(255,255,255,.08) !important; }
+      body { background:#111; color:#f5f5f5; }
+      .card { background: rgba(24,24,27,.82); color:#fff; }
+      th, td { border-color: rgba(255,255,255,.08); }
       a { color: #f87171; }
-    }
-
-    /* ===== Preloader (text pops quickly, ring reveals clockwise) =====
-       We piggyback on classes defined in /static/styles.css:
-       - .clock: conic-gradient mask that sweeps clockwise
-       - @font-face for THE BOLD FONT
-    */
-    .preloader {
-      position: absolute; inset: 0;
-      display: grid; place-items: center;
-      background: inherit;          /* match white or dark of frame */
-      z-index: 50;
-    }
-    .pre-inner { position: relative; width: min(72vmin, 540px); height: min(72vmin, 540px); }
-    .pre-enso {
-      position: absolute; inset: 0; margin: auto;
-      width: 100%; height: 100%; object-fit: contain;
-      filter: drop-shadow(0 6px 16px rgba(0,0,0,.18));
-    }
-    .pre-word {
-      position: absolute; inset: 0; display: grid; place-items: center;
-      font-family: "THE BOLD FONT - FREE VERSION - 2023", system-ui, -apple-system, Segoe UI, Roboto, sans-serif;
-      font-weight: 900; letter-spacing: -.03em;
-      font-size: clamp(36px, 11vmin, 96px);
-      color: #000;
-      opacity: 0; transform: translateY(8px);
-      animation: wordIn .35s ease-out .20s forwards;  /* text pops quickly first */
-      text-shadow: 0 1px 0 rgba(0,0,0,.03);
-    }
-    @media (prefers-color-scheme: dark) { .pre-word { color: #fff; } }
-
-    @keyframes wordIn {
-      to { opacity: 1; transform: translateY(0); }
-    }
-
-    /* Reveal app after splash */
-    .app { opacity: 0; transform: translateY(6px); transition: opacity .45s ease, transform .45s ease; }
-    body.loaded .preloader { opacity: 0; visibility: hidden; transition: opacity .45s ease .12s, visibility 0s linear .6s; }
-    body.loaded .app { opacity: 1; transform: none; }
-
-    /* Motion-friendly */
-    @media (prefers-reduced-motion: reduce) {
-      .pre-word, .clock { animation: none !important; }
     }
   </style>
 </head>
 <body>
-  <div class="frame">
+  <div class="fixed-frame"></div>
 
-    <!-- PRELOADER: Text appears fast; ring reveals clockwise using .clock mask -->
-    <div class="preloader" id="preloader">
-      <div class="pre-inner">
-        <div class="pre-word">KAIZEN</div>
-        <!-- IMPORTANT: use /static/img/kaizen_ring_red.png (rename your file if needed) -->
-        <img class="pre-enso clock" src="/static/img/kaizen_ring_red.png" alt="KAIZEN ring" />
-      </div>
-    </div>
-
-    <!-- Header lockup -->
+  <div class="content max-w-7xl mx-auto">
     <header class="brand-header">
-      <!-- Tiny ring serves as lockup; you can replace with a full wordmark PNG if you prefer -->
       <img class="brand-logo" src="/static/img/kaizen_ring_red.png" alt="KAIZEN" />
       <div>
-        <div class="brand-title text-xl sm:text-2xl">Streams & Playlists Dashboard</div>
+        <div class="brand-title text-xl sm:text-2xl">Catalogue Dashboard</div>
         <div class="text-xs opacity-70">Timezone: {{ local_tz }}</div>
       </div>
     </header>
 
-    <!-- Main app content -->
-    <div class="app">
-      <div class="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 pb-8">
-        <section class="grid grid-cols-1 lg:grid-cols-3 gap-6 mt-2">
-          <div class="card col-span-1 lg:col-span-2">
-            <div class="flex items-center justify-between mb-3">
-              <h2 class="text-lg sm:text-xl font-semibold">Daily Streams Δ (sum)</h2>
-              <div>
-                <label class="mr-2 text-sm opacity-70">Window</label>
-                <select id="streamsDays" class="border rounded px-2 py-1 text-sm">
-                  <option value="30">30 days</option>
-                  <option value="90" selected>90 days</option>
-                  <option value="180">180 days</option>
-                </select>
-              </div>
-            </div>
-            <canvas id="streamsChart" height="110"></canvas>
+    <!-- Row 1 -->
+    <section class="grid grid-cols-1 lg:grid-cols-3 gap-6">
+      <div class="card col-span-1 lg:col-span-2">
+        <div class="flex items-center justify-between mb-3">
+          <h2>Daily Streams Δ (sum)</h2>
+          <div>
+            <label class="mr-2 text-sm opacity-70">Window</label>
+            <select id="streamsDays" class="border rounded px-2 py-1 text-sm">
+              <option value="30">30 days</option>
+              <option value="90" selected>90 days</option>
+              <option value="180">180 days</option>
+            </select>
           </div>
-
-          <div class="card">
-            <h2 class="text-lg sm:text-xl font-semibold mb-3">Playlists</h2>
-            <label class="text-sm opacity-70">Select playlist</label>
-            <select id="playlistSelect" class="w-full border rounded px-2 py-2 mt-1"></select>
-            <div class="mt-4 text-sm">
-              <div>Latest followers: <span id="plFollowers" class="font-semibold">-</span></div>
-              <div>Last daily Δ: <span id="plDelta" class="font-semibold">-</span></div>
-              <div class="mt-2"><a id="plLink" class="underline" target="_blank" rel="noopener">Open in Spotify</a></div>
-            </div>
-          </div>
-        </section>
-
-        <section class="grid grid-cols-1 lg:grid-cols-2 gap-6 mt-6">
-          <div class="card">
-            <div class="flex items-center justify-between mb-3">
-              <h2 class="text-lg sm:text-xl font-semibold">Playlist Growth (followers & daily Δ)</h2>
-              <div>
-                <label class="mr-2 text-sm opacity-70">Window</label>
-                <select id="playlistDays" class="border rounded px-2 py-1 text-sm">
-                  <option value="30">30 days</option>
-                  <option value="90" selected>90 days</option>
-                  <option value="180">180 days</option>
-                </select>
-              </div>
-            </div>
-            <canvas id="playlistChart" height="120"></canvas>
-          </div>
-
-          <div class="card">
-            <div class="flex items-center justify-between mb-3">
-              <h2 class="text-lg sm:text-xl font-semibold">Overlay: Streams Δ vs Total Followers Δ (+ cumulative)</h2>
-              <div>
-                <label class="mr-2 text-sm opacity-70">Window</label>
-                <select id="overlayDays" class="border rounded px-2 py-1 text-sm">
-                  <option value="30">30 days</option>
-                  <option value="90" selected>90 days</option>
-                  <option value="180">180 days</option>
-                </select>
-              </div>
-            </div>
-            <canvas id="overlayChart" height="120"></canvas>
-          </div>
-        </section>
-
-        <section class="grid grid-cols-1 gap-6 mt-6">
-          <div class="card">
-            <div class="flex items-center justify-between mb-3">
-              <h2 class="text-lg sm:text-xl font-semibold">Top track deltas by day</h2>
-              <div class="flex items-center gap-2">
-                <label class="text-sm opacity-70">Date</label>
-                <select id="deltaDate" class="border rounded px-2 py-1 text-sm"></select>
-                <button id="btnReloadDeltas" class="border rounded px-3 py-1 text-sm">Reload</button>
-              </div>
-            </div>
-            <div class="scroll">
-              <table>
-                <thead>
-                  <tr><th class="text-left">#</th><th class="text-left">ISRC</th><th class="text-left">Title</th><th class="text-left">Artist</th><th class="text-right">Δ</th></tr>
-                </thead>
-                <tbody id="deltaTableBody"></tbody>
-              </table>
-            </div>
-          </div>
-        </section>
+        </div>
+        <canvas id="streamsChart" height="110"></canvas>
       </div>
-    </div>
+
+      <div class="card">
+        <h2 class="mb-3">Playlists</h2>
+        <label class="text-sm opacity-70">Select playlist</label>
+        <select id="playlistSelect" class="kaizen-bold w-full border rounded px-2 py-2 mt-1"></select>
+        <div class="mt-4 text-sm">
+          <div>Latest followers: <span id="plFollowers" class="font-semibold">-</span></div>
+          <div>Last daily Δ: <span id="plDelta" class="font-semibold">-</span></div>
+          <div class="mt-2"><a id="plLink" class="underline" target="_blank" rel="noopener">Open in Spotify</a></div>
+        </div>
+      </div>
+    </section>
+
+    <!-- Row 2 -->
+    <section class="grid grid-cols-1 lg:grid-cols-2 gap-6 mt-6">
+      <div class="card">
+        <div class="flex items-center justify-between mb-3">
+          <h2>Playlist Growth (followers & daily Δ)</h2>
+          <div>
+            <label class="mr-2 text-sm opacity-70">Window</label>
+            <select id="playlistDays" class="border rounded px-2 py-1 text-sm">
+              <option value="30">30 days</option>
+              <option value="90" selected>90 days</option>
+              <option value="180">180 days</option>
+            </select>
+          </div>
+        </div>
+        <canvas id="playlistChart" height="120"></canvas>
+      </div>
+
+      <div class="card">
+        <div class="flex items-center justify-between mb-3">
+          <h2>All Playlists — Followers Over Time</h2>
+          <div>
+            <label class="mr-2 text-sm opacity-70">Window</label>
+            <select id="allPlaylistsDays" class="border rounded px-2 py-1 text-sm">
+              <option value="30">30 days</option>
+              <option value="90" selected>90 days</option>
+              <option value="180">180 days</option>
+            </select>
+          </div>
+        </div>
+        <canvas id="allPlaylistsChart" height="120"></canvas>
+      </div>
+    </section>
+
+    <!-- Row 3: Best artists today -->
+    <section class="grid grid-cols-1 gap-6 mt-6">
+      <div class="card">
+        <div class="flex items-center justify-between mb-3">
+          <h2>Best Artists Today — Share of Total Streams Δ</h2>
+          <div class="text-sm opacity-70" id="bestArtistsDateLabel"></div>
+        </div>
+        <canvas id="bestArtistsChart" height="120"></canvas>
+      </div>
+    </section>
+
+    <!-- Row 4: Table -->
+    <section class="grid grid-cols-1 gap-6 mt-6">
+      <div class="card">
+        <div class="flex items-center justify-between mb-3">
+          <h2>Top track deltas by day</h2>
+          <div class="flex items-center gap-2">
+            <label class="text-sm opacity-70">Date</label>
+            <select id="deltaDate" class="border rounded px-2 py-1 text-sm"></select>
+            <button id="btnReloadDeltas" class="border rounded px-3 py-1 text-sm">Reload</button>
+          </div>
+        </div>
+        <div class="scroll">
+          <table>
+            <thead>
+              <tr><th class="text-left">#</th><th class="text-left">ISRC</th><th class="text-left">Title</th><th class="text-left">Artist</th><th class="text-right">Δ</th></tr>
+            </thead>
+            <tbody id="deltaTableBody"></tbody>
+          </table>
+        </div>
+      </div>
+    </section>
   </div>
 
-  <script>
-    // Reveal app after a short beat (lets the text pop + ring wipe read)
-    window.addEventListener('load', () => {
-      setTimeout(() => document.body.classList.add('loaded'), 650);
+<script>
+  const DEFAULT_PLAYLIST_NAME = {{ default_playlist_name | tojson }};
+  let streamsChart, playlistChart, allPlaylistsChart, bestArtistsChart;
+  const fmt = (n) => Number(n).toLocaleString();
+  async function api(path) { const r = await fetch(path); if (!r.ok) throw new Error(await r.text()); return r.json(); }
+
+  // Streams (LINE chart)
+  async function loadStreams(days) {
+    const data = await api('/api/streams/total-daily?days=' + days);
+    const ctx = document.getElementById('streamsChart').getContext('2d');
+    const cfg = {
+      type: 'line',
+      data: { labels: data.labels, datasets: [{ label: 'Streams Δ (sum)', data: data.values, tension: 0.3, fill: false }] },
+      options: { responsive: true, scales: { x: { ticks: { maxRotation: 0, autoSkip: true } }, y: { beginAtZero: true } },
+                 plugins: { tooltip: { callbacks: { label: (c) => ' ' + fmt(c.parsed.y) } } } }
+    };
+    if (streamsChart) streamsChart.destroy(); streamsChart = new Chart(ctx, cfg);
+  }
+
+  // Playlists list
+  async function loadPlaylists() {
+    const list = await api('/api/playlists/list');
+    const sel = document.getElementById('playlistSelect'); sel.innerHTML = '';
+    let defaultId = list.length ? list[0].playlist_id : null;
+    for (const p of list) { const opt = document.createElement('option'); opt.value = p.playlist_id; opt.textContent = p.playlist_name || p.playlist_id; sel.appendChild(opt); }
+    const def = list.find(p => (p.playlist_name || '').toLowerCase().startsWith(DEFAULT_PLAYLIST_NAME.toLowerCase()));
+    if (def) defaultId = def.playlist_id; if (defaultId) sel.value = defaultId;
+    await updatePlaylistCard(); await loadPlaylistChart(document.getElementById('playlistDays').value);
+  }
+
+  async function updatePlaylistCard() {
+    const list = await api('/api/playlists/list');
+    const id = document.getElementById('playlistSelect').value; const p = list.find(x => x.playlist_id === id); if (!p) return;
+    document.getElementById('plFollowers').textContent = fmt(p.followers ?? 0);
+    document.getElementById('plDelta').textContent = (p.delta == null) ? '-' : fmt(p.delta);
+    const a = document.getElementById('plLink'); a.href = p.web_url;
+  }
+
+  // Playlist Growth (selected playlist)
+  async function loadPlaylistChart(days) {
+    const id = document.getElementById('playlistSelect').value; if (!id) return;
+    const data = await api('/api/playlists/' + encodeURIComponent(id) + '/series?days=' + days);
+    const ctx = document.getElementById('playlistChart').getContext('2d');
+    const cfg = {
+      data: { labels: data.labels, datasets: [
+        { type: 'line', label: 'Followers', data: data.followers, yAxisID: 'y1', tension: 0.25 },
+        { type: 'bar',  label: 'Daily Δ',  data: data.deltas,    yAxisID: 'y2' }
+      ]},
+      options: { responsive: true, scales: {
+        x: { ticks: { maxRotation: 0, autoSkip: true } },
+        y1: { type: 'linear', position: 'left', beginAtZero: true },
+        y2: { type: 'linear', position: 'right', beginAtZero: true, grid: { drawOnChartArea: false } }
+      }, plugins: { tooltip: { callbacks: { label: (c) => ' ' + fmt(c.parsed.y) } } } }
+    };
+    if (playlistChart) playlistChart.destroy(); playlistChart = new Chart(ctx, cfg); await updatePlaylistCard();
+  }
+
+  // All playlists followers (multi-line)
+  async function loadAllPlaylistsChart(days) {
+    const data = await api('/api/playlists/all-series?days=' + days);
+    const ctx = document.getElementById('allPlaylistsChart').getContext('2d');
+    const datasets = data.series.map(s => ({
+      type: 'line', label: s.name, data: s.values, tension: 0.25, fill: false
+    }));
+    if (allPlaylistsChart) allPlaylistsChart.destroy();
+    allPlaylistsChart = new Chart(ctx, {
+      data: { labels: data.labels, datasets },
+      options: { responsive: true, plugins: { legend: { position: 'bottom' }, tooltip: { callbacks: { label: (c) => ' ' + fmt(c.parsed.y) } } },
+                 scales: { x: { ticks: { maxRotation: 0, autoSkip: true } }, y: { beginAtZero: true } } }
     });
+  }
 
-    const DEFAULT_PLAYLIST_NAME = {{ default_playlist_name | tojson }};
-    let streamsChart, playlistChart, overlayChart;
-    const fmt = (n) => Number(n).toLocaleString();
-
-    async function api(path) {
-      const r = await fetch(path);
-      if (!r.ok) throw new Error(await r.text());
-      return r.json();
-    }
-
-    // Streams (LINE chart, from streams.daily_delta)
-    async function loadStreams(days) {
-      const data = await api('/api/streams/total-daily?days=' + days);
-      const ctx = document.getElementById('streamsChart').getContext('2d');
-      const cfg = {
-        type: 'line',
-        data: { labels: data.labels, datasets: [{ label: 'Streams Δ (sum)', data: data.values, tension: 0.3, fill: false }] },
-        options: {
-          responsive: true,
-          scales: { x: { ticks: { maxRotation: 0, autoSkip: true } }, y: { beginAtZero: true } },
-          plugins: { tooltip: { callbacks: { label: (c) => ' ' + fmt(c.parsed.y) } } }
-        }
-      };
-      if (streamsChart) streamsChart.destroy();
-      streamsChart = new Chart(ctx, cfg);
-    }
-
-    // Playlists list
-    async function loadPlaylists() {
-      const list = await api('/api/playlists/list');
-      const sel = document.getElementById('playlistSelect'); sel.innerHTML = '';
-      let defaultId = list.length ? list[0].playlist_id : null;
-      for (const p of list) {
-        const opt = document.createElement('option');
-        opt.value = p.playlist_id;
-        opt.textContent = p.playlist_name || p.playlist_id;
-        sel.appendChild(opt);
-      }
-      const def = list.find(p => (p.playlist_name || '').toLowerCase().startsWith(DEFAULT_PLAYLIST_NAME.toLowerCase()));
-      if (def) defaultId = def.playlist_id;
-      if (defaultId) sel.value = defaultId;
-      await updatePlaylistCard();
-      await loadPlaylistChart(document.getElementById('playlistDays').value);
-    }
-
-    async function updatePlaylistCard() {
-      const list = await api('/api/playlists/list');
-      const id = document.getElementById('playlistSelect').value;
-      const p = list.find(x => x.playlist_id === id); if (!p) return;
-      document.getElementById('plFollowers').textContent = fmt(p.followers ?? 0);
-      document.getElementById('plDelta').textContent = (p.delta == null) ? '-' : fmt(p.delta);
-      const a = document.getElementById('plLink'); a.href = p.web_url;
-    }
-
-    // Playlist chart
-    async function loadPlaylistChart(days) {
-      const id = document.getElementById('playlistSelect').value; if (!id) return;
-      const data = await api('/api/playlists/' + encodeURIComponent(id) + '/series?days=' + days);
-      const ctx = document.getElementById('playlistChart').getContext('2d');
-      const cfg = {
-        data: { labels: data.labels, datasets: [
-          { type: 'line', label: 'Followers', data: data.followers, yAxisID: 'y1', tension: 0.25 },
-          { type: 'bar',  label: 'Daily Δ',  data: data.deltas,    yAxisID: 'y2' }
-        ]},
-        options: {
-          responsive: true,
-          scales: {
-            x: { ticks: { maxRotation: 0, autoSkip: true } },
-            y1: { type: 'linear', position: 'left', beginAtZero: true },
-            y2: { type: 'linear', position: 'right', beginAtZero: true, grid: { drawOnChartArea: false } }
-          },
-          plugins: { tooltip: { callbacks: { label: (c) => ' ' + fmt(c.parsed.y) } } }
-        }
-      };
-      if (playlistChart) playlistChart.destroy();
-      playlistChart = new Chart(ctx, cfg);
-      await updatePlaylistCard();
-    }
-
-    // Overlay: streams Δ vs followers Δ
-    async function loadOverlay(days) {
-      const data = await api('/api/overlay/streams-vs-followers?days=' + days);
-      const ctx = document.getElementById('overlayChart').getContext('2d');
-      const cfg = {
-        data: { labels: data.labels, datasets: [
-          { type: 'bar',  label: 'Streams Δ (sum)',          data: data.streams_delta,  yAxisID: 'yL' },
-          { type: 'line', label: 'Followers Δ (total)',      data: data.followers_delta, yAxisID: 'yR', tension: 0.25 },
-          { type: 'line', label: 'Followers Δ (cumulative)', data: data.followers_cum,   yAxisID: 'yR', tension: 0.25 }
-        ]},
-        options: {
-          responsive: true,
-          scales: {
-            x: { ticks: { maxRotation: 0, autoSkip: true } },
-            yL: { type: 'linear', position: 'left', beginAtZero: true },
-            yR: { type: 'linear', position: 'right', beginAtZero: true, grid: { drawOnChartArea: false } }
-          },
-          plugins: { tooltip: { callbacks: { label: (c) => ' ' + fmt(c.parsed.y) } } }
-        }
-      };
-      if (overlayChart) overlayChart.destroy();
-      overlayChart = new Chart(ctx, cfg);
-    }
-
-    // Deltas-by-day table
-    async function loadDeltaDates(days) {
-      const data = await api('/api/streams/dates?days=' + days);
-      const sel = document.getElementById('deltaDate'); sel.innerHTML = '';
-      for (const d of data.dates) {
-        const opt = document.createElement('option'); opt.value = d; opt.textContent = d; sel.appendChild(opt);
-      }
-      if (data.dates.length) sel.value = data.dates[0];
-    }
-    async function loadDeltaTable() {
-      const day = document.getElementById('deltaDate').value;
-      const data = await api('/api/streams/top-deltas?date=' + encodeURIComponent(day));
-      const body = document.getElementById('deltaTableBody'); body.innerHTML = '';
-      data.rows.forEach((r, i) => {
-        const tr = document.createElement('tr');
-        tr.innerHTML = `<td>${i+1}</td><td>${r.isrc ?? ''}</td><td>${r.title ?? ''}</td><td>${r.artist ?? ''}</td><td class="text-right">${fmt(r.delta ?? 0)}</td>`;
-        body.appendChild(tr);
-      });
-    }
-
-    document.getElementById('streamsDays').addEventListener('change', e => loadStreams(e.target.value));
-    document.getElementById('playlistDays').addEventListener('change', e => loadPlaylistChart(e.target.value));
-    document.getElementById('overlayDays').addEventListener('change', e => loadOverlay(e.target.value));
-    document.getElementById('playlistSelect').addEventListener('change', async () => {
-      await updatePlaylistCard();
-      await loadPlaylistChart(document.getElementById('playlistDays').value);
+  // Best artists today (share of total streams delta)
+  async function loadBestArtists() {
+    const data = await api('/api/artists/top-share');
+    document.getElementById('bestArtistsDateLabel').textContent = 'Date: ' + data.date;
+    const ctx = document.getElementById('bestArtistsChart').getContext('2d');
+    if (bestArtistsChart) bestArtistsChart.destroy();
+    bestArtistsChart = new Chart(ctx, {
+      type: 'bar',
+      data: { labels: data.labels, datasets: [{ label: 'Share of Daily Streams Δ (%)', data: data.shares }] },
+      options: { responsive: true, plugins: { legend: { display: false }, tooltip: { callbacks: { label: (c) => ' ' + c.parsed.y.toFixed(2) + '%' } } },
+                 scales: { y: { beginAtZero: true, ticks: { callback: (v)=> v + '%' } } } }
     });
-    document.getElementById('btnReloadDeltas').addEventListener('click', loadDeltaTable);
+  }
 
-    (async () => {
-      await loadStreams(document.getElementById('streamsDays').value);
-      await loadPlaylists();
-      await loadOverlay(document.getElementById('overlayDays').value);
-      await loadDeltaDates(90);
-      await loadDeltaTable();
-    })();
-  </script>
+  document.getElementById('streamsDays').addEventListener('change', e => loadStreams(e.target.value));
+  document.getElementById('playlistDays').addEventListener('change', e => loadPlaylistChart(e.target.value));
+  document.getElementById('allPlaylistsDays').addEventListener('change', e => loadAllPlaylistsChart(e.target.value));
+  document.getElementById('playlistSelect').addEventListener('change', async () => { await updatePlaylistCard(); await loadPlaylistChart(document.getElementById('playlistDays').value); });
+  document.getElementById('btnReloadDeltas').addEventListener('click', loadDeltaTable);
+
+  async function loadDeltaDates(days) {
+    const data = await api('/api/streams/dates?days=' + days);
+    const sel = document.getElementById('deltaDate'); sel.innerHTML = '';
+    for (const d of data.dates) { const opt = document.createElement('option'); opt.value = d; opt.textContent = d; sel.appendChild(opt); }
+    if (data.dates.length) sel.value = data.dates[0];
+  }
+  async function loadDeltaTable() {
+    const day = document.getElementById('deltaDate').value;
+    const data = await api('/api/streams/top-deltas?date=' + encodeURIComponent(day));
+    const body = document.getElementById('deltaTableBody'); body.innerHTML = '';
+    data.rows.forEach((r, i) => {
+      const tr = document.createElement('tr');
+      tr.innerHTML = `<td>${i+1}</td><td>${r.isrc ?? ''}</td><td>${r.title ?? ''}</td><td>${r.artist ?? ''}</td><td class="text-right">${fmt(r.delta ?? 0)}</td>`;
+      body.appendChild(tr);
+    });
+  }
+
+  (async () => {
+    await loadStreams(document.getElementById('streamsDays').value);
+    await loadPlaylists();
+    await loadPlaylistChart(document.getElementById('playlistDays').value);
+    await loadAllPlaylistsChart(document.getElementById('allPlaylistsDays').value);
+    await loadBestArtists();
+    await loadDeltaDates(90);
+    await loadDeltaTable();
+  })();
+</script>
 </body>
 </html>"""
     return render_template_string(
@@ -437,7 +356,7 @@ def ui():
     )
 
 
-# ── API: streams (from streams.daily_delta) ────────────────────────────────────
+# ── API: streams ──────────────────────────────────────────────────────────────
 @app.get("/api/streams/total-daily")
 def api_streams_total_daily():
     days = _clamp_days(request.args.get("days"), 90)
@@ -507,7 +426,7 @@ def api_streams_top_deltas():
     return jsonify({"rows": out})
 
 
-# ── API: playlists (uses playlist_followers & playlist_followers_delta) ────────
+# ── API: playlists (list + single series) ─────────────────────────────────────
 @app.get("/api/playlists/list")
 def api_playlists_list():
     q = """
@@ -564,52 +483,77 @@ def api_playlist_series(playlist_id: str):
     return jsonify({"labels": labels, "followers": followers, "deltas": deltas})
 
 
-# ── API: overlay (streams.daily_delta vs followers_delta) ──────────────────────
-@app.get("/api/overlay/streams-vs-followers")
-def api_overlay():
+# NEW: All playlists — followers over time (multi-series)
+@app.get("/api/playlists/all-series")
+def api_playlists_all_series():
     days = _clamp_days(request.args.get("days"), 90)
-
-    q_streams = """
-        SELECT s.stream_date AS d,
-               COALESCE(SUM(GREATEST(s.daily_delta, 0)), 0)::bigint AS v
-        FROM streams s
-        WHERE s.platform='spotify'
-          AND s.stream_date >= CURRENT_DATE - %s::int * INTERVAL '1 day'
-        GROUP BY s.stream_date
-        ORDER BY s.stream_date
-    """
-
-    q_fdelta = """
-        SELECT date AS d, COALESCE(SUM(delta),0)::bigint AS v
+    q = """
+        SELECT playlist_id,
+               COALESCE(playlist_name, playlist_id) AS name,
+               date AS d,
+               followers
         FROM playlist_followers_delta
         WHERE date >= CURRENT_DATE - %s::int * INTERVAL '1 day'
-        GROUP BY d
-        ORDER BY d
+        ORDER BY playlist_id, d
     """
-
-    rows_s = _q(q_streams, (days,))
-    rows_f = _q(q_fdelta, (days,))
-
-    dates = {r["d"] for r in rows_s} | {r["d"] for r in rows_f}
-    if dates:
-        start, end = min(dates), max(dates)
-    else:
+    rows = _q(q, (days,))
+    if not rows:
         end = date.today(); start = end - timedelta(days=days)
+        return jsonify({"labels": [d.isoformat() for d in _daterange(start, end)], "series": []})
 
-    labels, svals = _fill_series([(r["d"], int(r["v"])) for r in rows_s], start, end)
-    _, fvals = _fill_series([(r["d"], int(r["v"])) for r in rows_f], start, end)
+    # Collect date bounds
+    start, end = rows[0]["d"], rows[-1]["d"]
+    labels_base = [d.isoformat() for d in _daterange(start, end)]
 
-    fcum, total = [], 0
-    for v in fvals:
-        total += v
-        fcum.append(total)
+    # Build per-playlist series
+    series_map = {}
+    for r in rows:
+        pid = r["playlist_id"]
+        series_map.setdefault(pid, {"name": r["name"], "points": []})
+        series_map[pid]["points"].append((r["d"], int(r["followers"] or 0)))
 
-    return jsonify({
-        "labels": labels,
-        "streams_delta": svals,
-        "followers_delta": fvals,
-        "followers_cum": fcum,
-    })
+    series = []
+    for obj in series_map.values():
+        _, vals = _fill_series(obj["points"], start, end)
+        series.append({"name": obj["name"], "values": vals})
+
+    return jsonify({"labels": labels_base, "series": series})
+
+
+# NEW: Best artists for the latest date — share of daily delta
+@app.get("/api/artists/top-share")
+def api_artists_top_share():
+    # Pick latest available stream_date
+    q_latest = """
+        SELECT MAX(stream_date) AS d
+        FROM streams
+        WHERE platform='spotify'
+    """
+    r = _q(q_latest)
+    latest = r[0]["d"] if r and r[0]["d"] else None
+    day = request.args.get("date") or (latest.isoformat() if latest else None)
+    if not day:
+        return jsonify({"date": None, "labels": [], "values": [], "shares": []})
+
+    # Sum positive daily_delta by artist
+    q = """
+        SELECT t.artist,
+               COALESCE(SUM(GREATEST(s.daily_delta, 0)),0)::bigint AS v
+        FROM streams s
+        JOIN track_dim t ON t.track_uid = s.track_uid
+        WHERE s.platform='spotify'
+          AND s.stream_date = %s
+        GROUP BY t.artist
+        HAVING COALESCE(SUM(GREATEST(s.daily_delta, 0)),0) > 0
+        ORDER BY v DESC
+        LIMIT 25
+    """
+    rows = _q(q, (day,))
+    total = sum(int(r["v"]) for r in rows) or 1
+    labels = [r["artist"] or ""] for r in rows]
+    values = [int(r["v"]) for r in rows]
+    shares = [round(v * 100.0 / total, 2) for v in values]
+    return jsonify({"date": day, "labels": labels, "values": values, "shares": shares})
 
 
 # ── Health ────────────────────────────────────────────────────────────────────
