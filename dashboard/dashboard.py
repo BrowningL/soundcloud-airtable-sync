@@ -548,12 +548,15 @@ def api_artists_top_share():
         ORDER BY v DESC
         LIMIT 25
     """
+
     rows = _q(q, (day,))
     total = sum(int(r["v"]) for r in rows) or 1
-    labels = [r["artist"] or ""] for r in rows]
+
+    labels = [(r["artist"] or "") for r in rows]
     values = [int(r["v"]) for r in rows]
     shares = [round(v * 100.0 / total, 2) for v in values]
     return jsonify({"date": day, "labels": labels, "values": values, "shares": shares})
+
 
 
 # ── Health ────────────────────────────────────────────────────────────────────
