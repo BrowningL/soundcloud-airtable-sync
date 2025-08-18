@@ -22,7 +22,7 @@ AIRTABLE_BASE_ID = os.getenv("AIRTABLE_BASE_ID") or os.getenv("AT_BASE_ID") or "
 if not AIRTABLE_API_KEY or not AIRTABLE_API_KEY.startswith("pat"):
     raise RuntimeError("Set AIRTABLE_API_KEY to a valid Airtable Personal Access Token (starts with 'pat').")
 
-DATABASE_URL = os.getenv("DATABASE_URL")  # e.g. postgresql://railway:***@.../timeseriesdb?sslmode=require
+DATABASE_URL = os.getenv("DATABASE_URL")  # e.g. postgresql://railway:***@.../timeseriesdb
 OUTPUT_TARGET = os.getenv("OUTPUT_TARGET", "postgres").lower()  # 'postgres' | 'airtable' | 'both'
 AUTOMATION_TOKEN = os.getenv("AUTOMATION_TOKEN")  # optional: set to protect write routes
 LOCAL_TZ = os.getenv("LOCAL_TZ", "Europe/London")
@@ -31,6 +31,8 @@ LOCAL_TZ = os.getenv("LOCAL_TZ", "Europe/London")
 CATALOGUE_TABLE = os.getenv("CATALOGUE_TABLE", "Catalogue")
 CATALOGUE_VIEW = os.getenv("CATALOGUE_VIEW", "Inner Catalogue")
 CATALOGUE_ISRC_FIELD = os.getenv("CATALOGUE_ISRC_FIELD", "ISRC")
+CATALOGUE_ARTIST_FIELD = os.getenv("CATALOGUE_ARTIST_FIELD", "Artist")  # lookup/rollup or text
+CATALOGUE_TITLE_FIELD  = os.getenv("CATALOGUE_TITLE_FIELD",  "Title")   # lookup/rollup or text
 
 # ----- Track Playcounts (Airtable) -----
 PLAYCOUNTS_TABLE = os.getenv("PLAYCOUNTS_TABLE", "Spotify Streams")
@@ -92,9 +94,7 @@ def today_iso_local() -> str:
     return datetime.utcnow().date().isoformat()
 
 def parse_spotify_playlist_id(val: Optional[str]) -> Optional[str]:
-    """Accept URN, full URL, or raw id → return plain id (no prefix)."""
-    if not val:
-        return None
+    if not val: return None
     s = str(val).strip()
     if s.startswith("spotify:playlist:"):
         return s.split(":")[-1]
@@ -106,7 +106,7 @@ def parse_spotify_playlist_id(val: Optional[str]) -> Optional[str]:
                 return parts[1]
     except Exception:
         pass
-    return s  # assume raw id
+    return s
 
 def to_spotify_playlist_urn(raw: Optional[str]) -> Optional[str]:
     pid = parse_spotify_playlist_id(raw)
@@ -117,7 +117,7 @@ def urn_to_plain_id(urn: str) -> str:
 
 def _check_token():
     if not AUTOMATION_TOKEN:
-        return  # open if not set
+        return
     token = request.headers.get("x-automation-token") or request.args.get("token")
     if token != AUTOMATION_TOKEN:
         abort(403)
@@ -162,6 +162,39 @@ def at_batch_patch(table: str, records: List[Dict[str, Any]]):
         i += 10
         time.sleep(airtable_sleep)
 
+def _norm_lookup(val: Any) -> Optional[str]:
+    """Normalize Airtable lookup/rollup/text to a single string."""
+    if val is None: return None
+    if isinstance(val, list):
+        vals = [str(v).strip() for v in val if v is not None and str(v).strip() != ""]
+        return " & ".join(vals) if vals else None
+    s = str(val).strip()
+    return s or None
+
+def catalogue_index() -> Dict[str, Dict[str, Optional[str]]]:
+    """
+    Return mapping:
+      { ISRC_UPPER: { "air_id": <catalogue_record_id>, "artist": <str|None>, "title": <str|None> } }
+    """
+    params = {
+        "view": CATALOGUE_VIEW,
+        "pageSize": 100,
+        "fields[]": [CATALOGUE_ISRC_FIELD, CATALOGUE_ARTIST_FIELD, CATALOGUE_TITLE_FIELD],
+    }
+    rows = at_paginate(CATALOGUE_TABLE, params)
+    out: Dict[str, Dict[str, Optional[str]]] = {}
+    for rec in rows:
+        f = rec.get("fields", {})
+        isrc = (f.get(CATALOGUE_ISRC_FIELD) or "").strip().upper()
+        if not isrc:
+            continue
+        out[isrc] = {
+            "air_id": rec["id"],
+            "artist": _norm_lookup(f.get(CATALOGUE_ARTIST_FIELD)),
+            "title":  _norm_lookup(f.get(CATALOGUE_TITLE_FIELD)),
+        }
+    return out
+
 # ────────────────────────────────────────────────────────────────────────────────
 # Postgres helpers
 # ────────────────────────────────────────────────────────────────────────────────
@@ -200,27 +233,6 @@ def db_upsert_playlist_followers(cur, platform: str, playlist_id_urn: str, day_i
         DO UPDATE SET followers = EXCLUDED.followers,
                       playlist_name = COALESCE(EXCLUDED.playlist_name, playlist_followers.playlist_name)
     """, (platform, playlist_id_urn, day_iso, followers, playlist_name))
-
-# ────────────────────────────────────────────────────────────────────────────────
-# Catalogue / ISRC list
-# ────────────────────────────────────────────────────────────────────────────────
-def list_isrcs() -> List[Dict[str, str]]:
-    rows, offset = [], None
-    while True:
-        params = {"view": CATALOGUE_VIEW, "pageSize": 100, "fields[]": CATALOGUE_ISRC_FIELD}
-        if offset:
-            params["offset"] = offset
-        r = requests.get(at_url(CATALOGUE_TABLE), headers=at_headers(), params=params, timeout=60)
-        r.raise_for_status()
-        data = r.json()
-        for rec in data["records"]:
-            isrc = rec.get("fields", {}).get(CATALOGUE_ISRC_FIELD)
-            if isrc:
-                rows.append({"id": rec["id"], "isrc": isrc})
-        offset = data.get("offset")
-        if not offset:
-            break
-    return rows
 
 # ────────────────────────────────────────────────────────────────────────────────
 # Track Playcounts helpers (Airtable)
@@ -305,34 +317,57 @@ def playlists_index_from_airtable():
     for r in rows:
         f = r.get("fields", {})
         raw = f.get(PLAYLISTS_ID_FIELD) or f.get(PLAYLISTS_WEB_URL_FIELD)
-        urn = to_spotify_playlist_urn(raw)  # store URN in DB (per your preference)
+        urn = to_spotify_playlist_urn(raw)
         name = f.get(PLAYLISTS_NAME_FIELD)
         if urn:
             out[r["id"]] = {"playlist_id_urn": urn, "name": name}
     return out
 
 # ────────────────────────────────────────────────────────────────────────────────
-# Spotify helpers for streams (unchanged)
+# Spotify helpers for streams
 # ────────────────────────────────────────────────────────────────────────────────
 def get_search_token() -> str:
-    r = requests.post("https://accounts.spotify.com/api/token", data={"grant_type": "client_credentials"}, auth=(CLIENT_ID, CLIENT_SECRET), timeout=60)
+    r = requests.post("https://accounts.spotify.com/api/token",
+                      data={"grant_type": "client_credentials"},
+                      auth=(CLIENT_ID, CLIENT_SECRET), timeout=60)
     r.raise_for_status()
     return r.json()["access_token"]
 
-def search_track(isrc: str, bearer: str) -> Optional[Tuple[str, str, str]]:
-    r = requests.get("https://api.spotify.com/v1/search", headers={"Authorization": f"Bearer {bearer}"},
-                     params={"q": f"isrc:{isrc}", "type": "track", "limit": 5}, timeout=60)
+def search_track(isrc: str, bearer: str) -> Optional[Tuple[str, str, str, Optional[str]]]:
+    """
+    Return (track_id, album_id, track_name, artists_joined) for the given ISRC,
+    or None if not found.
+    """
+    r = requests.get("https://api.spotify.com/v1/search",
+                     headers={"Authorization": f"Bearer {bearer}"},
+                     params={"q": f"isrc:{isrc}", "type": "track", "limit": 5},
+                     timeout=60)
     if r.status_code != 200:
         return None
-    for t in r.json().get("tracks", {}).get("items", []):
-        if t.get("external_ids", {}).get("isrc", "").upper() == isrc.upper():
-            return t["id"], t["album"]["id"], t["name"]
     items = r.json().get("tracks", {}).get("items", [])
-    if items:
-        return items[0]["id"], items[0]["album"]["id"], items[0]["name"]
-    return None
+    if not items:
+        return None
 
-async def sniff_tokens() -> Tuple[str, Optional[str]]:
+    # Prefer exact ISRC match if available
+    best = None
+    for t in items:
+        if t.get("external_ids", {}).get("isrc", "").upper() == isrc.upper():
+            best = t
+            break
+    if best is None:
+        best = items[0]
+
+    track_id = best.get("id")
+    album_id = best.get("album", {}).get("id")
+    track_name = best.get("name")
+    artists = [a.get("name") for a in (best.get("artists") or []) if a.get("name")]
+    artists_joined = " & ".join(artists) if artists else None
+
+    if not (track_id and album_id):
+        return None
+    return track_id, album_id, track_name, artists_joined
+
+async def sniff_tokens() -> Tuple[str, Optional[str]]:  # unchanged
     async with async_playwright() as p:
         browser = await p.chromium.launch(headless=True, args=["--no-sandbox"])
         ctx = await browser.new_context(user_agent=USER_AGENT)
@@ -429,17 +464,12 @@ def backfill_deltas_for_followers() -> int:
     return backfill_table_deltas(FOLLOWERS_TABLE, FOLLOWERS_LINK_FIELD, FOLLOWERS_DATE_FIELD, FOLLOWERS_COUNT_FIELD, FOLLOWERS_DELTA_FIELD, clamp_negative=not FOLLOWERS_ALLOW_NEGATIVE)
 
 # ────────────────────────────────────────────────────────────────────────────────
-# Streams daily sync (existing)
+# Streams daily sync (UPDATED to carry artist/title)
 # ────────────────────────────────────────────────────────────────────────────────
 async def sync():
-    rows = list_isrcs()
-    seen, order, linkmap = set(), [], {}
-    for rec in rows:
-        code = rec["isrc"]
-        if code not in seen:
-            seen.add(code)
-            order.append(code)
-            linkmap[code] = rec["id"]
+    cat = catalogue_index()  # { ISRC: {air_id, artist, title} }
+    order = list(cat.keys())
+    linkmap = {k: v["air_id"] for k, v in cat.items()}
 
     print(f"Syncing {len(order)} tracks...")
     web_tok, cli_tok = await sniff_tokens()
@@ -456,20 +486,23 @@ async def sync():
 
     try:
         for isrc in order:
-            tr = search_track(isrc, search_tok)
+            tr = search_track(isrc, search_tok)  # now returns (tid, aid, tname, artists)
             if not tr:
+                # Still write count=0 if nothing found
                 if OUTPUT_TARGET in ("airtable", "both"):
                     upsert_count(linkmap[isrc], isrc, today_iso, 0)
                 if OUTPUT_TARGET in ("postgres", "both"):
-                    track_uid = db_upsert_track(cur, isrc, None, None)
+                    meta = cat.get(isrc, {})
+                    track_uid = db_upsert_track(cur, isrc, meta.get("artist"), meta.get("title"))
                     db_upsert_stream(cur, "spotify", track_uid, today_iso, 0)
                 continue
 
-            tid, aid, _ = tr
+            tid, aid, sp_title, sp_artists = tr
             if aid not in cache:
                 time.sleep(spotify_sleep)
                 cache[aid] = fetch_album(aid, web_tok, cli_tok)
 
+            # Find playcount for that track on the album page
             pc = 0
             js = cache[aid]
             for it in js.get("data", {}).get("albumUnion", {}).get("tracksV2", {}).get("items", []):
@@ -477,13 +510,21 @@ async def sync():
                 cand = (track.get("uri", "") or "").split(":")[-1] if track.get("uri") else None
                 if tid in (track.get("id"), cand):
                     val = track.get("playcount") or 0
-                    pc = int(str(val).replace(",", ""))
+                    try:
+                        pc = int(str(val).replace(",", ""))
+                    except Exception:
+                        pc = 0
                     break
+
+            # Prefer Airtable artist/title; fall back to Spotify metadata if missing
+            meta = cat.get(isrc, {})
+            artist = meta.get("artist") or sp_artists
+            title  = meta.get("title")  or sp_title
 
             if OUTPUT_TARGET in ("airtable", "both"):
                 upsert_count(linkmap[isrc], isrc, today_iso, pc)
             if OUTPUT_TARGET in ("postgres", "both"):
-                track_uid = db_upsert_track(cur, isrc, None, None)
+                track_uid = db_upsert_track(cur, isrc, artist, title)
                 db_upsert_stream(cur, "spotify", track_uid, today_iso, pc)
 
         if conn:
@@ -495,7 +536,7 @@ async def sync():
     print("Completed sync.")
 
 # ────────────────────────────────────────────────────────────────────────────────
-# Followers: backfill ALL from Airtable → Timescale (idempotent)
+# Followers backfill / today (unchanged)
 # ────────────────────────────────────────────────────────────────────────────────
 def backfill_playlist_followers_all(platform: str = "spotify") -> int:
     idx = playlists_index_from_airtable()
@@ -513,7 +554,7 @@ def backfill_playlist_followers_all(platform: str = "spotify") -> int:
             meta = idx.get(links[0])
             if not meta:
                 continue
-            urn = meta["playlist_id_urn"]            # keep URN in DB
+            urn = meta["playlist_id_urn"]
             day_iso = f.get(FOLLOWERS_DATE_FIELD)
             try:
                 followers = int(f.get(FOLLOWERS_COUNT_FIELD, 0) or 0)
@@ -524,9 +565,6 @@ def backfill_playlist_followers_all(platform: str = "spotify") -> int:
         conn.commit()
     return inserted
 
-# ────────────────────────────────────────────────────────────────────────────────
-# Followers: TODAY run (Airtable list → Spotify API → Timescale)
-# ────────────────────────────────────────────────────────────────────────────────
 def get_client_bearer() -> str:
     r = requests.post(
         "https://accounts.spotify.com/api/token",
@@ -574,9 +612,8 @@ def run_followers_today(platform: str = "spotify", tzkey: Optional[str] = None) 
 
     return {"inserted": inserted, "skipped": skipped, "date": today}
 
-
 # ────────────────────────────────────────────────────────────────────────────────
-# Flask
+# Flask endpoints (unchanged)
 # ────────────────────────────────────────────────────────────────────────────────
 app = Flask(__name__)
 
@@ -624,7 +661,7 @@ def diag_spotify_token():
 
 @app.get("/diag/spotify")
 def diag_spotify():
-    pid = request.args.get("pid")  # plain id like 5KVr4LVBAKjPWb5h8q0hub
+    pid = request.args.get("pid")
     if not pid:
         return jsonify({"ok": False, "error": "pid required"}), 400
     try:
@@ -657,20 +694,66 @@ def backfill_followers_endpoint():
     changed = backfill_deltas_for_followers()
     return jsonify({"status": "backfilled_followers", "changed": changed}), 200
 
-@app.post("/backfill_to_db")
-def backfill_to_db_endpoint():
-    _check_token()
-    days = request.args.get("days", "all")
-    n = backfill_airtable_to_postgres(days=days)
-    return jsonify({"status": "ok", "inserted_or_updated": n, "window_days": days}), 200
+# ────────────────────────────────────────────────────────────────────────────────
+# Backfill Streams (Airtable → Postgres)  (UPDATED to upsert artist/title)
+# ────────────────────────────────────────────────────────────────────────────────
+def backfill_airtable_to_postgres(days: Optional[str] = None) -> int:
+    # Build ISRC → (artist,title) map up front
+    cat = catalogue_index()  # {ISRC: {air_id, artist, title}}
 
+    recs = at_paginate(CATALOGUE_TABLE, {"view": CATALOGUE_VIEW, "pageSize": 100, "fields[]": CATALOGUE_ISRC_FIELD})
+    cat_id_to_isrc = {r["id"]: (r["fields"].get(CATALOGUE_ISRC_FIELD) or "").strip().upper()
+                      for r in recs if r.get("fields", {}).get(CATALOGUE_ISRC_FIELD)}
+
+    all_data = False
+    d_val: Optional[int] = None
+    if days is None:
+        all_data = True
+    else:
+        try:
+            d_val = int(days)
+            all_data = (d_val <= 0)
+        except Exception:
+            all_data = str(days).lower() in ("all", "everything", "full")
+
+    params = {"pageSize": 100, "sort[0][field]": PLAYCOUNTS_DATE_FIELD, "sort[0][direction]": "asc"}
+    if not all_data and d_val is not None and d_val > 0:
+        params["filterByFormula"] = f"IS_AFTER({{{PLAYCOUNTS_DATE_FIELD}}}, DATEADD(TODAY(), -{d_val}, 'days'))"
+
+    rows = at_paginate(PLAYCOUNTS_TABLE, params)
+
+    inserted = 0
+    with db_conn() as conn:
+        with conn.cursor() as cur:
+            db_ensure_platform(cur, "spotify")
+            for r in rows:
+                f = r.get("fields", {})
+                links = f.get(PLAYCOUNTS_LINK_FIELD) or []
+                if not links:
+                    continue
+                isrc = (cat_id_to_isrc.get(links[0]) or "").strip().upper()
+                if not isrc:
+                    continue
+                day_iso = f.get(PLAYCOUNTS_DATE_FIELD)
+                try:
+                    count = int(f.get(PLAYCOUNTS_COUNT_FIELD, 0) or 0)
+                except Exception:
+                    count = 0
+
+                meta = cat.get(isrc, {})
+                track_uid = db_upsert_track(cur, isrc, meta.get("artist"), meta.get("title"))
+                db_upsert_stream(cur, "spotify", track_uid, day_iso, count)
+                inserted += 1
+        conn.commit()
+    return inserted
+
+# Followers-only DAILY run (unchanged)
 @app.post("/backfill_followers_to_db")
 def backfill_followers_to_db():
     _check_token()
     n = backfill_playlist_followers_all(platform="spotify")
     return jsonify({"ok": True, "inserted_or_updated": n}), 200
 
-# Followers-only DAILY run (no backfill, no streams)
 @app.post("/run_followers_today")
 def _run_followers_today():
     _check_token()
@@ -681,8 +764,6 @@ def _run_followers_today():
         app.logger.exception("run_followers_today failed")
         return jsonify({"ok": False, "error": str(e)}), 500
 
-# Optional: push-mode ingest for followers
-# Body: { "platform":"spotify", "records":[{"playlist_id":"spotify:playlist:5KV...","date":"YYYY-MM-DD","followers":1234,"playlist_name":"optional"}] }
 @app.post("/ingest/playlist_followers")
 def ingest_playlist_followers():
     _check_token()
@@ -713,52 +794,8 @@ def diag():
     return jsonify({"find_today_id": find_today_by_isrc(isrc, day), "prev_count": prev_count_by_isrc(isrc, day)})
 
 # ────────────────────────────────────────────────────────────────────────────────
-# Backfill Streams (Airtable → Postgres)
+# Timezone helpers
 # ────────────────────────────────────────────────────────────────────────────────
-def backfill_airtable_to_postgres(days: Optional[str] = None) -> int:
-    recs = at_paginate(CATALOGUE_TABLE, {"view": CATALOGUE_VIEW, "pageSize": 100, "fields[]": CATALOGUE_ISRC_FIELD})
-    cat_id_to_isrc = {r["id"]: r["fields"].get(CATALOGUE_ISRC_FIELD) for r in recs if r.get("fields", {}).get(CATALOGUE_ISRC_FIELD)}
-
-    all_data = False
-    d_val: Optional[int] = None
-    if days is None:
-        all_data = True
-    else:
-        try:
-            d_val = int(days)
-            all_data = (d_val <= 0)
-        except Exception:
-            all_data = str(days).lower() in ("all", "everything", "full")
-
-    params = {"pageSize": 100, "sort[0][field]": PLAYCOUNTS_DATE_FIELD, "sort[0][direction]": "asc"}
-    if not all_data and d_val is not None and d_val > 0:
-        params["filterByFormula"] = f"IS_AFTER({{{PLAYCOUNTS_DATE_FIELD}}}, DATEADD(TODAY(), -{d_val}, 'days'))"
-
-    rows = at_paginate(PLAYCOUNTS_TABLE, params)
-
-    inserted = 0
-    with db_conn() as conn:
-        with conn.cursor() as cur:
-            db_ensure_platform(cur, "spotify")
-            for r in rows:
-                f = r.get("fields", {})
-                links = f.get(PLAYCOUNTS_LINK_FIELD) or []
-                if not links:
-                    continue
-                isrc = cat_id_to_isrc.get(links[0])
-                if not isrc:
-                    continue
-                day_iso = f.get(PLAYCOUNTS_DATE_FIELD)
-                try:
-                    count = int(f.get(PLAYCOUNTS_COUNT_FIELD, 0) or 0)
-                except Exception:
-                    count = 0
-                track_uid = db_upsert_track(cur, isrc, None, None)
-                db_upsert_stream(cur, "spotify", track_uid, day_iso, count)
-                inserted += 1
-        conn.commit()
-    return inserted
-# ── Timezone helpers (safe fallback) ──
 try:
     from zoneinfo import ZoneInfo, ZoneInfoNotFoundError  # py3.9+
 except Exception:
@@ -769,10 +806,6 @@ except Exception:
 DEFAULT_TZ = os.getenv("LOCAL_TZ") or "UTC"
 
 def today_iso_local(tzkey: Optional[str] = None) -> str:
-    """
-    Return YYYY-MM-DD in the requested timezone.
-    Falls back to UTC if the zone isn't available.
-    """
     tzname = (tzkey or DEFAULT_TZ or "UTC")
     if ZoneInfo:
         try:
@@ -781,7 +814,6 @@ def today_iso_local(tzkey: Optional[str] = None) -> str:
             pass
         except Exception:
             pass
-    # Fallback if tzdata missing or any error
     return datetime.utcnow().date().isoformat()
 
 # ────────────────────────────────────────────────────────────────────────────────
