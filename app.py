@@ -6,6 +6,7 @@ from datetime import date, datetime
 from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import urlparse
 
+import logging
 import requests
 from flask import Flask, jsonify, request, abort
 from playwright.async_api import async_playwright
@@ -13,6 +14,14 @@ from playwright.async_api import async_playwright
 # Postgres
 import psycopg2
 from psycopg2.extras import RealDictCursor
+
+# ────────────────────────────────────────────────────────────────────────────────
+# LOGGING (Railway captures stdout/stderr and python logging)
+# ────────────────────────────────────────────────────────────────────────────────
+logger = logging.getLogger("railway")
+if not logger.handlers:
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+logger.setLevel(logging.INFO)
 
 # ────────────────────────────────────────────────────────────────────────────────
 # CONFIG
@@ -464,14 +473,14 @@ def backfill_deltas_for_followers() -> int:
     return backfill_table_deltas(FOLLOWERS_TABLE, FOLLOWERS_LINK_FIELD, FOLLOWERS_DATE_FIELD, FOLLOWERS_COUNT_FIELD, FOLLOWERS_DELTA_FIELD, clamp_negative=not FOLLOWERS_ALLOW_NEGATIVE)
 
 # ────────────────────────────────────────────────────────────────────────────────
-# Streams daily sync (UPDATED to carry artist/title)
+# Streams daily sync (with logging)
 # ────────────────────────────────────────────────────────────────────────────────
 async def sync():
     cat = catalogue_index()  # { ISRC: {air_id, artist, title} }
     order = list(cat.keys())
     linkmap = {k: v["air_id"] for k, v in cat.items()}
 
-    print(f"Syncing {len(order)} tracks...")
+    logger.info(f"[streams] starting run: tracks={len(order)} output={OUTPUT_TARGET}")
     web_tok, cli_tok = await sniff_tokens()
     search_tok = get_search_token()
     cache: Dict[str, Dict[str, Any]] = {}
@@ -484,48 +493,57 @@ async def sync():
         cur = conn.cursor()
         db_ensure_platform(cur, "spotify")
 
+    errors = 0
+    processed = 0
+
     try:
         for isrc in order:
-            tr = search_track(isrc, search_tok)  # now returns (tid, aid, tname, artists)
-            if not tr:
-                # Still write count=0 if nothing found
+            try:
+                tr = search_track(isrc, search_tok)  # (tid, aid, tname, artists) or None
+                if not tr:
+                    if OUTPUT_TARGET in ("airtable", "both"):
+                        upsert_count(linkmap[isrc], isrc, today_iso, 0)
+                    if OUTPUT_TARGET in ("postgres", "both"):
+                        meta = cat.get(isrc, {})
+                        track_uid = db_upsert_track(cur, isrc, meta.get("artist"), meta.get("title"))
+                        db_upsert_stream(cur, "spotify", track_uid, today_iso, 0)
+                    processed += 1
+                    continue
+
+                tid, aid, sp_title, sp_artists = tr
+                if aid not in cache:
+                    time.sleep(spotify_sleep)
+                    cache[aid] = fetch_album(aid, web_tok, cli_tok)
+
+                # Find playcount for that track on the album page
+                pc = 0
+                js = cache[aid]
+                for it in js.get("data", {}).get("albumUnion", {}).get("tracksV2", {}).get("items", []):
+                    track = it.get("track", {})
+                    cand = (track.get("uri", "") or "").split(":")[-1] if track.get("uri") else None
+                    if tid in (track.get("id"), cand):
+                        val = track.get("playcount") or 0
+                        try:
+                            pc = int(str(val).replace(",", ""))
+                        except Exception:
+                            pc = 0
+                        break
+
+                meta = cat.get(isrc, {})
+                artist = meta.get("artist") or sp_artists
+                title  = meta.get("title")  or sp_title
+
                 if OUTPUT_TARGET in ("airtable", "both"):
-                    upsert_count(linkmap[isrc], isrc, today_iso, 0)
+                    upsert_count(linkmap[isrc], isrc, today_iso, pc)
                 if OUTPUT_TARGET in ("postgres", "both"):
-                    meta = cat.get(isrc, {})
-                    track_uid = db_upsert_track(cur, isrc, meta.get("artist"), meta.get("title"))
-                    db_upsert_stream(cur, "spotify", track_uid, today_iso, 0)
-                continue
+                    track_uid = db_upsert_track(cur, isrc, artist, title)
+                    db_upsert_stream(cur, "spotify", track_uid, today_iso, pc)
 
-            tid, aid, sp_title, sp_artists = tr
-            if aid not in cache:
-                time.sleep(spotify_sleep)
-                cache[aid] = fetch_album(aid, web_tok, cli_tok)
+                processed += 1
 
-            # Find playcount for that track on the album page
-            pc = 0
-            js = cache[aid]
-            for it in js.get("data", {}).get("albumUnion", {}).get("tracksV2", {}).get("items", []):
-                track = it.get("track", {})
-                cand = (track.get("uri", "") or "").split(":")[-1] if track.get("uri") else None
-                if tid in (track.get("id"), cand):
-                    val = track.get("playcount") or 0
-                    try:
-                        pc = int(str(val).replace(",", ""))
-                    except Exception:
-                        pc = 0
-                    break
-
-            # Prefer Airtable artist/title; fall back to Spotify metadata if missing
-            meta = cat.get(isrc, {})
-            artist = meta.get("artist") or sp_artists
-            title  = meta.get("title")  or sp_title
-
-            if OUTPUT_TARGET in ("airtable", "both"):
-                upsert_count(linkmap[isrc], isrc, today_iso, pc)
-            if OUTPUT_TARGET in ("postgres", "both"):
-                track_uid = db_upsert_track(cur, isrc, artist, title)
-                db_upsert_stream(cur, "spotify", track_uid, today_iso, pc)
+            except Exception as e:
+                errors += 1
+                logger.exception(f"[streams] error processing ISRC={isrc}: {e}")
 
         if conn:
             conn.commit()
@@ -533,10 +551,10 @@ async def sync():
         if cur: cur.close()
         if conn: conn.close()
 
-    print("Completed sync.")
+    logger.info(f"[streams] completed: processed={processed} errors={errors} date={today_iso} output={OUTPUT_TARGET}")
 
 # ────────────────────────────────────────────────────────────────────────────────
-# Followers backfill / today (unchanged)
+# Followers backfill / today (with logging)
 # ────────────────────────────────────────────────────────────────────────────────
 def backfill_playlist_followers_all(platform: str = "spotify") -> int:
     idx = playlists_index_from_airtable()
@@ -563,6 +581,7 @@ def backfill_playlist_followers_all(platform: str = "spotify") -> int:
             db_upsert_playlist_followers(cur, platform, urn, day_iso, followers, meta.get("name"))
             inserted += 1
         conn.commit()
+    logger.info(f"[followers/backfill→db] completed: inserted_or_updated={inserted}")
     return inserted
 
 def get_client_bearer() -> str:
@@ -590,10 +609,16 @@ def fetch_playlist_followers_spotify(plain_id: str, bearer: str) -> Optional[int
 def run_followers_today(platform: str = "spotify", tzkey: Optional[str] = None) -> Dict[str, Any]:
     idx = playlists_index_from_airtable()
     if not idx:
+        logger.warning("[followers] aborted: no playlists found in Airtable source")
         return {"inserted": 0, "skipped": 0, "reason": "no_playlists"}
 
-    bearer = get_client_bearer()
-    today = today_iso_local(tzkey)
+    try:
+        bearer = get_client_bearer()
+    except Exception as e:
+        logger.exception(f"[followers] failed to get bearer: {e}")
+        raise
+
+    today = today_iso_local()
 
     inserted = 0
     skipped = 0
@@ -605,15 +630,17 @@ def run_followers_today(platform: str = "spotify", tzkey: Optional[str] = None) 
             followers = fetch_playlist_followers_spotify(plain, bearer)
             if followers is None:
                 skipped += 1
+                logger.warning(f"[followers] skip pid={plain} reason=api_error_or_rate_limit")
                 continue
             db_upsert_playlist_followers(cur, platform, urn, today, followers, meta.get("name"))
             inserted += 1
         conn.commit()
 
+    logger.info(f"[followers] completed: playlists={len(idx)} inserted={inserted} skipped={skipped} date={today}")
     return {"inserted": inserted, "skipped": skipped, "date": today}
 
 # ────────────────────────────────────────────────────────────────────────────────
-# Flask endpoints (unchanged)
+# Flask endpoints (with logging)
 # ────────────────────────────────────────────────────────────────────────────────
 app = Flask(__name__)
 
@@ -676,23 +703,40 @@ def run_endpoint():
     _check_token()
     async_flag = request.args.get("async", "0").lower() in ("1", "true", "yes")
     if async_flag:
+        logger.info("[streams] async start requested")
         threading.Thread(target=lambda: asyncio.run(sync()), daemon=True).start()
         return jsonify({"status": "started"}), 202
     else:
-        asyncio.run(sync())
-        return jsonify({"status": "completed"}), 200
+        logger.info("[streams] sync start")
+        try:
+            asyncio.run(sync())
+            logger.info("[streams] sync completed successfully")
+            return jsonify({"status": "completed"}), 200
+        except Exception as e:
+            logger.exception(f"[streams] sync failed: {e}")
+            return jsonify({"status": "failed", "error": str(e)}), 500
 
 @app.post("/backfill")
 def backfill_endpoint():
     _check_token()
-    changed = backfill_deltas_for_all_tracks()
-    return jsonify({"status": "backfilled_playcounts", "changed": changed}), 200
+    try:
+        changed = backfill_deltas_for_all_tracks()
+        logger.info(f"[backfill/streams] completed: changed={changed}")
+        return jsonify({"status": "backfilled_playcounts", "changed": changed}), 200
+    except Exception as e:
+        logger.exception(f"[backfill/streams] failed: {e}")
+        return jsonify({"status": "failed", "error": str(e)}), 500
 
 @app.post("/backfill_followers")
 def backfill_followers_endpoint():
     _check_token()
-    changed = backfill_deltas_for_followers()
-    return jsonify({"status": "backfilled_followers", "changed": changed}), 200
+    try:
+        changed = backfill_deltas_for_followers()
+        logger.info(f"[backfill/followers] completed: changed={changed}")
+        return jsonify({"status": "backfilled_followers", "changed": changed}), 200
+    except Exception as e:
+        logger.exception(f"[backfill/followers] failed: {e}")
+        return jsonify({"status": "failed", "error": str(e)}), 500
 
 # ────────────────────────────────────────────────────────────────────────────────
 # Backfill Streams (Airtable → Postgres)  (UPDATED to upsert artist/title)
@@ -745,23 +789,30 @@ def backfill_airtable_to_postgres(days: Optional[str] = None) -> int:
                 db_upsert_stream(cur, "spotify", track_uid, day_iso, count)
                 inserted += 1
         conn.commit()
+    logger.info(f"[backfill/airtable→postgres] completed: inserted={inserted} days={days}")
     return inserted
 
-# Followers-only DAILY run (unchanged)
+# Followers-only DAILY run (unchanged signature, logging in body)
 @app.post("/backfill_followers_to_db")
 def backfill_followers_to_db():
     _check_token()
-    n = backfill_playlist_followers_all(platform="spotify")
-    return jsonify({"ok": True, "inserted_or_updated": n}), 200
+    try:
+        n = backfill_playlist_followers_all(platform="spotify")
+        return jsonify({"ok": True, "inserted_or_updated": n}), 200
+    except Exception as e:
+        logger.exception(f"[followers/backfill→db] failed: {e}")
+        return jsonify({"ok": False, "error": str(e)}), 500
 
 @app.post("/run_followers_today")
 def _run_followers_today():
     _check_token()
     try:
+        logger.info("[followers] daily run start")
         res = run_followers_today(platform="spotify")
+        logger.info(f"[followers] daily run finish: {res}")
         return jsonify({"ok": True, **res}), 200
     except Exception as e:
-        app.logger.exception("run_followers_today failed")
+        logger.exception(f"[followers] daily run failed: {e}")
         return jsonify({"ok": False, "error": str(e)}), 500
 
 @app.post("/ingest/playlist_followers")
@@ -783,6 +834,7 @@ def ingest_playlist_followers():
                 continue
             db_upsert_playlist_followers(cur, platform, urn, day, followers, name)
         conn.commit()
+    logger.info(f"[followers/ingest] completed: count={len(records)}")
     return jsonify({"ok": True, "count": len(records)}), 200
 
 @app.get("/diag")
@@ -821,4 +873,5 @@ def today_iso_local(tzkey: Optional[str] = None) -> str:
 # ────────────────────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", "3000"))
+    logger.info(f"[startup] app booting on 0.0.0.0:{port} tz={LOCAL_TZ} output={OUTPUT_TARGET}")
     app.run(host="0.0.0.0", port=port)
