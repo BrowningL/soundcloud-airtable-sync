@@ -1,7 +1,11 @@
-# dashboard.py — KAIZEN-styled Flask dashboard (Streams & Playlist Growth)
+# dashboard.py — KAIZEN-styled Flask dashboard (Streams & Playlist Growth + Catalogue)
 import os
-from datetime import date, timedelta
-from typing import List, Tuple
+from datetime import date, datetime, timedelta
+from typing import List, Tuple, Dict, Any
+from collections import defaultdict
+import json
+import urllib.parse
+import urllib.request
 
 from flask import Flask, jsonify, render_template_string, request
 from psycopg_pool import ConnectionPool, PoolClosed
@@ -14,6 +18,15 @@ DEFAULT_PLAYLIST_NAME = os.getenv("DEFAULT_PLAYLIST_NAME", "TOGI Motivation")
 DATABASE_URL = os.getenv("DATABASE_URL")
 if not DATABASE_URL:
     raise RuntimeError("DATABASE_URL is required")
+
+# Airtable (for catalogue size)
+AIRTABLE_API_KEY = os.getenv("AIRTABLE_API_KEY")
+AIRTABLE_BASE_ID = os.getenv("AIRTABLE_BASE_ID")
+AIRTABLE_TABLE_NAME = os.getenv("AIRTABLE_TABLE_NAME", "Catalogue")
+AIRTABLE_RELEASE_DATE_FIELD = os.getenv("AIRTABLE_RELEASE_DATE_FIELD", "Release Date")
+AIRTABLE_DISTRIBUTOR_FIELD = os.getenv("AIRTABLE_DISTRIBUTOR_FIELD", "Distributor")
+AIRTABLE_EXCLUDED_DISTRIBUTOR = os.getenv("AIRTABLE_EXCLUDED_DISTRIBUTOR", "External")
+AIRTABLE_CACHE_TTL_SECS = int(os.getenv("AIRTABLE_CACHE_TTL_SECS", "21600"))  # 6h
 
 POOL = ConnectionPool(
     conninfo=DATABASE_URL,
@@ -67,6 +80,115 @@ def _clamp_days(raw: str | None, default: int = 90, min_d: int = 1, max_d: int =
     return min(max(v, min_d), max_d)
 
 
+# ── Airtable helpers (catalogue size, excluding External distributor) ─────────
+def _airtable_enabled() -> bool:
+    return bool(AIRTABLE_API_KEY and AIRTABLE_BASE_ID)
+
+_airtable_cache: Dict[str, Any] = {
+    "at": None, "labels": None, "values": None,
+    "min_date": None, "max_date": None, "count": 0,
+    "ok": False, "error": None
+}
+
+def _http_get_json(url: str, headers: Dict[str, str], params: Dict[str, Any], timeout: float = 30.0) -> Dict[str, Any]:
+    # Support fields[] arrays
+    query = urllib.parse.urlencode(
+        [(k, v) for k, vv in params.items() for v in (vv if isinstance(vv, list) else [vv])]
+    )
+    full = f"{url}?{query}" if query else url
+    req = urllib.request.Request(full, headers=headers, method="GET")
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        return json.loads(resp.read().decode("utf-8"))
+
+def _fetch_catalogue_cumulative():
+    """Return (labels, values, min_date, max_date, total_count, ok, error)"""
+    now = datetime.utcnow()
+    # serve cached if fresh
+    if _airtable_cache["at"] and (now - _airtable_cache["at"]).total_seconds() < AIRTABLE_CACHE_TTL_SECS:
+        return (
+            _airtable_cache["labels"], _airtable_cache["values"],
+            _airtable_cache["min_date"], _airtable_cache["max_date"],
+            _airtable_cache["count"], _airtable_cache["ok"], _airtable_cache["error"]
+        )
+
+    if not _airtable_enabled():
+        _airtable_cache.update({"at": now, "labels": [], "values": [], "min_date": None,
+                                "max_date": None, "count": 0, "ok": False, "error": "Airtable not configured"})
+        return [], [], None, None, 0, False, "Airtable not configured"
+
+    base_url = f"https://api.airtable.com/v0/{AIRTABLE_BASE_ID}/{urllib.parse.quote(AIRTABLE_TABLE_NAME)}"
+    headers = {"Authorization": f"Bearer {AIRTABLE_API_KEY}"}
+
+    # Only records with a Release Date and Distributor != 'External'
+    # Note: blanks are included (NOT(field = 'External')) evaluates true if field blank.
+    formula = f"AND({{{AIRTABLE_RELEASE_DATE_FIELD}}}, NOT({{{AIRTABLE_DISTRIBUTOR_FIELD}}} = '{AIRTABLE_EXCLUDED_DISTRIBUTOR}'))"
+
+    params = {
+        "pageSize": 100,
+        "fields[]": AIRTABLE_RELEASE_DATE_FIELD,
+        "filterByFormula": formula,
+    }
+
+    per_day_additions: Dict[date, int] = defaultdict(int)
+    total = 0
+    seen_min: date | None = None
+    seen_max: date | None = None
+
+    offset = None
+    try:
+        while True:
+            q = dict(params)
+            if offset:
+                q["offset"] = offset
+            data = _http_get_json(base_url, headers, q, timeout=30.0)
+            records = data.get("records", [])
+            for rec in records:
+                raw = (rec.get("fields", {}) or {}).get(AIRTABLE_RELEASE_DATE_FIELD)
+                if not raw:
+                    continue
+                # Accept date-only or ISO datetime
+                try:
+                    d = date.fromisoformat(raw[:10])
+                except Exception:
+                    try:
+                        d = datetime.fromisoformat(raw.replace("Z", "+00:00")).date()
+                    except Exception:
+                        continue
+                per_day_additions[d] += 1
+                total += 1
+                seen_min = d if seen_min is None or d < seen_min else seen_min
+                seen_max = d if seen_max is None or d > seen_max else seen_max
+
+            offset = data.get("offset")
+            if not offset:
+                break
+
+        if total == 0 or not seen_min or not seen_max:
+            _airtable_cache.update({"at": now, "labels": [], "values": [],
+                                    "min_date": None, "max_date": None, "count": 0, "ok": True, "error": None})
+            return [], [], None, None, 0, True, None
+
+        start = seen_min
+        end = max(seen_max, date.today())
+        labels, values = [], []
+        running = 0
+        for d in _daterange(start, end):
+            running += per_day_additions.get(d, 0)
+            labels.append(d.isoformat())
+            values.append(running)
+
+        _airtable_cache.update({
+            "at": now, "labels": labels, "values": values,
+            "min_date": start, "max_date": end, "count": total, "ok": True, "error": None
+        })
+        return labels, values, start, end, total, True, None
+
+    except Exception as e:
+        _airtable_cache.update({"at": now, "labels": [], "values": [],
+                                "min_date": None, "max_date": None, "count": 0, "ok": False, "error": str(e)})
+        return [], [], None, None, 0, False, str(e)
+
+
 # ── UI ────────────────────────────────────────────────────────────────────────
 @app.get("/")
 def ui():
@@ -83,35 +205,22 @@ def ui():
     .fixed-frame {
       position: fixed; inset: 0;
       pointer-events: none;
-      border: 18px solid #000;   /* frame thickness */
+      border: 18px solid #000;
       box-sizing: border-box;
       z-index: 9999;
     }
-
     html, body { height: 100%; }
     body { margin: 0; background: #fff; color: #111; }
-    .content { padding: 24px; }  /* keeps content away from the frame edges */
-
-    /* Header */
+    .content { padding: 24px; }
     .brand-header { display:flex; align-items:center; gap:.85rem; margin-bottom: .75rem; }
-    .brand-logo { height: 64px; width: 64px; object-fit: contain; } /* larger ring top-left */
-    .brand-title { font-weight: 800; letter-spacing: -0.02em; }     /* title only; charts keep defaults */
-
-    /* Cards (keep your previous feel; not ultra-bold titles) */
-    .card {
-      background: #fff;
-      border-radius: 16px;
-      box-shadow: 0 10px 28px rgba(0,0,0,.08);
-      padding: 1.1rem;
-    }
-    h2 { font-size: 1.125rem; font-weight: 600; }  /* same as before, not heavy */
+    .brand-logo { height: 64px; width: 64px; object-fit: contain; }
+    .brand-title { font-weight: 800; letter-spacing: -0.02em; }
+    .card { background: #fff; border-radius: 16px; box-shadow: 0 10px 28px rgba(0,0,0,.08); padding: 1.1rem; }
+    h2 { font-size: 1.125rem; font-weight: 600; }
     table { width:100%; border-collapse: collapse; }
     th, td { padding:.5rem; border-bottom:1px solid rgba(0,0,0,.06); }
     .scroll { max-height: 420px; overflow:auto; }
-
-    /* Use THE BOLD FONT only on the playlist dropdown for a branded touch */
     .kaizen-bold { font-family: "THE BOLD FONT - FREE VERSION - 2023", ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, "Helvetica Neue", Arial, "Noto Sans", "Apple Color Emoji","Segoe UI Emoji"; }
-
     @media (prefers-color-scheme: dark) {
       body { background:#111; color:#f5f5f5; }
       .card { background: rgba(24,24,27,.82); color:#fff; }
@@ -194,7 +303,18 @@ def ui():
       </div>
     </section>
 
-    <!-- Row 3: Best artists today -->
+    <!-- NEW Row 3: Catalogue size over time (Airtable, excluding External) -->
+    <section class="grid grid-cols-1 gap-6 mt-6">
+      <div class="card">
+        <div class="flex items-center justify-between mb-3">
+          <h2>Catalogue Size Over Time</h2>
+          <div class="text-sm opacity-70" id="catalogueMeta"></div>
+        </div>
+        <canvas id="catalogueChart" height="120"></canvas>
+      </div>
+    </section>
+
+    <!-- Row 4: Best artists today -->
     <section class="grid grid-cols-1 gap-6 mt-6">
       <div class="card">
         <div class="flex items-center justify-between mb-3">
@@ -205,7 +325,7 @@ def ui():
       </div>
     </section>
 
-    <!-- Row 4: Table -->
+    <!-- Row 5: Table -->
     <section class="grid grid-cols-1 gap-6 mt-6">
       <div class="card">
         <div class="flex items-center justify-between mb-3">
@@ -230,7 +350,7 @@ def ui():
 
 <script>
   const DEFAULT_PLAYLIST_NAME = {{ default_playlist_name | tojson }};
-  let streamsChart, playlistChart, allPlaylistsChart, bestArtistsChart;
+  let streamsChart, playlistChart, allPlaylistsChart, bestArtistsChart, catalogueChart;
   const fmt = (n) => Number(n).toLocaleString();
   async function api(path) { const r = await fetch(path); if (!r.ok) throw new Error(await r.text()); return r.json(); }
 
@@ -314,6 +434,22 @@ def ui():
     });
   }
 
+  // NEW: Catalogue size (Airtable, excluding "External")
+  async function loadCatalogue() {
+    const data = await api('/api/catalogue/size-series');
+    const ctx = document.getElementById('catalogueChart').getContext('2d');
+    if (catalogueChart) catalogueChart.destroy();
+    catalogueChart = new Chart(ctx, {
+      type: 'line',
+      data: { labels: data.labels, datasets: [{ label: 'Total tracks in catalogue', data: data.values, tension: 0.25, fill: false }] },
+      options: { responsive: true, scales: { x: { ticks: { maxRotation: 0, autoSkip: true } }, y: { beginAtZero: true } },
+                 plugins: { tooltip: { callbacks: { label: (c) => ' ' + fmt(c.parsed.y) } } } }
+    });
+    const meta = document.getElementById('catalogueMeta');
+    const total = (data.values && data.values.length) ? data.values[data.values.length-1] : 0;
+    meta.textContent = `Total: ${fmt(total)} • Range: ${data.min_date ?? '-'} → ${data.max_date ?? '-'} • Counted: ${fmt(data.count ?? 0)} (excl. 'External')`;
+  }
+
   document.getElementById('streamsDays').addEventListener('change', e => loadStreams(e.target.value));
   document.getElementById('playlistDays').addEventListener('change', e => loadPlaylistChart(e.target.value));
   document.getElementById('allPlaylistsDays').addEventListener('change', e => loadAllPlaylistsChart(e.target.value));
@@ -342,6 +478,7 @@ def ui():
     await loadPlaylists();
     await loadPlaylistChart(document.getElementById('playlistDays').value);
     await loadAllPlaylistsChart(document.getElementById('allPlaylistsDays').value);
+    await loadCatalogue();
     await loadBestArtists();
     await loadDeltaDates(90);
     await loadDeltaTable();
@@ -501,11 +638,9 @@ def api_playlists_all_series():
         end = date.today(); start = end - timedelta(days=days)
         return jsonify({"labels": [d.isoformat() for d in _daterange(start, end)], "series": []})
 
-    # Collect date bounds
     start, end = rows[0]["d"], rows[-1]["d"]
     labels_base = [d.isoformat() for d in _daterange(start, end)]
 
-    # Build per-playlist series
     series_map = {}
     for r in rows:
         pid = r["playlist_id"]
@@ -523,7 +658,6 @@ def api_playlists_all_series():
 # NEW: Best artists for the latest date — share of daily delta
 @app.get("/api/artists/top-share")
 def api_artists_top_share():
-    # Pick latest available stream_date
     q_latest = """
         SELECT MAX(stream_date) AS d
         FROM streams
@@ -535,7 +669,6 @@ def api_artists_top_share():
     if not day:
         return jsonify({"date": None, "labels": [], "values": [], "shares": []})
 
-    # Sum positive daily_delta by artist
     q = """
         SELECT t.artist,
                COALESCE(SUM(GREATEST(s.daily_delta, 0)),0)::bigint AS v
@@ -548,7 +681,6 @@ def api_artists_top_share():
         ORDER BY v DESC
         LIMIT 25
     """
-
     rows = _q(q, (day,))
     total = sum(int(r["v"]) for r in rows) or 1
 
@@ -558,6 +690,20 @@ def api_artists_top_share():
     return jsonify({"date": day, "labels": labels, "values": values, "shares": shares})
 
 
+# NEW: Catalogue size series API (Airtable, distributor != 'External')
+@app.get("/api/catalogue/size-series")
+def api_catalogue_size_series():
+    labels, values, min_d, max_d, total, ok, err = _fetch_catalogue_cumulative()
+    if not ok:
+        return jsonify({"labels": [], "values": [], "error": err}), 200
+    return jsonify({
+        "labels": labels,
+        "values": values,
+        "min_date": min_d.isoformat() if isinstance(min_d, date) else None,
+        "max_date": max_d.isoformat() if isinstance(max_d, date) else None,
+        "count": total
+    })
+
 
 # ── Health ────────────────────────────────────────────────────────────────────
 @app.get("/health")
@@ -565,9 +711,20 @@ def health():
     try:
         _q("SELECT NOW()")
         ssl = _q("SHOW ssl")
-        return {"ok": True, "db": True, "ssl": (ssl[0]["ssl"] if ssl else "unknown")}
+        db_info = {"ok": True, "ssl": (ssl[0]["ssl"] if ssl else "unknown")}
     except Exception as e:
-        return {"ok": False, "db": False, "error": str(e)}
+        db_info = {"ok": False, "error": str(e)}
+
+    at_ok = False
+    at_err = None
+    if _airtable_enabled():
+        *_unused, at_ok, at_err = _fetch_catalogue_cumulative()
+    else:
+        at_err = "Airtable not configured"
+
+    return {"ok": bool(db_info.get("ok") and (at_ok or not _airtable_enabled())),
+            "db": db_info,
+            "airtable": {"ok": at_ok, "error": at_err}}
 
 
 # ── Entrypoint ────────────────────────────────────────────────────────────────
