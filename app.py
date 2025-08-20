@@ -15,6 +15,8 @@ from playwright.async_api import async_playwright
 import psycopg2
 from psycopg2.extras import RealDictCursor
 
+from catalogue_health.catalogue_health import run_catalogue_health as ch_run
+
 # ────────────────────────────────────────────────────────────────────────────────
 # LOGGING (Railway captures stdout/stderr and python logging)
 # ────────────────────────────────────────────────────────────────────────────────
@@ -737,6 +739,25 @@ def backfill_followers_endpoint():
     except Exception as e:
         logger.exception(f"[backfill/followers] failed: {e}")
         return jsonify({"status": "failed", "error": str(e)}), 500
+
+@app.post("/run_catalogue_health")
+def run_catalogue_health_endpoint():
+    _check_token()
+    async_flag = (request.args.get("async", "0").lower() in ("1", "true", "yes"))
+    limit = request.args.get("limit", type=int)  # optional
+    dry = (request.args.get("dry_run", "0").lower() in ("1", "true", "yes"))
+
+    def _job():
+        logger.info("[catalogue_health] start via HTTP | limit=%s dry_run=%s", limit, dry)
+        res = ch_run(limit_override=limit, dry_run_override=dry)
+        logger.info("[catalogue_health] finish | %s", res)
+
+    if async_flag:
+        threading.Thread(target=_job, daemon=True).start()
+        return jsonify({"ok": True, "status": "started"}), 202
+
+    res = ch_run(limit_override=limit, dry_run_override=dry)
+    return jsonify({"ok": True, **res}), 200
 
 # ────────────────────────────────────────────────────────────────────────────────
 # Backfill Streams (Airtable → Postgres)  (UPDATED to upsert artist/title)
