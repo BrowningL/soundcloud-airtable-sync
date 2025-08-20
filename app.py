@@ -15,8 +15,6 @@ from playwright.async_api import async_playwright
 import psycopg2
 from psycopg2.extras import RealDictCursor
 
-from catalogue_health.catalogue_health import run_catalogue_health as ch_run
-
 # ────────────────────────────────────────────────────────────────────────────────
 # LOGGING (Railway captures stdout/stderr and python logging)
 # ────────────────────────────────────────────────────────────────────────────────
@@ -24,6 +22,14 @@ logger = logging.getLogger("railway")
 if not logger.handlers:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger.setLevel(logging.INFO)
+
+# Try to import the catalogue health worker with defensive logging
+try:
+    from catalogue_health.catalogue_health import run_catalogue_health as ch_run
+    logger.info("[catalogue_health] module import OK")
+except Exception as e:
+    ch_run = None  # type: ignore
+    logger.exception("[catalogue_health] import failed: %s", e)
 
 # ────────────────────────────────────────────────────────────────────────────────
 # CONFIG
@@ -90,51 +96,6 @@ PATHFINDER_HOSTS = [
 
 airtable_sleep = float(os.getenv("AT_SLEEP", "0.2"))
 spotify_sleep = float(os.getenv("SPOTIFY_SLEEP", "0.15"))
-
-# ────────────────────────────────────────────────────────────────────────────────
-# Utilities
-# ────────────────────────────────────────────────────────────────────────────────
-try:
-    from zoneinfo import ZoneInfo
-except ImportError:
-    ZoneInfo = None
-
-def today_iso_local() -> str:
-    if ZoneInfo:
-        return datetime.now(ZoneInfo(LOCAL_TZ)).date().isoformat()
-    return datetime.utcnow().date().isoformat()
-
-def parse_spotify_playlist_id(val: Optional[str]) -> Optional[str]:
-    if not val: return None
-    s = str(val).strip()
-    if s.startswith("spotify:playlist:"):
-        return s.split(":")[-1]
-    try:
-        u = urlparse(s)
-        if "spotify" in (u.netloc or "") and u.path:
-            parts = u.path.strip("/").split("/")
-            if len(parts) >= 2 and parts[0] == "playlist":
-                return parts[1]
-    except Exception:
-        pass
-    return s
-
-def to_spotify_playlist_urn(raw: Optional[str]) -> Optional[str]:
-    pid = parse_spotify_playlist_id(raw)
-    return f"spotify:playlist:{pid}" if pid else None
-
-def urn_to_plain_id(urn: str) -> str:
-    return urn.split(":")[-1] if urn and ":" in urn else urn
-
-def _check_token():
-    if not AUTOMATION_TOKEN:
-        return
-    token = request.headers.get("x-automation-token") or request.args.get("token")
-    if token != AUTOMATION_TOKEN:
-        abort(403)
-
-def _has_spotify_creds():
-    return bool(CLIENT_ID and CLIENT_SECRET and CLIENT_ID != "YOUR_SPOTIFY_CLIENT_ID" and CLIENT_SECRET != "YOUR_SPOTIFY_CLIENT_SECRET")
 
 # ────────────────────────────────────────────────────────────────────────────────
 # Airtable helpers
@@ -257,7 +218,7 @@ def find_today_by_isrc(isrc_code: str, day_iso: str) -> Optional[str]:
     else:
         formula = (
             f"AND("
-            f"SEARCH('{_q(isrc_code)}', ARRAYJOIN({{{PLAYCOUNTS_LINK_FIELD}}})),"
+            f"SEARCH('{_q(isrc_code)}', ARRAYJOIN({{{PLAYCOUNTS_LINK_FIELD}}})),""
             f"IS_SAME({{{PLAYCOUNTS_DATE_FIELD}}}, '{day_iso}', 'day')"
             f")"
         )
@@ -337,6 +298,38 @@ def playlists_index_from_airtable():
 # ────────────────────────────────────────────────────────────────────────────────
 # Spotify helpers for streams
 # ────────────────────────────────────────────────────────────────────────────────
+def parse_spotify_playlist_id(val: Optional[str]) -> Optional[str]:
+    if not val: return None
+    s = str(val).strip()
+    if s.startswith("spotify:playlist:"):
+        return s.split(":")[-1]
+    try:
+        u = urlparse(s)
+        if "spotify" in (u.netloc or "") and u.path:
+            parts = u.path.strip("/").split("/")
+            if len(parts) >= 2 and parts[0] == "playlist":
+                return parts[1]
+    except Exception:
+        pass
+    return s
+
+def to_spotify_playlist_urn(raw: Optional[str]) -> Optional[str]:
+    pid = parse_spotify_playlist_id(raw)
+    return f"spotify:playlist:{pid}" if pid else None
+
+def urn_to_plain_id(urn: str) -> str:
+    return urn.split(":")[-1] if urn and ":" in urn else urn
+
+def _check_token():
+    if not AUTOMATION_TOKEN:
+        return
+    token = request.headers.get("x-automation-token") or request.args.get("token")
+    if token != AUTOMATION_TOKEN:
+        abort(403)
+
+def _has_spotify_creds():
+    return bool(CLIENT_ID and CLIENT_SECRET and CLIENT_ID != "YOUR_SPOTIFY_CLIENT_ID" and CLIENT_SECRET != "YOUR_SPOTIFY_CLIENT_SECRET")
+
 def get_search_token() -> str:
     r = requests.post("https://accounts.spotify.com/api/token",
                       data={"grant_type": "client_credentials"},
@@ -743,21 +736,33 @@ def backfill_followers_endpoint():
 @app.post("/run_catalogue_health")
 def run_catalogue_health_endpoint():
     _check_token()
+    if ch_run is None:
+        logger.error("[catalogue_health] cannot run: module import failed previously")
+        return jsonify({"ok": False, "error": "module_import_failed"}), 500
+
     async_flag = (request.args.get("async", "0").lower() in ("1", "true", "yes"))
     limit = request.args.get("limit", type=int)  # optional
     dry = (request.args.get("dry_run", "0").lower() in ("1", "true", "yes"))
 
     def _job():
-        logger.info("[catalogue_health] start via HTTP | limit=%s dry_run=%s", limit, dry)
-        res = ch_run(limit_override=limit, dry_run_override=dry)
-        logger.info("[catalogue_health] finish | %s", res)
+        try:
+            logger.info("[catalogue_health] ▶ start | limit=%s dry_run=%s", limit, dry)
+            res = ch_run(limit_override=limit, dry_run_override=dry)
+            logger.info("[catalogue_health] ✅ finish | %s", res)
+        except Exception as e:
+            logger.exception("[catalogue_health] ❌ failed: %s", e)
 
     if async_flag:
         threading.Thread(target=_job, daemon=True).start()
         return jsonify({"ok": True, "status": "started"}), 202
 
-    res = ch_run(limit_override=limit, dry_run_override=dry)
-    return jsonify({"ok": True, **res}), 200
+    try:
+        res = ch_run(limit_override=limit, dry_run_override=dry)
+        logger.info("[catalogue_health] ✅ finish | %s", res)
+        return jsonify({"ok": True, **res}), 200
+    except Exception as e:
+        logger.exception("[catalogue_health] ❌ failed: %s", e)
+        return jsonify({"ok": False, "error": str(e)}), 500
 
 # ────────────────────────────────────────────────────────────────────────────────
 # Backfill Streams (Airtable → Postgres)  (UPDATED to upsert artist/title)
@@ -867,7 +872,7 @@ def diag():
     return jsonify({"find_today_id": find_today_by_isrc(isrc, day), "prev_count": prev_count_by_isrc(isrc, day)})
 
 # ────────────────────────────────────────────────────────────────────────────────
-# Timezone helpers
+# Timezone helpers (single source of truth)
 # ────────────────────────────────────────────────────────────────────────────────
 try:
     from zoneinfo import ZoneInfo, ZoneInfoNotFoundError  # py3.9+
@@ -895,4 +900,9 @@ def today_iso_local(tzkey: Optional[str] = None) -> str:
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", "3000"))
     logger.info(f"[startup] app booting on 0.0.0.0:{port} tz={LOCAL_TZ} output={OUTPUT_TARGET}")
+    # Print route map to confirm /run_catalogue_health exists
+    try:
+        logger.info("[startup] routes: %s", [str(r) for r in app.url_map.iter_rules()])
+    except Exception:
+        pass
     app.run(host="0.0.0.0", port=port)
