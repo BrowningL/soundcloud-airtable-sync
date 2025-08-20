@@ -218,14 +218,21 @@ def find_today_by_isrc(isrc_code: str, day_iso: str) -> Optional[str]:
     else:
         formula = (
             f"AND("
-            f"SEARCH('{_q(isrc_code)}', ARRAYJOIN({{{PLAYCOUNTS_LINK_FIELD}}})),""
+            f"SEARCH('{_q(isrc_code)}', ARRAYJOIN({{{PLAYCOUNTS_LINK_FIELD}}})),"
             f"IS_SAME({{{PLAYCOUNTS_DATE_FIELD}}}, '{day_iso}', 'day')"
             f")"
         )
-    r = requests.get(at_url(PLAYCOUNTS_TABLE), headers=at_headers(), params={"filterByFormula": formula, "pageSize": 1}, timeout=60)
-    if r.status_code != 200: return None
+    r = requests.get(
+        at_url(PLAYCOUNTS_TABLE),
+        headers=at_headers(),
+        params={"filterByFormula": formula, "pageSize": 1},
+        timeout=60,
+    )
+    if r.status_code != 200:
+        return None
     recs = r.json().get("records", [])
     return recs[0]["id"] if recs else None
+
 
 def prev_count_by_isrc(isrc_code: str, before_iso: str) -> Optional[int]:
     clauses = [
