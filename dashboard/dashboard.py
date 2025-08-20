@@ -3,8 +3,10 @@ import os
 from datetime import date, datetime, timedelta
 from typing import List, Tuple, Dict, Any
 from collections import defaultdict
+import json
+import urllib.parse
+import urllib.request
 
-import requests
 from flask import Flask, jsonify, render_template_string, request
 from psycopg_pool import ConnectionPool, PoolClosed
 from psycopg.rows import dict_row
@@ -21,6 +23,8 @@ AIRTABLE_API_KEY = os.getenv("AIRTABLE_API_KEY")
 AIRTABLE_BASE_ID = os.getenv("AIRTABLE_BASE_ID")
 AIRTABLE_TABLE_NAME = os.getenv("AIRTABLE_TABLE_NAME", "Catalogue")
 AIRTABLE_RELEASE_DATE_FIELD = os.getenv("AIRTABLE_RELEASE_DATE_FIELD", "Release Date")
+AIRTABLE_DISTRIBUTOR_FIELD = os.getenv("AIRTABLE_DISTRIBUTOR_FIELD", "Distributor")
+AIRTABLE_EXCLUDED_DISTRIBUTOR = os.getenv("AIRTABLE_EXCLUDED_DISTRIBUTOR", "External")
 AIRTABLE_CACHE_TTL_SECS = int(os.getenv("AIRTABLE_CACHE_TTL_SECS", "21600"))  # 6 hours
 
 POOL = ConnectionPool(
@@ -87,12 +91,20 @@ _airtable_cache: Dict[str, Any] = {
 def _airtable_enabled() -> bool:
     return bool(AIRTABLE_API_KEY and AIRTABLE_BASE_ID)
 
+def _http_get_json(url: str, headers: Dict[str, str], params: Dict[str, Any], timeout: float = 30.0) -> Dict[str, Any]:
+    query = urllib.parse.urlencode(
+        [(k, v) for k, vv in params.items() for v in (vv if isinstance(vv, list) else [vv])]
+    )
+    full = f"{url}?{query}" if query else url
+    req = urllib.request.Request(full, headers=headers, method="GET")
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        return json.loads(resp.read().decode("utf-8"))
+
 def _fetch_airtable_release_dates() -> Dict[str, Any]:
     """
-    Fetch all release dates from Airtable and build a cumulative series per day.
-    Returns dict with labels, values, min_date, max_date, count, ok, error.
+    Fetch all release dates from Airtable, excluding records with Distributor == 'External',
+    then build a cumulative series per day.
     """
-    # Serve from cache if fresh
     now = datetime.utcnow()
     if _airtable_cache["at"] and (now - _airtable_cache["at"]).total_seconds() < AIRTABLE_CACHE_TTL_SECS:
         return {
@@ -110,12 +122,17 @@ def _fetch_airtable_release_dates() -> Dict[str, Any]:
         _airtable_cache.update(out); _airtable_cache["at"] = now
         return out
 
-    url = f"https://api.airtable.com/v0/{AIRTABLE_BASE_ID}/{requests.utils.quote(AIRTABLE_TABLE_NAME)}"
+    base_url = f"https://api.airtable.com/v0/{AIRTABLE_BASE_ID}/{urllib.parse.quote(AIRTABLE_TABLE_NAME)}"
     headers = {"Authorization": f"Bearer {AIRTABLE_API_KEY}"}
+
+    # filter: must have a Release Date AND Distributor != 'External'
+    # You can tweak logic if blank distributor should also be included (current formula includes blanks).
+    formula = f"AND({{{{{ {AIRTABLE_RELEASE_DATE_FIELD} }}}}}, NOT({{{{{ {AIRTABLE_DISTRIBUTOR_FIELD} }}}}} = '{AIRTABLE_EXCLUDED_DISTRIBUTOR}'))"
+
     params = {
         "pageSize": 100,
-        # only fetch needed field to reduce payload
-        "fields[]": AIRTABLE_RELEASE_DATE_FIELD,
+        "fields[]": AIRTABLE_RELEASE_DATE_FIELD,  # small payload
+        "filterByFormula": formula,
     }
 
     per_day_additions: Dict[date, int] = defaultdict(int)
@@ -126,12 +143,10 @@ def _fetch_airtable_release_dates() -> Dict[str, Any]:
     offset = None
     try:
         while True:
-            q = params.copy()
+            q = dict(params)
             if offset:
                 q["offset"] = offset
-            resp = requests.get(url, headers=headers, params=q, timeout=30)
-            resp.raise_for_status()
-            data = resp.json()
+            data = _http_get_json(base_url, headers, q, timeout=30.0)
 
             records = data.get("records", [])
             for rec in records:
@@ -139,12 +154,10 @@ def _fetch_airtable_release_dates() -> Dict[str, Any]:
                 raw = fields.get(AIRTABLE_RELEASE_DATE_FIELD)
                 if not raw:
                     continue
-                # Airtable date field can be date-only ("YYYY-MM-DD") or ISO datetime
+                # Accept date-only ("YYYY-MM-DD") or ISO datetime
                 try:
-                    # Try strict date first
                     d = date.fromisoformat(raw[:10])
                 except Exception:
-                    # last resort: parse RFC3339-like
                     try:
                         d = datetime.fromisoformat(raw.replace("Z", "+00:00")).date()
                     except Exception:
@@ -165,11 +178,9 @@ def _fetch_airtable_release_dates() -> Dict[str, Any]:
             _airtable_cache.update(out); _airtable_cache["at"] = now
             return out
 
-        # Build cumulative series from the first release date to today
         start = seen_min
         end = max(seen_max, date.today())
-        labels = []
-        values = []
+        labels, values = [], []
         running = 0
         for d in _daterange(start, end):
             running += per_day_additions.get(d, 0)
@@ -188,8 +199,6 @@ def _fetch_airtable_release_dates() -> Dict[str, Any]:
 # ── UI ────────────────────────────────────────────────────────────────────────
 @app.get("/")
 def ui():
-    # KAIZEN-styled single-file template (keeps your existing layout assumptions)
-    # Adds a third chart ("catalogueChart") below the two playlist charts.
     html = f"""
 <!doctype html>
 <html lang="en">
@@ -200,31 +209,16 @@ def ui():
   <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
   <style>
     :root {{
-      --bg: #0b0b0f;
-      --card: #12121a;
-      --ink: #f2f2f7;
-      --muted: #9aa0a6;
-      --accent: #ff3b30; /* KAIZEN red accent */
-      --grid: #1d1d27;
+      --bg: #0b0b0f; --card: #12121a; --ink: #f2f2f7; --muted: #9aa0a6; --grid: #1d1d27;
     }}
-    html, body {{
-      margin: 0; padding: 0; background: var(--bg); color: var(--ink);
-      font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial, Apple Color Emoji, Segoe UI Emoji;
-    }}
+    html, body {{ margin:0; padding:0; background:var(--bg); color:var(--ink);
+      font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial, Apple Color Emoji, Segoe UI Emoji; }}
     .wrap {{ max-width: 1280px; margin: 28px auto; padding: 0 16px; }}
-    h1 {{ font-weight: 800; letter-spacing: 0.3px; margin: 0 0 8px; }}
+    h1 {{ margin: 0 0 8px; font-weight: 800; }}
     .sub {{ color: var(--muted); margin-bottom: 20px; }}
-    .grid {{
-      display: grid; gap: 16px;
-      grid-template-columns: 1fr;
-    }}
-    @media (min-width: 1000px) {{
-      .grid.two {{ grid-template-columns: 1fr 1fr; }}
-    }}
-    .card {{
-      background: var(--card); border-radius: 18px; padding: 16px 16px 8px;
-      box-shadow: 0 10px 30px rgba(0,0,0,0.25);
-    }}
+    .grid {{ display: grid; gap: 16px; grid-template-columns: 1fr; }}
+    @media (min-width: 1000px) {{ .grid.two {{ grid-template-columns: 1fr 1fr; }} }}
+    .card {{ background: var(--card); border-radius: 18px; padding: 16px 16px 8px; box-shadow: 0 10px 30px rgba(0,0,0,.25); }}
     .card h3 {{ margin: 0 0 8px; font-weight: 700; }}
     canvas {{ width: 100%; height: 340px; }}
     .meta {{ color: var(--muted); font-size: 12px; margin-top: 8px; }}
@@ -235,7 +229,6 @@ def ui():
     <h1>KAIZEN Streams & Growth</h1>
     <div class="sub">TZ: {LOCAL_TZ} &middot; Default playlist: {DEFAULT_PLAYLIST_NAME}</div>
 
-    <!-- Row: two playlist charts (existing) -->
     <div class="grid two">
       <div class="card">
         <h3>All Playlists — Followers</h3>
@@ -249,7 +242,6 @@ def ui():
       </div>
     </div>
 
-    <!-- New: Catalogue size chart -->
     <div class="grid" style="margin-top: 16px;">
       <div class="card">
         <h3>Catalogue Size Over Time</h3>
@@ -260,39 +252,27 @@ def ui():
   </div>
 
   <script>
-    // Simple utility to fetch JSON
     async function jget(url) {{
       const r = await fetch(url);
       if (!r.ok) throw new Error("HTTP " + r.status);
       return r.json();
     }}
 
-    // --- Playlists Followers (multi-series) ---
+    // Followers (multi-series)
     (async () => {{
       try {{
         const data = await jget("/api/playlists/all-series?days=365");
         const ctx = document.getElementById("playlistsFollowers");
         if (ctx) {{
           const ds = (data.series || []).map((s) => ({{
-            label: s.name,
-            data: s.values,
-            borderWidth: 2,
-            fill: false,
-            tension: 0.25
+            label: s.name, data: s.values, borderWidth: 2, fill: false, tension: 0.25
           }}));
           new Chart(ctx, {{
             type: "line",
-            data: {{
-              labels: data.labels,
-              datasets: ds
-            }},
+            data: {{ labels: data.labels, datasets: ds }},
             options: {{
-              responsive: true,
-              interaction: {{ mode: "index", intersect: false }},
-              plugins: {{
-                legend: {{ display: true }},
-                tooltip: {{ enabled: true }}
-              }},
+              responsive: true, interaction: {{ mode:"index", intersect:false }},
+              plugins: {{ legend: {{ display: true }}, tooltip: {{ enabled: true }} }},
               scales: {{
                 x: {{ grid: {{ color: "rgba(255,255,255,0.05)" }} }},
                 y: {{ grid: {{ color: "rgba(255,255,255,0.05)" }}, beginAtZero: true }}
@@ -303,11 +283,9 @@ def ui():
       }} catch(e) {{ console.error("Followers chart error:", e); }}
     }})();
 
-    // --- Playlists Deltas (sum across playlists by day) ---
+    // Deltas (Σ playlists)
     (async () => {{
       try {{
-        // Re-use per-playlist deltas endpoint; if you don't have a direct "all deltas" API,
-        // you can adapt server-side. For now we approximate by differencing followers client-side.
         const data = await jget("/api/playlists/all-series?days=365");
         const labels = data.labels || [];
         const summed = new Array(labels.length).fill(0);
@@ -321,20 +299,10 @@ def ui():
         if (ctx) {{
           new Chart(ctx, {{
             type: "bar",
-            data: {{
-              labels,
-              datasets: [{{
-                label: "Daily follower delta (Σ playlists)",
-                data: summed,
-                borderWidth: 1
-              }}]
-            }},
+            data: {{ labels, datasets: [{{ label:"Daily follower delta (Σ playlists)", data: summed, borderWidth:1 }}] }},
             options: {{
               responsive: true,
-              plugins: {{
-                legend: {{ display: true }},
-                tooltip: {{ enabled: true }}
-              }},
+              plugins: {{ legend: {{ display:true }}, tooltip: {{ enabled:true }} }},
               scales: {{
                 x: {{ grid: {{ color: "rgba(255,255,255,0.05)" }} }},
                 y: {{ grid: {{ color: "rgba(255,255,255,0.05)" }}, beginAtZero: true }}
@@ -345,11 +313,10 @@ def ui():
       }} catch(e) {{ console.error("Deltas chart error:", e); }}
     }})();
 
-    // --- NEW: Catalogue Size Over Time (Airtable) ---
+    // Catalogue (Airtable, excluding 'External' distributor)
     (async () => {{
       try {{
-        const daysParam = new URLSearchParams(window.location.search).get("cat_days");
-        const url = "/api/catalogue/size-series" + (daysParam ? ("?days=" + encodeURIComponent(daysParam)) : "");
+        const url = "/api/catalogue/size-series";
         const data = await jget(url);
         const ctx = document.getElementById("catalogueChart");
         if (ctx) {{
@@ -357,20 +324,11 @@ def ui():
             type: "line",
             data: {{
               labels: data.labels || [],
-              datasets: [{{
-                label: "Total tracks in catalogue",
-                data: data.values || [],
-                borderWidth: 2,
-                fill: false,
-                tension: 0.25
-              }}]
+              datasets: [{{ label: "Total tracks in catalogue", data: data.values || [], borderWidth: 2, fill: false, tension: 0.25 }}]
             }},
             options: {{
               responsive: true,
-              plugins: {{
-                legend: {{ display: true }},
-                tooltip: {{ enabled: true }}
-              }},
+              plugins: {{ legend: {{ display: true }}, tooltip: {{ enabled: true }} }},
               scales: {{
                 x: {{ grid: {{ color: "rgba(255,255,255,0.05)" }} }},
                 y: {{ grid: {{ color: "rgba(255,255,255,0.05)" }}, beginAtZero: true }}
@@ -383,7 +341,7 @@ def ui():
           const total = (data.values && data.values.length) ? data.values[data.values.length-1] : 0;
           const minD = data.min_date || "";
           const maxD = data.max_date || "";
-          meta.textContent = `Total: ${{total}} • Range: ${{minD}} → ${{maxD}} • Records counted: ${{data.count||0}}`;
+          meta.textContent = `Total: ${{total}} • Range: ${{minD}} → ${{maxD}} • Records counted: ${{data.count||0}} (excl. distributor='{AIRTABLE_EXCLUDED_DISTRIBUTOR}')`;
         }}
       }} catch(e) {{
         console.error("Catalogue chart error:", e);
@@ -493,7 +451,7 @@ def api_playlist_series(playlist_id: str):
 
 @app.get("/api/playlists/all-series")
 def api_playlists_all_series():
-    days = _clamp_days(request.args.get("days"), 365)  # widened default to benefit deltas
+    days = _clamp_days(request.args.get("days"), 365)
     q = """ ... """  # (unchanged SQL query)
     rows = _q(q, (days,))
     if not rows:
@@ -529,14 +487,9 @@ def api_artists_top_share():
     shares = [round(v * 100.0 / total, 2) for v in values]
     return jsonify({"date": day, "labels": labels, "values": values, "shares": shares})
 
-# ── NEW API: Catalogue size series (Airtable) ─────────────────────────────────
+# ── NEW API: Catalogue size series (Airtable, distributor != External) ────────
 @app.get("/api/catalogue/size-series")
 def api_catalogue_size_series():
-    """
-    Returns cumulative catalogue size series built from Airtable 'Release Date'.
-    Query params:
-      - days (optional): clamp window; if omitted, full range from first release to today
-    """
     data = _fetch_airtable_release_dates()
     if not data.get("ok"):
         return jsonify({"labels": [], "values": [], "error": data.get("error")}), 200
@@ -544,7 +497,6 @@ def api_catalogue_size_series():
     labels = data["labels"] or []
     values = data["values"] or []
 
-    # Optionally clamp to trailing N days if requested
     days = request.args.get("days")
     if days:
         try:
