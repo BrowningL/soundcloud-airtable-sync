@@ -3,16 +3,13 @@ import os
 import time
 import logging
 from datetime import date, datetime, timedelta
-from typing import List, Tuple, Dict, Any
+from typing import List, Tuple, Dict, Any, Optional
 from collections import defaultdict
 import json
 import urllib.parse
 import urllib.request
 
 from flask import Flask, jsonify, render_template_string, request
-import psycopg
-from psycopg_pool import ConnectionPool, PoolClosed
-from psycopg.rows import dict_row
 
 # ── Config ────────────────────────────────────────────────────────────────────
 LOCAL_TZ = os.getenv("LOCAL_TZ", "Europe/London")
@@ -31,99 +28,100 @@ AIRTABLE_DISTRIBUTOR_FIELD = os.getenv("AIRTABLE_DISTRIBUTOR_FIELD", "Distributo
 AIRTABLE_EXCLUDED_DISTRIBUTOR = os.getenv("AIRTABLE_EXCLUDED_DISTRIBUTOR", "External")
 AIRTABLE_CACHE_TTL_SECS = int(os.getenv("AIRTABLE_CACHE_TTL_SECS", "21600"))  # 6h
 
-# ── DB pool (resilient against restarts/idle timeouts) ────────────────────────
-# Enforce SSL and enable TCP keepalives so dead peers are detected promptly.
-conn_kwargs = {
-    "sslmode": "require",          # was "prefer" → make it strict
-    "keepalives": 1,
-    "keepalives_idle": 30,
-    "keepalives_interval": 10,
-    "keepalives_count": 5,
-}
-
-POOL = ConnectionPool(
-    conninfo=DATABASE_URL,
-    kwargs=conn_kwargs,
-    min_size=1,
-    max_size=int(os.getenv("DB_POOL_MAX", "5")),
-    timeout=10,         # wait up to 10s for a free conn
-    max_lifetime=3600,  # recycle hourly to avoid stale sockets
-    max_idle=300,       # recycle idle conns after 5m
-    open=False,         # lazy-open
-)
+# ── Logging ───────────────────────────────────────────────────────────────────
+logger = logging.getLogger("dashboard")
+if not logger.handlers:
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
+logger.setLevel(logging.INFO)
 
 app = Flask(__name__)  # serves /static/* by default
 
-# ── DB helpers ────────────────────────────────────────────────────────────────
-def _ensure_pool_open():
+# ── DB pool (adaptive SSL + reconnect) ────────────────────────────────────────
+import psycopg
+from psycopg.rows import dict_row
+from psycopg_pool import ConnectionPool, PoolTimeout, PoolClosed
+
+_URL_HAS_SSLMODE = ("sslmode=" in DATABASE_URL.lower())
+
+def _build_pool(sslmode: Optional[str]) -> ConnectionPool:
+    kwargs: Dict[str, Any] = {}
+    # Respect explicit sslmode from URL; only set when not pinned in the URL.
+    if sslmode:
+        kwargs["sslmode"] = sslmode  # 'require' | 'prefer' | 'disable'
+    # TCP keepalives to detect dead peers
+    kwargs.update({
+        "keepalives": 1,
+        "keepalives_idle": 30,
+        "keepalives_interval": 10,
+        "keepalives_count": 5,
+    })
+    return ConnectionPool(
+        conninfo=DATABASE_URL,
+        kwargs=kwargs,
+        min_size=1,
+        max_size=int(os.getenv("DB_POOL_MAX", "5")),
+        timeout=int(os.getenv("DB_TIMEOUT_SECS", "10")),  # wait for free conn
+        max_lifetime=int(os.getenv("DB_MAX_LIFETIME_SECS", "3600")),  # recycle hourly
+        max_idle=int(os.getenv("DB_MAX_IDLE_SECS", "300")),           # recycle after 5m idle
+        open=False,  # lazy-open
+    )
+
+# Initial sslmode: if URL pins it, let libpq decide; else use env (default 'prefer')
+DEFAULT_SSLMODE = None if _URL_HAS_SSLMODE else os.getenv("DB_SSLMODE", "prefer").lower()
+POOL = _build_pool(DEFAULT_SSLMODE)
+
+def _ensure_pool_open_adaptive():
+    """
+    Open the pool. If the server explicitly rejects SSL, rebuild with sslmode=disable.
+    Only adapts when sslmode isn't pinned inside DATABASE_URL.
+    """
+    global POOL
     try:
         POOL.open()
-    except Exception:
-        # Pool may already be open; ignore
-        pass
+        return
+    except Exception as e:
+        msg = str(e).lower()
+        if (not _URL_HAS_SSLMODE) and ("server does not support ssl" in msg or "ssl was required" in msg):
+            logger.warning("DB reports SSL mismatch; rebuilding pool with sslmode=disable")
+            try:
+                POOL.close()
+            except Exception:
+                pass
+            POOL = _build_pool("disable")
+            POOL.open()
+            return
+        raise
 
 def _reopen_pool():
+    global POOL
     try:
         POOL.close()
     except Exception:
         pass
     time.sleep(0.25)
-    POOL.open()
+    _ensure_pool_open_adaptive()
 
 def _q(query: str, params: tuple | None = None):
     """
-    Execute a read-only query with one automatic reconnect retry if the server
-    closed the connection (restart, network flap, idle timeout).
-    Returns list of dict rows.
+    Read-only query with one reconnect retry if the connection was dropped or the pool timed out.
+    Returns list of dict rows. Raises on repeated failure (so callers surface 500).
     """
     params = params or ()
     for attempt in (1, 2):
         try:
-            _ensure_pool_open()
+            _ensure_pool_open_adaptive()
             with POOL.connection() as conn:
-                # cheap ping so we fail fast on a dead socket
+                # Cheap ping so we fail fast on a dead socket
                 with conn.cursor() as ping:
                     ping.execute("SELECT 1")
                 with conn.cursor(row_factory=dict_row) as cur:
                     cur.execute(query, params)
-                    if cur.description:
-                        return cur.fetchall()
-                    return []
-        except (psycopg.OperationalError, psycopg.InterfaceError) as e:
-            logging.warning("DB op failed (%s). Attempt %d/2", e.__class__.__name__, attempt)
+                    return cur.fetchall() if cur.description else []
+        except (psycopg.OperationalError, psycopg.InterfaceError, PoolTimeout, PoolClosed) as e:
+            logger.warning("DB op failed (%s). Attempt %d/2", e.__class__.__name__, attempt)
             if attempt == 2:
                 raise
             _reopen_pool()
-        except PoolClosed:
-            # Very rare: pool got closed—reopen and retry.
-            if attempt == 2:
-                raise
-            _reopen_pool()
-
-def _exec(query: str, params: tuple | None = None) -> int:
-    """
-    Execute a write/DDL with one automatic reconnect retry.
-    Returns affected rowcount.
-    """
-    params = params or ()
-    for attempt in (1, 2):
-        try:
-            _ensure_pool_open()
-            with POOL.connection() as conn:
-                with conn.cursor() as cur:
-                    cur.execute(query, params)
-                    conn.commit()
-                    return cur.rowcount
-        except (psycopg.OperationalError, psycopg.InterfaceError) as e:
-            logging.warning("DB exec failed (%s). Attempt %d/2", e.__class__.__name__, attempt)
-            if attempt == 2:
-                raise
-            _reopen_pool()
-        except PoolClosed:
-            if attempt == 2:
-                raise
-            _reopen_pool()
-
 
 # ── Series helpers ────────────────────────────────────────────────────────────
 def _daterange(start: date, end: date) -> List[date]:
@@ -144,7 +142,6 @@ def _clamp_days(raw: str | None, default: int = 90, min_d: int = 1, max_d: int =
     except Exception:
         v = default
     return min(max(v, min_d), max_d)
-
 
 # ── Airtable helpers (catalogue size, excluding External distributor) ─────────
 def _airtable_enabled() -> bool:
@@ -197,8 +194,8 @@ def _fetch_catalogue_cumulative():
 
     per_day_additions: Dict[date, int] = defaultdict(int)
     total = 0
-    seen_min: date | None = None
-    seen_max: date | None = None
+    seen_min: Optional[date] = None
+    seen_max: Optional[date] = None
 
     offset = None
     try:
@@ -253,7 +250,6 @@ def _fetch_catalogue_cumulative():
         _airtable_cache.update({"at": now, "labels": [], "values": [],
                                 "min_date": None, "max_date": None, "count": 0, "ok": False, "error": str(e)})
         return [], [], None, None, 0, False, str(e)
-
 
 # ── UI ────────────────────────────────────────────────────────────────────────
 @app.get("/")
@@ -369,7 +365,7 @@ def ui():
       </div>
     </section>
 
-    <!-- NEW Row 3: Catalogue size over time (Airtable, excluding External) -->
+    <!-- Row 3: Catalogue size over time (Airtable, excluding External) -->
     <section class="grid grid-cols-1 gap-6 mt-6">
       <div class="card">
         <div class="flex items-center justify-between mb-3">
@@ -500,7 +496,7 @@ def ui():
     });
   }
 
-  // NEW: Catalogue size (Airtable, excluding "External")
+  // Catalogue size (Airtable, excluding "External")
   async function loadCatalogue() {
     const data = await api('/api/catalogue/size-series');
     const ctx = document.getElementById('catalogueChart').getContext('2d');
@@ -558,7 +554,6 @@ def ui():
         default_playlist_name=DEFAULT_PLAYLIST_NAME
     )
 
-
 # ── API: streams ──────────────────────────────────────────────────────────────
 @app.get("/api/streams/total-daily")
 def api_streams_total_daily():
@@ -580,7 +575,6 @@ def api_streams_total_daily():
     labels, values = _fill_series([(r["d"], r["v"]) for r in rows], start, end)
     return jsonify({"labels": labels, "values": values})
 
-
 @app.get("/api/streams/dates")
 def api_streams_dates():
     days = _clamp_days(request.args.get("days"), 90)
@@ -593,7 +587,6 @@ def api_streams_dates():
     """
     rows = _q(q, (days,))
     return jsonify({"dates": [r["d"].isoformat() for r in rows]})
-
 
 @app.get("/api/streams/top-deltas")
 def api_streams_top_deltas():
@@ -627,7 +620,6 @@ def api_streams_top_deltas():
             "delta": int(r.get("delta") or 0),
         })
     return jsonify({"rows": out})
-
 
 # ── API: playlists (list + single series) ─────────────────────────────────────
 @app.get("/api/playlists/list")
@@ -665,7 +657,6 @@ def api_playlists_list():
         })
     return jsonify(out)
 
-
 @app.get("/api/playlists/<path:playlist_id>/series")
 def api_playlist_series(playlist_id: str):
     days = _clamp_days(request.args.get("days"), 90)
@@ -685,8 +676,7 @@ def api_playlist_series(playlist_id: str):
     _, deltas = _fill_series([(r["d"], int(r["delta"] or 0)) for r in rows], start, end)
     return jsonify({"labels": labels, "followers": followers, "deltas": deltas})
 
-
-# NEW: All playlists — followers over time (multi-series)
+# All playlists — followers over time (multi-series)
 @app.get("/api/playlists/all-series")
 def api_playlists_all_series():
     days = _clamp_days(request.args.get("days"), 90)
@@ -707,7 +697,7 @@ def api_playlists_all_series():
     start, end = rows[0]["d"], rows[-1]["d"]
     labels_base = [d.isoformat() for d in _daterange(start, end)]
 
-    series_map = {}
+    series_map: Dict[str, Dict[str, Any]] = {}
     for r in rows:
         pid = r["playlist_id"]
         series_map.setdefault(pid, {"name": r["name"], "points": []})
@@ -720,8 +710,7 @@ def api_playlists_all_series():
 
     return jsonify({"labels": labels_base, "series": series})
 
-
-# NEW: Best artists for the latest date — share of daily delta
+# Best artists for the latest date — share of daily delta
 @app.get("/api/artists/top-share")
 def api_artists_top_share():
     q_latest = """
@@ -755,8 +744,7 @@ def api_artists_top_share():
     shares = [round(v * 100.0 / total, 2) for v in values]
     return jsonify({"date": day, "labels": labels, "values": values, "shares": shares})
 
-
-# NEW: Catalogue size series API (Airtable, distributor != 'External')
+# Catalogue size series API (Airtable, distributor != 'External')
 @app.get("/api/catalogue/size-series")
 def api_catalogue_size_series():
     labels, values, min_d, max_d, total, ok, err = _fetch_catalogue_cumulative()
@@ -769,7 +757,6 @@ def api_catalogue_size_series():
         "max_date": max_d.isoformat() if isinstance(max_d, date) else None,
         "count": total
     })
-
 
 # ── Health ────────────────────────────────────────────────────────────────────
 @app.get("/health")
@@ -791,7 +778,6 @@ def health():
     return {"ok": bool(db_info.get("ok") and (at_ok or not _airtable_enabled())),
             "db": db_info,
             "airtable": {"ok": at_ok, "error": at_err}}
-
 
 # ── Entrypoint ────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
