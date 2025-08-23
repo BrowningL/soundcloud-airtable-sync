@@ -1,5 +1,7 @@
 # dashboard.py — KAIZEN-styled Flask dashboard (Streams & Playlist Growth + Catalogue)
 import os
+import time
+import logging
 from datetime import date, datetime, timedelta
 from typing import List, Tuple, Dict, Any
 from collections import defaultdict
@@ -8,6 +10,7 @@ import urllib.parse
 import urllib.request
 
 from flask import Flask, jsonify, render_template_string, request
+import psycopg
 from psycopg_pool import ConnectionPool, PoolClosed
 from psycopg.rows import dict_row
 
@@ -28,35 +31,98 @@ AIRTABLE_DISTRIBUTOR_FIELD = os.getenv("AIRTABLE_DISTRIBUTOR_FIELD", "Distributo
 AIRTABLE_EXCLUDED_DISTRIBUTOR = os.getenv("AIRTABLE_EXCLUDED_DISTRIBUTOR", "External")
 AIRTABLE_CACHE_TTL_SECS = int(os.getenv("AIRTABLE_CACHE_TTL_SECS", "21600"))  # 6h
 
+# ── DB pool (resilient against restarts/idle timeouts) ────────────────────────
+# Enforce SSL and enable TCP keepalives so dead peers are detected promptly.
+conn_kwargs = {
+    "sslmode": "require",          # was "prefer" → make it strict
+    "keepalives": 1,
+    "keepalives_idle": 30,
+    "keepalives_interval": 10,
+    "keepalives_count": 5,
+}
+
 POOL = ConnectionPool(
     conninfo=DATABASE_URL,
-    kwargs={"sslmode": os.getenv("DB_SSLMODE", "prefer")},  # "disable" if needed
+    kwargs=conn_kwargs,
     min_size=1,
-    max_size=5,
-    open=False,
+    max_size=int(os.getenv("DB_POOL_MAX", "5")),
+    timeout=10,         # wait up to 10s for a free conn
+    max_lifetime=3600,  # recycle hourly to avoid stale sockets
+    max_idle=300,       # recycle idle conns after 5m
+    open=False,         # lazy-open
 )
 
 app = Flask(__name__)  # serves /static/* by default
-
 
 # ── DB helpers ────────────────────────────────────────────────────────────────
 def _ensure_pool_open():
     try:
         POOL.open()
     except Exception:
+        # Pool may already be open; ignore
         pass
 
-def _q(query: str, params: tuple | None = None):
-    _ensure_pool_open()
+def _reopen_pool():
     try:
-        with POOL.connection() as conn, conn.cursor(row_factory=dict_row) as cur:
-            cur.execute(query, params or ())
-            return cur.fetchall()
-    except PoolClosed:
-        _ensure_pool_open()
-        with POOL.connection() as conn, conn.cursor(row_factory=dict_row) as cur:
-            cur.execute(query, params or ())
-            return cur.fetchall()
+        POOL.close()
+    except Exception:
+        pass
+    time.sleep(0.25)
+    POOL.open()
+
+def _q(query: str, params: tuple | None = None):
+    """
+    Execute a read-only query with one automatic reconnect retry if the server
+    closed the connection (restart, network flap, idle timeout).
+    Returns list of dict rows.
+    """
+    params = params or ()
+    for attempt in (1, 2):
+        try:
+            _ensure_pool_open()
+            with POOL.connection() as conn:
+                # cheap ping so we fail fast on a dead socket
+                with conn.cursor() as ping:
+                    ping.execute("SELECT 1")
+                with conn.cursor(row_factory=dict_row) as cur:
+                    cur.execute(query, params)
+                    if cur.description:
+                        return cur.fetchall()
+                    return []
+        except (psycopg.OperationalError, psycopg.InterfaceError) as e:
+            logging.warning("DB op failed (%s). Attempt %d/2", e.__class__.__name__, attempt)
+            if attempt == 2:
+                raise
+            _reopen_pool()
+        except PoolClosed:
+            # Very rare: pool got closed—reopen and retry.
+            if attempt == 2:
+                raise
+            _reopen_pool()
+
+def _exec(query: str, params: tuple | None = None) -> int:
+    """
+    Execute a write/DDL with one automatic reconnect retry.
+    Returns affected rowcount.
+    """
+    params = params or ()
+    for attempt in (1, 2):
+        try:
+            _ensure_pool_open()
+            with POOL.connection() as conn:
+                with conn.cursor() as cur:
+                    cur.execute(query, params)
+                    conn.commit()
+                    return cur.rowcount
+        except (psycopg.OperationalError, psycopg.InterfaceError) as e:
+            logging.warning("DB exec failed (%s). Attempt %d/2", e.__class__.__name__, attempt)
+            if attempt == 2:
+                raise
+            _reopen_pool()
+        except PoolClosed:
+            if attempt == 2:
+                raise
+            _reopen_pool()
 
 
 # ── Series helpers ────────────────────────────────────────────────────────────
