@@ -475,85 +475,137 @@ def backfill_deltas_for_followers() -> int:
     return backfill_table_deltas(FOLLOWERS_TABLE, FOLLOWERS_LINK_FIELD, FOLLOWERS_DATE_FIELD, FOLLOWERS_COUNT_FIELD, FOLLOWERS_DELTA_FIELD, clamp_negative=not FOLLOWERS_ALLOW_NEGATIVE)
 
 # ────────────────────────────────────────────────────────────────────────────────
-# Streams daily sync (with logging)
+# Streams daily sync (with logging)  >>> RETRY-ON-ZERO UPGRADE
 # ────────────────────────────────────────────────────────────────────────────────
-async def sync():
+async def sync(max_retries: int = 1, retry_sleep_sec: float = 3.0):
+    """
+    Run the sync. If the run looks like a silent failure, retry once:
+      • Primary trigger: sum of today's deltas == 0
+      • Fallback trigger: sum of fetched playcounts == 0
+    On retry, refresh tokens and clear album cache. Second pass overwrites zeros.
+    """
     cat = catalogue_index()  # { ISRC: {air_id, artist, title} }
     order = list(cat.keys())
     linkmap = {k: v["air_id"] for k, v in cat.items()}
-
-    logger.info(f"[streams] starting run: tracks={len(order)} output={OUTPUT_TARGET}")
-    web_tok, cli_tok = await sniff_tokens()
-    search_tok = get_search_token()
-    cache: Dict[str, Dict[str, Any]] = {}
     today_iso = date.today().isoformat()
 
-    conn = None
-    cur = None
-    if OUTPUT_TARGET in ("postgres", "both"):
-        conn = db_conn()
-        cur = conn.cursor()
-        db_ensure_platform(cur, "spotify")
+    async def run_once(attempt_idx: int):
+        nonlocal today_iso
+        logger.info(f"[streams] starting run: tracks={len(order)} output={OUTPUT_TARGET} attempt={attempt_idx+1}")
 
-    errors = 0
-    processed = 0
+        web_tok, cli_tok = await sniff_tokens()
+        search_tok = get_search_token()
+        cache: Dict[str, Dict[str, Any]] = {}
 
-    try:
-        for isrc in order:
-            try:
-                tr = search_track(isrc, search_tok)  # (tid, aid, tname, artists) or None
-                if not tr:
+        conn = None
+        cur = None
+        if OUTPUT_TARGET in ("postgres", "both"):
+            conn = db_conn()
+            cur = conn.cursor()
+            db_ensure_platform(cur, "spotify")
+
+        errors = 0
+        processed = 0
+        sum_pc = 0
+        sum_delta_like = 0  # computed the same way as Airtable delta logic
+
+        try:
+            for isrc in order:
+                try:
+                    tr = search_track(isrc, search_tok)  # (tid, aid, tname, artists) or None
+                    if not tr:
+                        # No match → treat as 0
+                        pc = 0
+                        prev = prev_count_by_isrc(isrc, today_iso)
+                        if prev is not None and prev > 0:
+                            # delta-like stays 0
+                            pass
+
+                        if OUTPUT_TARGET in ("airtable", "both"):
+                            upsert_count(linkmap[isrc], isrc, today_iso, pc)
+                        if OUTPUT_TARGET in ("postgres", "both"):
+                            meta = cat.get(isrc, {})
+                            track_uid = db_upsert_track(cur, isrc, meta.get("artist"), meta.get("title"))
+                            db_upsert_stream(cur, "spotify", track_uid, today_iso, pc)
+
+                        sum_pc += pc
+                        processed += 1
+                        continue
+
+                    tid, aid, sp_title, sp_artists = tr
+                    if aid not in cache:
+                        time.sleep(spotify_sleep)
+                        cache[aid] = fetch_album(aid, web_tok, cli_tok)
+
+                    # Find playcount for that track on the album page
+                    pc = 0
+                    js = cache[aid]
+                    for it in js.get("data", {}).get("albumUnion", {}).get("tracksV2", {}).get("items", []):
+                        track = it.get("track", {})
+                        cand = (track.get("uri", "") or "").split(":")[-1] if track.get("uri") else None
+                        if tid in (track.get("id"), cand):
+                            val = track.get("playcount") or 0
+                            try:
+                                pc = int(str(val).replace(",", ""))
+                            except Exception:
+                                pc = 0
+                            break
+
+                    # delta-like (prev from Airtable history if present)
+                    prev = prev_count_by_isrc(isrc, today_iso)
+                    if prev is not None and prev > 0 and pc > 0:
+                        d = pc - prev
+                        if d > 0:
+                            sum_delta_like += d
+
+                    meta = cat.get(isrc, {})
+                    artist = meta.get("artist") or sp_artists
+                    title  = meta.get("title")  or sp_title
+
                     if OUTPUT_TARGET in ("airtable", "both"):
-                        upsert_count(linkmap[isrc], isrc, today_iso, 0)
+                        upsert_count(linkmap[isrc], isrc, today_iso, pc)
                     if OUTPUT_TARGET in ("postgres", "both"):
-                        meta = cat.get(isrc, {})
-                        track_uid = db_upsert_track(cur, isrc, meta.get("artist"), meta.get("title"))
-                        db_upsert_stream(cur, "spotify", track_uid, today_iso, 0)
+                        track_uid = db_upsert_track(cur, isrc, artist, title)
+                        db_upsert_stream(cur, "spotify", track_uid, today_iso, pc)
+
+                    sum_pc += pc
                     processed += 1
-                    continue
 
-                tid, aid, sp_title, sp_artists = tr
-                if aid not in cache:
-                    time.sleep(spotify_sleep)
-                    cache[aid] = fetch_album(aid, web_tok, cli_tok)
+                except Exception as e:
+                    errors += 1
+                    logger.exception(f"[streams] error processing ISRC={isrc}: {e}")
 
-                # Find playcount for that track on the album page
-                pc = 0
-                js = cache[aid]
-                for it in js.get("data", {}).get("albumUnion", {}).get("tracksV2", {}).get("items", []):
-                    track = it.get("track", {})
-                    cand = (track.get("uri", "") or "").split(":")[-1] if track.get("uri") else None
-                    if tid in (track.get("id"), cand):
-                        val = track.get("playcount") or 0
-                        try:
-                            pc = int(str(val).replace(",", ""))
-                        except Exception:
-                            pc = 0
-                        break
+            if conn:
+                conn.commit()
+        finally:
+            if cur: cur.close()
+            if conn: conn.close()
 
-                meta = cat.get(isrc, {})
-                artist = meta.get("artist") or sp_artists
-                title  = meta.get("title")  or sp_title
+        logger.info(f"[streams] completed: processed={processed} errors={errors} date={today_iso} "
+                    f"output={OUTPUT_TARGET} sum_pc={sum_pc} sum_delta_like={sum_delta_like} attempt={attempt_idx+1}")
+        return {"processed": processed, "errors": errors, "sum_pc": sum_pc, "sum_delta_like": sum_delta_like}
 
-                if OUTPUT_TARGET in ("airtable", "both"):
-                    upsert_count(linkmap[isrc], isrc, today_iso, pc)
-                if OUTPUT_TARGET in ("postgres", "both"):
-                    track_uid = db_upsert_track(cur, isrc, artist, title)
-                    db_upsert_stream(cur, "spotify", track_uid, today_iso, pc)
+    # First attempt
+    stats = await run_once(attempt_idx=0)
 
-                processed += 1
+    # Decide retry
+    should_retry = False
+    reason = None
+    if stats["sum_delta_like"] == 0:
+        should_retry = True
+        reason = "sum_delta_like==0"
+    elif stats["sum_pc"] == 0:
+        should_retry = True
+        reason = "sum_pc==0"
 
-            except Exception as e:
-                errors += 1
-                logger.exception(f"[streams] error processing ISRC={isrc}: {e}")
-
-        if conn:
-            conn.commit()
-    finally:
-        if cur: cur.close()
-        if conn: conn.close()
-
-    logger.info(f"[streams] completed: processed={processed} errors={errors} date={today_iso} output={OUTPUT_TARGET}")
+    if should_retry and max_retries > 0:
+        logger.warning(f"[streams] retry triggered ({reason}); sleeping {retry_sleep_sec}s then refreshing tokens…")
+        time.sleep(retry_sleep_sec)
+        stats2 = await run_once(attempt_idx=1)
+        if stats2["sum_delta_like"] == 0 and stats2["sum_pc"] == 0:
+            logger.error("[streams] hard-zero after retry (both sum_delta_like and sum_pc are 0).")
+        else:
+            logger.info("[streams] retry succeeded (non-zero signal detected).")
 
 # ────────────────────────────────────────────────────────────────────────────────
 # Followers backfill / today (with logging)
