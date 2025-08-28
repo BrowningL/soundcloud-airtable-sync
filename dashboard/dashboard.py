@@ -258,7 +258,7 @@ def ui():
 <html lang="en">
 <head>
   <meta charset="utf-8" /><meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>KAIZEN — Catalogue Dashboard</title>
+  <title>KAIZEN — Streams & Playlists</title>
   <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
   <script src="https://cdn.tailwindcss.com"></script>
   <link rel="stylesheet" href="/static/styles.css" />
@@ -274,8 +274,7 @@ def ui():
     html, body { height: 100%; }
     body { margin: 0; background: #fff; color: #111; }
     .content { padding: 24px; }
-    .brand-header { display:flex; align-items:center; gap:.85rem; margin-bottom: .75rem; }
-    .brand-logo { height: 64px; width: 64px; object-fit: contain; }
+    .brand-header { display:flex; align-items:center; justify-content:space-between; margin-bottom: .75rem; }
     .brand-title { font-weight: 800; letter-spacing: -0.02em; }
     .card { background: #fff; border-radius: 16px; box-shadow: 0 10px 28px rgba(0,0,0,.08); padding: 1.1rem; }
     h2 { font-size: 1.125rem; font-weight: 600; }
@@ -283,11 +282,22 @@ def ui():
     th, td { padding:.5rem; border-bottom:1px solid rgba(0,0,0,.06); }
     .scroll { max-height: 420px; overflow:auto; }
     .kaizen-bold { font-family: "THE BOLD FONT - FREE VERSION - 2023", ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, "Helvetica Neue", Arial, "Noto Sans", "Apple Color Emoji","Segoe UI Emoji"; }
+
+    /* Dark mode */
     @media (prefers-color-scheme: dark) {
       body { background:#111; color:#f5f5f5; }
       .card { background: rgba(24,24,27,.82); color:#fff; }
       th, td { border-color: rgba(255,255,255,.08); }
       a { color: #f87171; }
+    }
+
+    /* Mobile landscape optimizations */
+    @media (max-width: 900px) and (orientation: landscape) {
+      .content { padding: 12px; }
+      .card { padding: .85rem; border-radius: 12px; }
+      h2 { font-size: 1rem; }
+      .brand-title { font-size: 1rem; }
+      canvas { max-height: 240px; }
     }
   </style>
 </head>
@@ -296,18 +306,15 @@ def ui():
 
   <div class="content max-w-7xl mx-auto">
     <header class="brand-header">
-      <img class="brand-logo" src="/static/img/kaizen_ring_red.png" alt="KAIZEN" />
-      <div>
-        <div class="brand-title text-xl sm:text-2xl">Catalogue Dashboard</div>
-        <div class="text-xs opacity-70">Timezone: {{ local_tz }}</div>
-      </div>
+      <div class="brand-title text-xl sm:text-2xl">Catalogue Dashboard</div>
+      <!-- removed logo and timezone -->
     </header>
 
-    <!-- Row 1 -->
-    <section class="grid grid-cols-1 lg:grid-cols-3 gap-6">
-      <div class="card col-span-1 lg:col-span-2">
+    <!-- Row 1: Daily Streams full width -->
+    <section class="grid grid-cols-1 gap-6">
+      <div class="card">
         <div class="flex items-center justify-between mb-3">
-          <h2>Daily Streams Δ (sum)</h2>
+          <h2>Daily Streams</h2>
           <div>
             <label class="mr-2 text-sm opacity-70">Window</label>
             <select id="streamsDays" class="border rounded px-2 py-1 text-sm">
@@ -319,7 +326,10 @@ def ui():
         </div>
         <canvas id="streamsChart" height="110"></canvas>
       </div>
+    </section>
 
+    <!-- Row 2: Playlists selector (left) + Playlist Growth (right) -->
+    <section class="grid grid-cols-1 lg:grid-cols-[320px,1fr] gap-6 mt-6">
       <div class="card">
         <h2 class="mb-3">Playlists</h2>
         <label class="text-sm opacity-70">Select playlist</label>
@@ -330,13 +340,10 @@ def ui():
           <div class="mt-2"><a id="plLink" class="underline" target="_blank" rel="noopener">Open in Spotify</a></div>
         </div>
       </div>
-    </section>
 
-    <!-- Row 2 -->
-    <section class="grid grid-cols-1 lg:grid-cols-2 gap-6 mt-6">
       <div class="card">
         <div class="flex items-center justify-between mb-3">
-          <h2>Playlist Growth (followers & daily Δ)</h2>
+          <h2>Playlist Growth</h2>
           <div>
             <label class="mr-2 text-sm opacity-70">Window</label>
             <select id="playlistDays" class="border rounded px-2 py-1 text-sm">
@@ -347,21 +354,6 @@ def ui():
           </div>
         </div>
         <canvas id="playlistChart" height="120"></canvas>
-      </div>
-
-      <div class="card">
-        <div class="flex items-center justify-between mb-3">
-          <h2>All Playlists — Followers Over Time</h2>
-          <div>
-            <label class="mr-2 text-sm opacity-70">Window</label>
-            <select id="allPlaylistsDays" class="border rounded px-2 py-1 text-sm">
-              <option value="30">30 days</option>
-              <option value="90" selected>90 days</option>
-              <option value="180">180 days</option>
-            </select>
-          </div>
-        </div>
-        <canvas id="allPlaylistsChart" height="120"></canvas>
       </div>
     </section>
 
@@ -412,7 +404,7 @@ def ui():
 
 <script>
   const DEFAULT_PLAYLIST_NAME = {{ default_playlist_name | tojson }};
-  let streamsChart, playlistChart, allPlaylistsChart, bestArtistsChart, catalogueChart;
+  let streamsChart, playlistChart, bestArtistsChart, catalogueChart; // removed allPlaylistsChart
   const fmt = (n) => Number(n).toLocaleString();
   async function api(path) { const r = await fetch(path); if (!r.ok) throw new Error(await r.text()); return r.json(); }
 
@@ -423,7 +415,8 @@ def ui():
     const cfg = {
       type: 'line',
       data: { labels: data.labels, datasets: [{ label: 'Streams Δ (sum)', data: data.values, tension: 0.3, fill: false }] },
-      options: { responsive: true, scales: { x: { ticks: { maxRotation: 0, autoSkip: true } }, y: { beginAtZero: true } },
+      options: { responsive: true, maintainAspectRatio: true,
+                 scales: { x: { ticks: { maxRotation: 0, autoSkip: true } }, y: { beginAtZero: true } },
                  plugins: { tooltip: { callbacks: { label: (c) => ' ' + fmt(c.parsed.y) } } } }
     };
     if (streamsChart) streamsChart.destroy(); streamsChart = new Chart(ctx, cfg);
@@ -458,28 +451,16 @@ def ui():
         { type: 'line', label: 'Followers', data: data.followers, yAxisID: 'y1', tension: 0.25 },
         { type: 'bar',  label: 'Daily Δ',  data: data.deltas,    yAxisID: 'y2' }
       ]},
-      options: { responsive: true, scales: {
-        x: { ticks: { maxRotation: 0, autoSkip: true } },
-        y1: { type: 'linear', position: 'left', beginAtZero: true },
-        y2: { type: 'linear', position: 'right', beginAtZero: true, grid: { drawOnChartArea: false } }
-      }, plugins: { tooltip: { callbacks: { label: (c) => ' ' + fmt(c.parsed.y) } } } }
+      options: { responsive: true, maintainAspectRatio: true,
+        scales: {
+          x: { ticks: { maxRotation: 0, autoSkip: true } },
+          y1: { type: 'linear', position: 'left', beginAtZero: true },
+          y2: { type: 'linear', position: 'right', beginAtZero: true, grid: { drawOnChartArea: false } }
+        },
+        plugins: { tooltip: { callbacks: { label: (c) => ' ' + fmt(c.parsed.y) } } }
+      }
     };
     if (playlistChart) playlistChart.destroy(); playlistChart = new Chart(ctx, cfg); await updatePlaylistCard();
-  }
-
-  // All playlists followers (multi-line)
-  async function loadAllPlaylistsChart(days) {
-    const data = await api('/api/playlists/all-series?days=' + days);
-    const ctx = document.getElementById('allPlaylistsChart').getContext('2d');
-    const datasets = data.series.map(s => ({
-      type: 'line', label: s.name, data: s.values, tension: 0.25, fill: false
-    }));
-    if (allPlaylistsChart) allPlaylistsChart.destroy();
-    allPlaylistsChart = new Chart(ctx, {
-      data: { labels: data.labels, datasets },
-      options: { responsive: true, plugins: { legend: { position: 'bottom' }, tooltip: { callbacks: { label: (c) => ' ' + fmt(c.parsed.y) } } },
-                 scales: { x: { ticks: { maxRotation: 0, autoSkip: true } }, y: { beginAtZero: true } } }
-    });
   }
 
   // Best artists today (share of total streams delta)
@@ -491,8 +472,9 @@ def ui():
     bestArtistsChart = new Chart(ctx, {
       type: 'bar',
       data: { labels: data.labels, datasets: [{ label: 'Share of Daily Streams Δ (%)', data: data.shares }] },
-      options: { responsive: true, plugins: { legend: { display: false }, tooltip: { callbacks: { label: (c) => ' ' + c.parsed.y.toFixed(2) + '%' } } },
-                 scales: { y: { beginAtZero: true, ticks: { callback: (v)=> v + '%' } } } }
+      options: { responsive: true, maintainAspectRatio: true,
+        plugins: { legend: { display: false }, tooltip: { callbacks: { label: (c) => ' ' + c.parsed.y.toFixed(2) + '%' } } },
+        scales: { y: { beginAtZero: true, ticks: { callback: (v)=> v + '%' } } } }
     });
   }
 
@@ -504,8 +486,9 @@ def ui():
     catalogueChart = new Chart(ctx, {
       type: 'line',
       data: { labels: data.labels, datasets: [{ label: 'Total tracks in catalogue', data: data.values, tension: 0.25, fill: false }] },
-      options: { responsive: true, scales: { x: { ticks: { maxRotation: 0, autoSkip: true } }, y: { beginAtZero: true } },
-                 plugins: { tooltip: { callbacks: { label: (c) => ' ' + fmt(c.parsed.y) } } } }
+      options: { responsive: true, maintainAspectRatio: true,
+        scales: { x: { ticks: { maxRotation: 0, autoSkip: true } }, y: { beginAtZero: true } },
+        plugins: { tooltip: { callbacks: { label: (c) => ' ' + fmt(c.parsed.y) } } } }
     });
     const meta = document.getElementById('catalogueMeta');
     const total = (data.values && data.values.length) ? data.values[data.values.length-1] : 0;
@@ -514,7 +497,6 @@ def ui():
 
   document.getElementById('streamsDays').addEventListener('change', e => loadStreams(e.target.value));
   document.getElementById('playlistDays').addEventListener('change', e => loadPlaylistChart(e.target.value));
-  document.getElementById('allPlaylistsDays').addEventListener('change', e => loadAllPlaylistsChart(e.target.value));
   document.getElementById('playlistSelect').addEventListener('change', async () => { await updatePlaylistCard(); await loadPlaylistChart(document.getElementById('playlistDays').value); });
   document.getElementById('btnReloadDeltas').addEventListener('click', loadDeltaTable);
 
@@ -539,7 +521,6 @@ def ui():
     await loadStreams(document.getElementById('streamsDays').value);
     await loadPlaylists();
     await loadPlaylistChart(document.getElementById('playlistDays').value);
-    await loadAllPlaylistsChart(document.getElementById('allPlaylistsDays').value);
     await loadCatalogue();
     await loadBestArtists();
     await loadDeltaDates(90);
@@ -676,7 +657,7 @@ def api_playlist_series(playlist_id: str):
     _, deltas = _fill_series([(r["d"], int(r["delta"] or 0)) for r in rows], start, end)
     return jsonify({"labels": labels, "followers": followers, "deltas": deltas})
 
-# All playlists — followers over time (multi-series)
+# (Endpoint kept though no longer used in UI)
 @app.get("/api/playlists/all-series")
 def api_playlists_all_series():
     days = _clamp_days(request.args.get("days"), 90)
