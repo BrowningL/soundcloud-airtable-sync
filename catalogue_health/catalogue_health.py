@@ -1,6 +1,17 @@
 # catalogue_health/catalogue_health.py
 
-# … imports & config unchanged …
+import os
+import uuid
+import logging
+from datetime import datetime, timezone
+from typing import Any, Dict, List, Optional
+from concurrent.futures import ThreadPoolExecutor, as_completed
+
+# Local package imports (adjust paths if your module names differ)
+from .airtable import fetch_airtable_catalogue
+from .db import bootstrap_db, persist_rows, persist_run_summary
+from .checks import check_one
+
 
 # Change default artist field:
 FIELD_ARTIST = os.getenv("FIELD_ARTIST", "Artist")  # was "Primary Artist"
