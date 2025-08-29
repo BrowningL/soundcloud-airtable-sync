@@ -111,9 +111,6 @@ def _q(query: str, params: tuple | None = None):
         try:
             _ensure_pool_open_adaptive()
             with POOL.connection() as conn:
-                # Cheap ping so we fail fast on a dead socket
-                with conn.cursor() as ping:
-                    ping.execute("SELECT 1")
                 with conn.cursor(row_factory=dict_row) as cur:
                     cur.execute(query, params)
                     return cur.fetchall() if cur.description else []
