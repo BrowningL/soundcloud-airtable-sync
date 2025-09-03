@@ -274,46 +274,126 @@ def ui():
   <meta charset="utf-8" /><meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>KAIZEN — Streams & Playlists</title>
   <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
-  <script src="https://cdn.tailwindcss.com"></script>
-  <link rel="stylesheet" href="/static/styles.css" />
-  <style>
-    /* Fixed black frame that always shows during scroll */
-    .fixed-frame {
-      position: fixed; inset: 0;
-      pointer-events: none;
-      border: 18px solid #000;
-      box-sizing: border-box;
-      z-index: 9999;
-    }
-    html, body { height: 100%; }
-    body { margin: 0; background: #fff; color: #111; }
-    .content { padding: 24px; }
-    .brand-header { display:flex; align-items:center; justify-content:space-between; margin-bottom: .75rem; }
-    .brand-title { font-weight: 800; letter-spacing: -0.02em; }
-    .card { background: #fff; border-radius: 16px; box-shadow: 0 10px 28px rgba(0,0,0,.08); padding: 1.1rem; }
-    h2 { font-size: 1.125rem; font-weight: 600; }
-    table { width:100%; border-collapse: collapse; }
-    th, td { padding:.5rem; border-bottom:1px solid rgba(0,0,0,.06); }
-    .scroll { max-height: 420px; overflow:auto; }
-    .kaizen-bold { font-family: "THE BOLD FONT - FREE VERSION - 2023", ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, "Helvetica Neue", Arial, "Noto Sans", "Apple Color Emoji","Segoe UI Emoji"; }
+<script>
+  // Read CSS variables so JS (Chart.js) matches the OS theme
+  const css = (name) => getComputedStyle(document.documentElement).getPropertyValue(name).trim();
+  function applyChartTheme(){
+    const fg      = css('--fg') || '#111';
+    const line    = css('--line') || 'rgba(0,0,0,.1)';
+    const accent  = css('--accent') || '#2563eb';
 
-    /* Dark mode */
-    @media (prefers-color-scheme: dark) {
-      body { background:#111; color:#f5f5f5; }
-      .card { background: rgba(24,24,27,.82); color:#fff; }
-      th, td { border-color: rgba(255,255,255,.08); }
-      a { color: #f87171; }
-    }
+    Chart.defaults.color = fg;
+    Chart.defaults.borderColor = line;
+    Chart.defaults.plugins.legend.labels.color = fg;
+    Chart.defaults.plugins.tooltip.titleColor = fg;
+    Chart.defaults.plugins.tooltip.bodyColor = fg;
+    Chart.defaults.plugins.tooltip.backgroundColor = 'rgba(0,0,0,.72)';
 
-    /* Mobile landscape optimizations */
-    @media (max-width: 900px) and (orientation: landscape) {
-      .content { padding: 12px; }
-      .card { padding: .85rem; border-radius: 12px; }
-      h2 { font-size: 1rem; }
-      .brand-title { font-size: 1rem; }
-      canvas { max-height: 240px; }
+    // sensible defaults for all charts
+    Chart.defaults.elements.point.radius = 3;
+    Chart.defaults.elements.line.tension = 0.3;
+
+    // Keep a global accent we can reuse
+    window.__ACCENT_COLOR__ = accent;
+  }
+  applyChartTheme();
+
+  // Live-update when macOS switches light/dark
+  const mq = window.matchMedia('(prefers-color-scheme: dark)');
+  mq.addEventListener?.('change', () => { applyChartTheme(); /* charts get recreated in your loaders */ });
+</script>
+
+<script src="https://cdn.tailwindcss.com"></script>
+<link rel="stylesheet" href="/static/styles.css" />
+<style>
+  /* Theme tokens */
+  :root{
+    --bg: #ffffff;
+    --fg: #111111;
+    --card: #ffffff;
+    --muted: rgba(0,0,0,.55);
+    --line: rgba(0,0,0,.08);
+    --accent: #2563eb;   /* chart line & links */
+    --chip: #111111;
+    --input-bg:#ffffff;
+    --input-border:#d1d5db;
+  }
+  @media (prefers-color-scheme: dark){
+    :root{
+      --bg:#0f1115;
+      --fg:#f3f4f6;
+      --card:rgba(24,24,27,.86);
+      --muted: rgba(255,255,255,.65);
+      --line: rgba(255,255,255,.12);
+      --accent:#60a5fa;
+      --chip:#f3f4f6;
+      --input-bg:#0d0f13;
+      --input-border:#2a2f3a;
     }
-  </style>
+  }
+
+  /* Layout & typography */
+  html, body { height: 100%; }
+  body {
+    margin:0;
+    background: var(--bg);
+    color: var(--fg);
+    font-family: -apple-system, system-ui, Segoe UI, Roboto, Helvetica, Arial, "Apple Color Emoji","Segoe UI Emoji";
+    -webkit-font-smoothing: antialiased; -moz-osx-font-smoothing: grayscale;
+  }
+  .content { padding: 24px; }
+  .brand-header { display:flex; align-items:center; justify-content:space-between; margin-bottom:.75rem; }
+  .brand-title { font-weight:800; letter-spacing:-0.02em; }
+
+  .card {
+    background: var(--card);
+    color: var(--fg);
+    border-radius:16px;
+    box-shadow: 0 10px 28px rgba(0,0,0,.08);
+    padding:1.1rem;
+    border:1px solid var(--line);
+  }
+  h2 { font-size:1.125rem; font-weight:600; }
+
+  /* Tables */
+  table { width:100%; border-collapse:collapse; }
+  th, td { padding:.5rem; border-bottom:1px solid var(--line); }
+  th { color: var(--muted); font-weight:600; }
+
+  /* Inputs */
+  select, button {
+    background: var(--input-bg);
+    color: var(--fg);
+    border:1px solid var(--input-border);
+    border-radius:8px;
+  }
+  button { cursor:pointer; }
+
+  a { color: var(--accent); }
+
+  .scroll { max-height:420px; overflow:auto; }
+
+  /* Remove the heavy custom font */
+  .kaizen-bold { font-family: inherit; font-weight:700; }
+
+  /* Subtle fixed frame */
+  .fixed-frame {
+    position:fixed; inset:0; pointer-events:none;
+    border:18px solid #000;
+    opacity:.9; box-sizing:border-box; z-index:9999;
+    mix-blend-mode:normal;
+  }
+
+  /* Mobile landscape */
+  @media (max-width:900px) and (orientation:landscape){
+    .content { padding:12px; }
+    .card { padding:.85rem; border-radius:12px; }
+    h2 { font-size:1rem; }
+    .brand-title { font-size:1rem; }
+    canvas { max-height:240px; }
+  }
+</style>
+
 </head>
 <body>
   <div class="fixed-frame"></div>
@@ -397,7 +477,7 @@ def ui():
     <section class="grid grid-cols-1 gap-6 mt-6">
       <div class="card">
         <div class="flex items-center justify-between mb-3">
-          <h2>Top track deltas by day</h2>
+          <h2>Best tracks today - Track deltas by day</h2>
           <div class="flex items-center gap-2">
             <label class="text-sm opacity-70">Date</label>
             <select id="deltaDate" class="border rounded px-2 py-1 text-sm"></select>
@@ -418,7 +498,7 @@ def ui():
 
 <script>
   const DEFAULT_PLAYLIST_NAME = {{ default_playlist_name | tojson }};
-  let streamsChart, playlistChart, bestArtistsChart, catalogueChart; // removed allPlaylistsChart
+  let streamsChart, playlistChart, bestArtistsChart, catalogueChart;
   const fmt = (n) => Number(n).toLocaleString();
   async function api(path) { const r = await fetch(path); if (!r.ok) throw new Error(await r.text()); return r.json(); }
 
@@ -428,10 +508,24 @@ def ui():
     const ctx = document.getElementById('streamsChart').getContext('2d');
     const cfg = {
       type: 'line',
-      data: { labels: data.labels, datasets: [{ label: 'Streams Δ (sum)', data: data.values, tension: 0.3, fill: false }] },
-      options: { responsive: true, maintainAspectRatio: true,
-                 scales: { x: { ticks: { maxRotation: 0, autoSkip: true } }, y: { beginAtZero: true } },
-                 plugins: { tooltip: { callbacks: { label: (c) => ' ' + fmt(c.parsed.y) } } } }
+      data: {
+        labels: data.labels,
+        datasets: [{
+          label: 'Streams Δ (sum)',
+          data: data.values,
+          fill: false,
+          borderColor: window.__ACCENT_COLOR__,
+          pointBackgroundColor: window.__ACCENT_COLOR__
+        }]
+      },
+      options: {
+        responsive: true, maintainAspectRatio: true,
+        scales: {
+          x: { ticks: { maxRotation: 0, autoSkip: true }, grid: { color: Chart.defaults.borderColor } },
+          y: { beginAtZero: true, grid: { color: Chart.defaults.borderColor } }
+        },
+        plugins: { tooltip: { callbacks: { label: (c) => ' ' + fmt(c.parsed.y) } } }
+      }
     };
     if (streamsChart) streamsChart.destroy(); streamsChart = new Chart(ctx, cfg);
   }
@@ -441,43 +535,69 @@ def ui():
     const list = await api('/api/playlists/list');
     const sel = document.getElementById('playlistSelect'); sel.innerHTML = '';
     let defaultId = list.length ? list[0].playlist_id : null;
-    for (const p of list) { const opt = document.createElement('option'); opt.value = p.playlist_id; opt.textContent = p.playlist_name || p.playlist_id; sel.appendChild(opt); }
+    for (const p of list) {
+      const opt = document.createElement('option');
+      opt.value = p.playlist_id; opt.textContent = p.playlist_name || p.playlist_id;
+      sel.appendChild(opt);
+    }
     const def = list.find(p => (p.playlist_name || '').toLowerCase().startsWith(DEFAULT_PLAYLIST_NAME.toLowerCase()));
-    if (def) defaultId = def.playlist_id; if (defaultId) sel.value = defaultId;
+    if (def) defaultId = def.playlist_id;
+    if (defaultId) sel.value = defaultId;
     await updatePlaylistCard(); await loadPlaylistChart(document.getElementById('playlistDays').value);
   }
 
   async function updatePlaylistCard() {
     const list = await api('/api/playlists/list');
-    const id = document.getElementById('playlistSelect').value; const p = list.find(x => x.playlist_id === id); if (!p) return;
+    const id = document.getElementById('playlistSelect').value;
+    const p = list.find(x => x.playlist_id === id); if (!p) return;
     document.getElementById('plFollowers').textContent = fmt(p.followers ?? 0);
     document.getElementById('plDelta').textContent = (p.delta == null) ? '-' : fmt(p.delta);
-    const a = document.getElementById('plLink'); a.href = p.web_url;
+    document.getElementById('plLink').href = p.web_url;
   }
 
-  // Playlist Growth (selected playlist)
+  // Playlist Growth (selected playlist) — line + bars, themed
   async function loadPlaylistChart(days) {
     const id = document.getElementById('playlistSelect').value; if (!id) return;
     const data = await api('/api/playlists/' + encodeURIComponent(id) + '/series?days=' + days);
     const ctx = document.getElementById('playlistChart').getContext('2d');
     const cfg = {
-      data: { labels: data.labels, datasets: [
-        { type: 'line', label: 'Followers', data: data.followers, yAxisID: 'y1', tension: 0.25 },
-        { type: 'bar',  label: 'Daily Δ',  data: data.deltas,    yAxisID: 'y2' }
-      ]},
-      options: { responsive: true, maintainAspectRatio: true,
+      data: {
+        labels: data.labels,
+        datasets: [
+          {
+            type: 'line',
+            label: 'Followers',
+            data: data.followers,
+            yAxisID: 'y1',
+            tension: 0.25,
+            borderColor: window.__ACCENT_COLOR__,
+            pointBackgroundColor: window.__ACCENT_COLOR__
+          },
+          {
+            type: 'bar',
+            label: 'Daily Δ',
+            data: data.deltas,
+            yAxisID: 'y2',
+            backgroundColor: window.__ACCENT_COLOR__
+          }
+        ]
+      },
+      options: {
+        responsive: true, maintainAspectRatio: true,
         scales: {
-          x: { ticks: { maxRotation: 0, autoSkip: true } },
-          y1: { type: 'linear', position: 'left', beginAtZero: true },
+          x: { ticks: { maxRotation: 0, autoSkip: true }, grid: { color: Chart.defaults.borderColor } },
+          y1: { type: 'linear', position: 'left', beginAtZero: true, grid: { color: Chart.defaults.borderColor } },
           y2: { type: 'linear', position: 'right', beginAtZero: true, grid: { drawOnChartArea: false } }
         },
         plugins: { tooltip: { callbacks: { label: (c) => ' ' + fmt(c.parsed.y) } } }
       }
     };
-    if (playlistChart) playlistChart.destroy(); playlistChart = new Chart(ctx, cfg); await updatePlaylistCard();
+    if (playlistChart) playlistChart.destroy();
+    playlistChart = new Chart(ctx, cfg);
+    await updatePlaylistCard();
   }
 
-  // Best artists today (share of total streams delta)
+  // Best artists today (share of total streams delta) — themed bars
   async function loadBestArtists() {
     const data = await api('/api/artists/top-share');
     document.getElementById('bestArtistsDateLabel').textContent = 'Date: ' + data.date;
@@ -485,35 +605,57 @@ def ui():
     if (bestArtistsChart) bestArtistsChart.destroy();
     bestArtistsChart = new Chart(ctx, {
       type: 'bar',
-      data: { labels: data.labels, datasets: [{ label: 'Share of Daily Streams Δ (%)', data: data.shares }] },
-      options: { responsive: true, maintainAspectRatio: true,
+      data: {
+        labels: data.labels,
+        datasets: [{
+          label: 'Share of Daily Streams Δ (%)',
+          data: data.shares,
+          backgroundColor: window.__ACCENT_COLOR__
+        }]
+      },
+      options: {
+        responsive: true, maintainAspectRatio: true,
         plugins: { legend: { display: false }, tooltip: { callbacks: { label: (c) => ' ' + c.parsed.y.toFixed(2) + '%' } } },
-        scales: { y: { beginAtZero: true, ticks: { callback: (v)=> v + '%' } } } }
+        scales: {
+          x: { grid: { color: Chart.defaults.borderColor } },
+          y: { beginAtZero: true, ticks: { callback: (v)=> v + '%' }, grid: { color: Chart.defaults.borderColor } }
+        }
+      }
     });
   }
 
-  // Catalogue size (Airtable, excluding "External")
+  // Catalogue size (Airtable, excluding "External") — themed line
   async function loadCatalogue() {
     const data = await api('/api/catalogue/size-series');
     const ctx = document.getElementById('catalogueChart').getContext('2d');
     if (catalogueChart) catalogueChart.destroy();
     catalogueChart = new Chart(ctx, {
       type: 'line',
-      data: { labels: data.labels, datasets: [{ label: 'Total tracks in catalogue', data: data.values, tension: 0.25, fill: false }] },
-      options: { responsive: true, maintainAspectRatio: true,
-        scales: { x: { ticks: { maxRotation: 0, autoSkip: true } }, y: { beginAtZero: true } },
-        plugins: { tooltip: { callbacks: { label: (c) => ' ' + fmt(c.parsed.y) } } } }
+      data: {
+        labels: data.labels,
+        datasets: [{
+          label: 'Total tracks in catalogue',
+          data: data.values,
+          fill: false,
+          borderColor: window.__ACCENT_COLOR__,
+          pointBackgroundColor: window.__ACCENT_COLOR__
+        }]
+      },
+      options: {
+        responsive: true, maintainAspectRatio: true,
+        scales: {
+          x: { ticks: { maxRotation: 0, autoSkip: true }, grid: { color: Chart.defaults.borderColor } },
+          y: { beginAtZero: true, grid: { color: Chart.defaults.borderColor } }
+        },
+        plugins: { tooltip: { callbacks: { label: (c) => ' ' + fmt(c.parsed.y) } } }
+      }
     });
     const meta = document.getElementById('catalogueMeta');
     const total = (data.values && data.values.length) ? data.values[data.values.length-1] : 0;
     meta.textContent = `Total: ${fmt(total)} • Range: ${data.min_date ?? '-'} → ${data.max_date ?? '-'} • Counted: ${fmt(data.count ?? 0)} (excl. 'External')`;
   }
 
-  document.getElementById('streamsDays').addEventListener('change', e => loadStreams(e.target.value));
-  document.getElementById('playlistDays').addEventListener('change', e => loadPlaylistChart(e.target.value));
-  document.getElementById('playlistSelect').addEventListener('change', async () => { await updatePlaylistCard(); await loadPlaylistChart(document.getElementById('playlistDays').value); });
-  document.getElementById('btnReloadDeltas').addEventListener('click', loadDeltaTable);
-
+  // Dates + table
   async function loadDeltaDates(days) {
     const data = await api('/api/streams/dates?days=' + days);
     const sel = document.getElementById('deltaDate'); sel.innerHTML = '';
@@ -531,6 +673,15 @@ def ui():
     });
   }
 
+  // Listeners
+  document.getElementById('streamsDays').addEventListener('change', e => loadStreams(e.target.value));
+  document.getElementById('playlistDays').addEventListener('change', e => loadPlaylistChart(e.target.value));
+  document.getElementById('playlistSelect').addEventListener('change', async () => {
+    await updatePlaylistCard(); await loadPlaylistChart(document.getElementById('playlistDays').value);
+  });
+  document.getElementById('btnReloadDeltas').addEventListener('click', loadDeltaTable);
+
+  // Bootstrap
   (async () => {
     await loadStreams(document.getElementById('streamsDays').value);
     await loadPlaylists();
@@ -541,6 +692,7 @@ def ui():
     await loadDeltaTable();
   })();
 </script>
+
 </body>
 </html>"""
     return render_template_string(
