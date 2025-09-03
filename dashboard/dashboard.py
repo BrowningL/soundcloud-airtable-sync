@@ -592,15 +592,20 @@ def api_streams_top_deltas():
         limit = int(request.args.get("limit", 10000))
     except Exception:
         limit = 10000
-    q = """
+
+    # Return normalized artist in the table (first credited name)
+    q = r"""
         SELECT
           t.isrc,
           t.title,
-          t.artist,
+          (regexp_split_to_array(
+             btrim(replace(t.artist, E'\u00D7', ' x ')),
+             '(?i)\s*(?:,|&|;|\+|x|×|with|feat\.?|featuring)\s*'
+           ))[1] AS artist_norm,
           COALESCE(s.daily_delta, 0)::bigint AS delta
         FROM streams s
         JOIN track_dim t ON t.track_uid = s.track_uid
-        WHERE s.platform='spotify'
+        WHERE s.platform = 'spotify'
           AND s.stream_date = %s
         ORDER BY COALESCE(s.daily_delta,0) DESC, t.isrc
         LIMIT %s
@@ -611,10 +616,11 @@ def api_streams_top_deltas():
         out.append({
             "isrc": r.get("isrc"),
             "title": r.get("title"),
-            "artist": r.get("artist"),
+            "artist": r.get("artist_norm"),  # show normalized
             "delta": int(r.get("delta") or 0),
         })
     return jsonify({"rows": out})
+
 
 # ── API: playlists (list + single series) ─────────────────────────────────────
 @app.get("/api/playlists/list")
@@ -708,26 +714,34 @@ def api_playlists_all_series():
 # Best artists for the latest date — share of daily delta
 @app.get("/api/artists/top-share")
 def api_artists_top_share():
-    q_latest = """
-        SELECT MAX(stream_date) AS d
-        FROM streams
-        WHERE platform='spotify'
-    """
+    # latest date
+    q_latest = "SELECT MAX(stream_date) AS d FROM streams WHERE platform='spotify'"
     r = _q(q_latest)
     latest = r[0]["d"] if r and r[0]["d"] else None
     day = request.args.get("date") or (latest.isoformat() if latest else None)
     if not day:
         return jsonify({"date": None, "labels": [], "values": [], "shares": []})
 
-    q = """
-        SELECT t.artist,
-               COALESCE(SUM(GREATEST(s.daily_delta, 0)),0)::bigint AS v
-        FROM streams s
-        JOIN track_dim t ON t.track_uid = s.track_uid
-        WHERE s.platform='spotify'
-          AND s.stream_date = %s
-        GROUP BY t.artist
-        HAVING COALESCE(SUM(GREATEST(s.daily_delta, 0)),0) > 0
+    # Normalize artist by taking the first credited name
+    # separators handled: comma, ampersand, semicolon, plus, x/×, with, feat./featuring
+    q = r"""
+        WITH base AS (
+          SELECT
+            (regexp_split_to_array(
+               btrim(replace(t.artist, E'\u00D7', ' x ')),
+               '(?i)\s*(?:,|&|;|\+|x|×|with|feat\.?|featuring)\s*'
+             ))[1] AS artist_norm,
+            GREATEST(s.daily_delta, 0)::bigint AS v
+          FROM streams s
+          JOIN track_dim t ON t.track_uid = s.track_uid
+          WHERE s.platform = 'spotify'
+            AND s.stream_date = %s
+        )
+        SELECT artist_norm AS artist,
+               COALESCE(SUM(v),0)::bigint AS v
+        FROM base
+        GROUP BY artist_norm
+        HAVING COALESCE(SUM(v),0) > 0
         ORDER BY v DESC
         LIMIT 25
     """
