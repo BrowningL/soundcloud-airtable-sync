@@ -508,22 +508,15 @@ def ui():
     const ctx = document.getElementById('streamsChart').getContext('2d');
     const cfg = {
       type: 'line',
-      data: {
-        labels: data.labels,
-        datasets: [{
-          label: 'Streams Δ (sum)',
-          data: data.values,
-          fill: false,
-          borderColor: window.__ACCENT_COLOR__,
-          pointBackgroundColor: window.__ACCENT_COLOR__
-        }]
-      },
+      data: { labels: data.labels, datasets: [{
+        label: 'Streams Δ (sum)',
+        data: data.values,
+        tension: 0.3,
+        fill: false
+      }]},
       options: {
         responsive: true, maintainAspectRatio: true,
-        scales: {
-          x: { ticks: { maxRotation: 0, autoSkip: true }, grid: { color: Chart.defaults.borderColor } },
-          y: { beginAtZero: true, grid: { color: Chart.defaults.borderColor } }
-        },
+        scales: { x: { ticks: { maxRotation: 0, autoSkip: true } }, y: { beginAtZero: true } },
         plugins: { tooltip: { callbacks: { label: (c) => ' ' + fmt(c.parsed.y) } } }
       }
     };
@@ -537,13 +530,15 @@ def ui():
     let defaultId = list.length ? list[0].playlist_id : null;
     for (const p of list) {
       const opt = document.createElement('option');
-      opt.value = p.playlist_id; opt.textContent = p.playlist_name || p.playlist_id;
+      opt.value = p.playlist_id;
+      opt.textContent = p.playlist_name || p.playlist_id;
       sel.appendChild(opt);
     }
     const def = list.find(p => (p.playlist_name || '').toLowerCase().startsWith(DEFAULT_PLAYLIST_NAME.toLowerCase()));
     if (def) defaultId = def.playlist_id;
     if (defaultId) sel.value = defaultId;
-    await updatePlaylistCard(); await loadPlaylistChart(document.getElementById('playlistDays').value);
+    await updatePlaylistCard();
+    await loadPlaylistChart(document.getElementById('playlistDays').value);
   }
 
   async function updatePlaylistCard() {
@@ -555,49 +550,31 @@ def ui():
     document.getElementById('plLink').href = p.web_url;
   }
 
-  // Playlist Growth (selected playlist) — line + bars, themed
+  // Playlist Growth
   async function loadPlaylistChart(days) {
     const id = document.getElementById('playlistSelect').value; if (!id) return;
     const data = await api('/api/playlists/' + encodeURIComponent(id) + '/series?days=' + days);
     const ctx = document.getElementById('playlistChart').getContext('2d');
     const cfg = {
-      data: {
-        labels: data.labels,
-        datasets: [
-          {
-            type: 'line',
-            label: 'Followers',
-            data: data.followers,
-            yAxisID: 'y1',
-            tension: 0.25,
-            borderColor: window.__ACCENT_COLOR__,
-            pointBackgroundColor: window.__ACCENT_COLOR__
-          },
-          {
-            type: 'bar',
-            label: 'Daily Δ',
-            data: data.deltas,
-            yAxisID: 'y2',
-            backgroundColor: window.__ACCENT_COLOR__
-          }
-        ]
-      },
+      data: { labels: data.labels, datasets: [
+        { type: 'line', label: 'Followers', data: data.followers, yAxisID: 'y1', tension: 0.25 },
+        { type: 'bar',  label: 'Daily Δ',  data: data.deltas,    yAxisID: 'y2' }
+      ]},
       options: {
         responsive: true, maintainAspectRatio: true,
         scales: {
-          x: { ticks: { maxRotation: 0, autoSkip: true }, grid: { color: Chart.defaults.borderColor } },
-          y1: { type: 'linear', position: 'left', beginAtZero: true, grid: { color: Chart.defaults.borderColor } },
+          x: { ticks: { maxRotation: 0, autoSkip: true } },
+          y1: { type: 'linear', position: 'left', beginAtZero: true },
           y2: { type: 'linear', position: 'right', beginAtZero: true, grid: { drawOnChartArea: false } }
         },
         plugins: { tooltip: { callbacks: { label: (c) => ' ' + fmt(c.parsed.y) } } }
       }
     };
-    if (playlistChart) playlistChart.destroy();
-    playlistChart = new Chart(ctx, cfg);
+    if (playlistChart) playlistChart.destroy(); playlistChart = new Chart(ctx, cfg);
     await updatePlaylistCard();
   }
 
-  // Best artists today (share of total streams delta) — themed bars
+  // Best artists today
   async function loadBestArtists() {
     const data = await api('/api/artists/top-share');
     document.getElementById('bestArtistsDateLabel').textContent = 'Date: ' + data.date;
@@ -605,48 +582,34 @@ def ui():
     if (bestArtistsChart) bestArtistsChart.destroy();
     bestArtistsChart = new Chart(ctx, {
       type: 'bar',
-      data: {
-        labels: data.labels,
-        datasets: [{
-          label: 'Share of Daily Streams Δ (%)',
-          data: data.shares,
-          backgroundColor: window.__ACCENT_COLOR__
-        }]
-      },
+      data: { labels: data.labels, datasets: [{
+        label: 'Share of Daily Streams Δ (%)',
+        data: data.shares
+      }]},
       options: {
         responsive: true, maintainAspectRatio: true,
         plugins: { legend: { display: false }, tooltip: { callbacks: { label: (c) => ' ' + c.parsed.y.toFixed(2) + '%' } } },
-        scales: {
-          x: { grid: { color: Chart.defaults.borderColor } },
-          y: { beginAtZero: true, ticks: { callback: (v)=> v + '%' }, grid: { color: Chart.defaults.borderColor } }
-        }
+        scales: { y: { beginAtZero: true, ticks: { callback: (v)=> v + '%' } } }
       }
     });
   }
 
-  // Catalogue size (Airtable, excluding "External") — themed line
+  // Catalogue size
   async function loadCatalogue() {
     const data = await api('/api/catalogue/size-series');
     const ctx = document.getElementById('catalogueChart').getContext('2d');
     if (catalogueChart) catalogueChart.destroy();
     catalogueChart = new Chart(ctx, {
       type: 'line',
-      data: {
-        labels: data.labels,
-        datasets: [{
-          label: 'Total tracks in catalogue',
-          data: data.values,
-          fill: false,
-          borderColor: window.__ACCENT_COLOR__,
-          pointBackgroundColor: window.__ACCENT_COLOR__
-        }]
-      },
+      data: { labels: data.labels, datasets: [{
+        label: 'Total tracks in catalogue',
+        data: data.values,
+        tension: 0.25,
+        fill: false
+      }]},
       options: {
         responsive: true, maintainAspectRatio: true,
-        scales: {
-          x: { ticks: { maxRotation: 0, autoSkip: true }, grid: { color: Chart.defaults.borderColor } },
-          y: { beginAtZero: true, grid: { color: Chart.defaults.borderColor } }
-        },
+        scales: { x: { ticks: { maxRotation: 0, autoSkip: true } }, y: { beginAtZero: true } },
         plugins: { tooltip: { callbacks: { label: (c) => ' ' + fmt(c.parsed.y) } } }
       }
     });
@@ -659,7 +622,9 @@ def ui():
   async function loadDeltaDates(days) {
     const data = await api('/api/streams/dates?days=' + days);
     const sel = document.getElementById('deltaDate'); sel.innerHTML = '';
-    for (const d of data.dates) { const opt = document.createElement('option'); opt.value = d; opt.textContent = d; sel.appendChild(opt); }
+    for (const d of data.dates) {
+      const opt = document.createElement('option'); opt.value = d; opt.textContent = d; sel.appendChild(opt);
+    }
     if (data.dates.length) sel.value = data.dates[0];
   }
   async function loadDeltaTable() {
@@ -692,6 +657,7 @@ def ui():
     await loadDeltaTable();
   })();
 </script>
+
 
 </body>
 </html>"""
