@@ -36,7 +36,7 @@ logger.setLevel(logging.INFO)
 
 app = Flask(__name__)  # serves /static/* by default
 
-# ── DB pool (adaptive SSL + reconnect) ────────────────────────────────────────
+# ── DB pool (adaptive SSL + reconnect, upgraded with retries) ──────────────────
 import psycopg
 from psycopg.rows import dict_row
 from psycopg_pool import ConnectionPool, PoolTimeout, PoolClosed
@@ -45,10 +45,8 @@ _URL_HAS_SSLMODE = ("sslmode=" in DATABASE_URL.lower())
 
 def _build_pool(sslmode: Optional[str]) -> ConnectionPool:
     kwargs: Dict[str, Any] = {}
-    # Respect explicit sslmode from URL; only set when not pinned in the URL.
     if sslmode:
         kwargs["sslmode"] = sslmode  # 'require' | 'prefer' | 'disable'
-    # TCP keepalives to detect dead peers
     kwargs.update({
         "keepalives": 1,
         "keepalives_idle": 30,
@@ -61,20 +59,25 @@ def _build_pool(sslmode: Optional[str]) -> ConnectionPool:
         min_size=1,
         max_size=int(os.getenv("DB_POOL_MAX", "5")),
         timeout=int(os.getenv("DB_TIMEOUT_SECS", "10")),  # wait for free conn
-        max_lifetime=int(os.getenv("DB_MAX_LIFETIME_SECS", "3600")),  # recycle hourly
-        max_idle=int(os.getenv("DB_MAX_IDLE_SECS", "300")),           # recycle after 5m idle
+        max_lifetime=int(os.getenv("DB_MAX_LIFETIME_SECS", "300")),   # recycle faster
+        max_idle=int(os.getenv("DB_MAX_IDLE_SECS", "120")),           # recycle idle conns
         open=False,  # lazy-open
     )
 
-# Initial sslmode: if URL pins it, let libpq decide; else use env (default 'prefer')
 DEFAULT_SSLMODE = None if _URL_HAS_SSLMODE else os.getenv("DB_SSLMODE", "prefer").lower()
 POOL = _build_pool(DEFAULT_SSLMODE)
 
+def _rebuild_pool(force_sslmode: Optional[str] = None):
+    global POOL
+    try:
+        POOL.close()
+    except Exception:
+        pass
+    time.sleep(0.25)
+    sslmode = force_sslmode if force_sslmode is not None else DEFAULT_SSLMODE
+    POOL = _build_pool(sslmode)
+
 def _ensure_pool_open_adaptive():
-    """
-    Open the pool. If the server explicitly rejects SSL, rebuild with sslmode=disable.
-    Only adapts when sslmode isn't pinned inside DATABASE_URL.
-    """
     global POOL
     try:
         POOL.open()
@@ -83,42 +86,56 @@ def _ensure_pool_open_adaptive():
         msg = str(e).lower()
         if (not _URL_HAS_SSLMODE) and ("server does not support ssl" in msg or "ssl was required" in msg):
             logger.warning("DB reports SSL mismatch; rebuilding pool with sslmode=disable")
-            try:
-                POOL.close()
-            except Exception:
-                pass
-            POOL = _build_pool("disable")
+            _rebuild_pool("disable")
             POOL.open()
             return
         raise
 
-def _reopen_pool():
-    global POOL
+def _warm_conn(conn: psycopg.Connection):
+    """Run lightweight safety commands to ensure the connection is alive."""
+    conn.execute("SET statement_timeout = 20000")
+    conn.execute("SET idle_in_transaction_session_timeout = 0")
+    conn.execute("SELECT 1")
+
+def _soft_reopen_pool():
     try:
         POOL.close()
     except Exception:
         pass
-    time.sleep(0.25)
+    time.sleep(0.3)
     _ensure_pool_open_adaptive()
 
 def _q(query: str, params: tuple | None = None):
     """
-    Read-only query with one reconnect retry if the connection was dropped or the pool timed out.
-    Returns list of dict rows. Raises on repeated failure (so callers surface 500).
+    Safe query runner with retries.
+    - Attempts up to 3 times.
+    - Soft reopen first, full rebuild second, else raise.
     """
     params = params or ()
-    for attempt in (1, 2):
+    exc: Optional[Exception] = None
+    for attempt in (1, 2, 3):
         try:
             _ensure_pool_open_adaptive()
             with POOL.connection() as conn:
+                _warm_conn(conn)
                 with conn.cursor(row_factory=dict_row) as cur:
                     cur.execute(query, params)
                     return cur.fetchall() if cur.description else []
         except (psycopg.OperationalError, psycopg.InterfaceError, PoolTimeout, PoolClosed) as e:
-            logger.warning("DB op failed (%s). Attempt %d/2", e.__class__.__name__, attempt)
-            if attempt == 2:
-                raise
-            _reopen_pool()
+            exc = e
+            logger.warning("DB op failed (%s). Attempt %d/3", e.__class__.__name__, attempt)
+            if attempt == 1:
+                _soft_reopen_pool(); time.sleep(0.2)
+            elif attempt == 2:
+                _rebuild_pool()
+                try:
+                    POOL.open()
+                except Exception:
+                    pass
+                time.sleep(0.35)
+            else:
+                break
+    raise exc if exc else RuntimeError("DB query failed unexpectedly")
 
 # ── Series helpers ────────────────────────────────────────────────────────────
 def _daterange(start: date, end: date) -> List[date]:
