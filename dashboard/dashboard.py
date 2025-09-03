@@ -58,10 +58,10 @@ def _build_pool(sslmode: Optional[str]) -> ConnectionPool:
         kwargs=kwargs,
         min_size=1,
         max_size=int(os.getenv("DB_POOL_MAX", "5")),
-        timeout=int(os.getenv("DB_TIMEOUT_SECS", "10")),  # wait for free conn
-        max_lifetime=int(os.getenv("DB_MAX_LIFETIME_SECS", "300")),   # recycle faster
-        max_idle=int(os.getenv("DB_MAX_IDLE_SECS", "120")),           # recycle idle conns
-        open=False,  # lazy-open
+        timeout=int(os.getenv("DB_TIMEOUT_SECS", "10")),
+        max_lifetime=int(os.getenv("DB_MAX_LIFETIME_SECS", "300")),
+        max_idle=int(os.getenv("DB_MAX_IDLE_SECS", "120")),
+        open=False,
     )
 
 DEFAULT_SSLMODE = None if _URL_HAS_SSLMODE else os.getenv("DB_SSLMODE", "prefer").lower()
@@ -92,7 +92,6 @@ def _ensure_pool_open_adaptive():
         raise
 
 def _warm_conn(conn: psycopg.Connection):
-    """Run lightweight safety commands to ensure the connection is alive."""
     conn.execute("SET statement_timeout = 20000")
     conn.execute("SET idle_in_transaction_session_timeout = 0")
     conn.execute("SELECT 1")
@@ -106,11 +105,6 @@ def _soft_reopen_pool():
     _ensure_pool_open_adaptive()
 
 def _q(query: str, params: tuple | None = None):
-    """
-    Safe query runner with retries.
-    - Attempts up to 3 times.
-    - Soft reopen first, full rebuild second, else raise.
-    """
     params = params or ()
     exc: Optional[Exception] = None
     for attempt in (1, 2, 3):
@@ -157,7 +151,7 @@ def _clamp_days(raw: str | None, default: int = 90, min_d: int = 1, max_d: int =
         v = default
     return min(max(v, min_d), max_d)
 
-# ── Airtable helpers (catalogue size, excluding External distributor) ─────────
+# ── Airtable helpers ──────────────────────────────────────────────────────────
 def _airtable_enabled() -> bool:
     return bool(AIRTABLE_API_KEY and AIRTABLE_BASE_ID)
 
@@ -168,7 +162,6 @@ _airtable_cache: Dict[str, Any] = {
 }
 
 def _http_get_json(url: str, headers: Dict[str, str], params: Dict[str, Any], timeout: float = 30.0) -> Dict[str, Any]:
-    # Support fields[] arrays
     query = urllib.parse.urlencode(
         [(k, v) for k, vv in params.items() for v in (vv if isinstance(vv, list) else [vv])]
     )
@@ -178,9 +171,7 @@ def _http_get_json(url: str, headers: Dict[str, str], params: Dict[str, Any], ti
         return json.loads(resp.read().decode("utf-8"))
 
 def _fetch_catalogue_cumulative():
-    """Return (labels, values, min_date, max_date, total_count, ok, error)"""
     now = datetime.utcnow()
-    # serve cached if fresh
     if _airtable_cache["at"] and (now - _airtable_cache["at"]).total_seconds() < AIRTABLE_CACHE_TTL_SECS:
         return (
             _airtable_cache["labels"], _airtable_cache["values"],
@@ -196,8 +187,6 @@ def _fetch_catalogue_cumulative():
     base_url = f"https://api.airtable.com/v0/{AIRTABLE_BASE_ID}/{urllib.parse.quote(AIRTABLE_TABLE_NAME)}"
     headers = {"Authorization": f"Bearer {AIRTABLE_API_KEY}"}
 
-    # Only records with a Release Date and Distributor != 'External'
-    # Note: blanks are included (NOT(field = 'External')) evaluates true if field blank.
     formula = f"AND({{{AIRTABLE_RELEASE_DATE_FIELD}}}, NOT({{{AIRTABLE_DISTRIBUTOR_FIELD}}} = '{AIRTABLE_EXCLUDED_DISTRIBUTOR}'))"
 
     params = {
@@ -223,7 +212,6 @@ def _fetch_catalogue_cumulative():
                 raw = (rec.get("fields", {}) or {}).get(AIRTABLE_RELEASE_DATE_FIELD)
                 if not raw:
                     continue
-                # Accept date-only or ISO datetime
                 try:
                     d = date.fromisoformat(raw[:10])
                 except Exception:
@@ -277,23 +265,24 @@ def ui():
   <script src="https://cdn.tailwindcss.com"></script>
   <link rel="stylesheet" href="/static/styles.css" />
   <style>
-    /* Fixed black frame that always shows during scroll */
-    .fixed-frame {
-      position: fixed; inset: 0;
-      pointer-events: none;
-      border: 18px solid #000;
-      box-sizing: border-box;
-      z-index: 9999;
-    }
+    /* Force a clean system font everywhere */
+    :root { --ui-font: -apple-system, system-ui, Segoe UI, Roboto, Helvetica, Arial, "Apple Color Emoji","Segoe UI Emoji"; }
     html, body { height: 100%; }
     body {
       margin: 0;
       background: #fff;
       color: #111;
-      /* System font stack (font tweak requested) */
-      font-family: -apple-system, system-ui, Segoe UI, Roboto, Helvetica, Arial, "Apple Color Emoji","Segoe UI Emoji";
+      font-family: var(--ui-font);
       -webkit-font-smoothing: antialiased; -moz-osx-font-smoothing: grayscale;
     }
+    /* Ensure ALL elements use the system font */
+    *, *::before, *::after,
+    button, input, select, textarea, label, table, th, td, h1, h2, h3, h4, h5, h6 {
+      font-family: var(--ui-font) !important;
+    }
+
+    /* Frame & layout */
+    .fixed-frame { position: fixed; inset: 0; pointer-events: none; border: 18px solid #000; box-sizing: border-box; z-index: 9999; }
     .content { padding: 24px; }
     .brand-header { display:flex; align-items:center; justify-content:space-between; margin-bottom: .75rem; }
     .brand-title { font-weight: 800; letter-spacing: -0.02em; }
@@ -302,9 +291,9 @@ def ui():
     table { width:100%; border-collapse: collapse; }
     th, td { padding:.5rem; border-bottom:1px solid rgba(0,0,0,.06); }
     .scroll { max-height: 420px; overflow:auto; }
-    .kaizen-bold { font-family: inherit; font-weight: 700; }
+    .kaizen-bold { font-family: var(--ui-font) !important; font-weight: 700; }
 
-    /* Dark mode (original simple styling only for layout; charts use defaults) */
+    /* Optional dark background for the container; charts keep defaults */
     @media (prefers-color-scheme: dark) {
       body { background:#111; color:#f5f5f5; }
       .card { background: rgba(24,24,27,.82); color:#fff; }
@@ -312,7 +301,6 @@ def ui():
       a { color: #f87171; }
     }
 
-    /* Mobile landscape */
     @media (max-width: 900px) and (orientation: landscape) {
       .content { padding: 12px; }
       .card { padding: .85rem; border-radius: 12px; }
@@ -428,7 +416,7 @@ def ui():
   const fmt = (n) => Number(n).toLocaleString();
   async function api(path) { const r = await fetch(path); if (!r.ok) throw new Error(await r.text()); return r.json(); }
 
-  // Streams (LINE chart) — Chart.js defaults (original colors)
+  // Streams (Chart.js defaults)
   async function loadStreams(days) {
     const data = await api('/api/streams/total-daily?days=' + days);
     const ctx = document.getElementById('streamsChart').getContext('2d');
@@ -461,7 +449,7 @@ def ui():
     document.getElementById('plLink').href = p.web_url;
   }
 
-  // Playlist Growth (selected playlist) — defaults
+  // Playlist Growth (defaults)
   async function loadPlaylistChart(days) {
     const id = document.getElementById('playlistSelect').value; if (!id) return;
     const data = await api('/api/playlists/' + encodeURIComponent(id) + '/series?days=' + days);
@@ -483,7 +471,7 @@ def ui():
     if (playlistChart) playlistChart.destroy(); playlistChart = new Chart(ctx, cfg); await updatePlaylistCard();
   }
 
-  // Best artists today — defaults
+  // Best artists (defaults)
   async function loadBestArtists() {
     const data = await api('/api/artists/top-share');
     document.getElementById('bestArtistsDateLabel').textContent = 'Date: ' + data.date;
@@ -498,7 +486,7 @@ def ui():
     });
   }
 
-  // Catalogue size — defaults
+  // Catalogue size (defaults)
   async function loadCatalogue() {
     const data = await api('/api/catalogue/size-series');
     const ctx = document.getElementById('catalogueChart').getContext('2d');
@@ -602,7 +590,6 @@ def api_streams_top_deltas():
     except Exception:
         limit = 10000
 
-    # Return normalized artist in the table (first credited name)
     q = r"""
         SELECT
           t.isrc,
@@ -630,7 +617,7 @@ def api_streams_top_deltas():
         })
     return jsonify({"rows": out})
 
-# ── API: playlists (list + single series) ─────────────────────────────────────
+# ── API: playlists ────────────────────────────────────────────────────────────
 @app.get("/api/playlists/list")
 def api_playlists_list():
     q = """
@@ -685,7 +672,6 @@ def api_playlist_series(playlist_id: str):
     _, deltas = _fill_series([(r["d"], int(r["delta"] or 0)) for r in rows], start, end)
     return jsonify({"labels": labels, "followers": followers, "deltas": deltas})
 
-# (Endpoint kept though no longer used in UI)
 @app.get("/api/playlists/all-series")
 def api_playlists_all_series():
     days = _clamp_days(request.args.get("days"), 90)
@@ -719,7 +705,7 @@ def api_playlists_all_series():
 
     return jsonify({"labels": labels_base, "series": series})
 
-# Best artists for the latest date — share of daily delta (with artist normalization)
+# Best artists — share of daily delta
 @app.get("/api/artists/top-share")
 def api_artists_top_share():
     q_latest = "SELECT MAX(stream_date) AS d FROM streams WHERE platform='spotify'"
@@ -758,7 +744,7 @@ def api_artists_top_share():
     shares = [round(v * 100.0 / total, 2) for v in values]
     return jsonify({"date": day, "labels": labels, "values": values, "shares": shares})
 
-# Catalogue size series API (Airtable, distributor != 'External')
+# Catalogue size series API
 @app.get("/api/catalogue/size-series")
 def api_catalogue_size_series():
     labels, values, min_d, max_d, total, ok, err = _fetch_catalogue_cumulative()
