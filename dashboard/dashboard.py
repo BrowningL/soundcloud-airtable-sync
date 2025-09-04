@@ -36,43 +36,54 @@ logger.setLevel(logging.INFO)
 
 app = Flask(__name__)  # serves /static/* by default
 
-# ── DB pool (adaptive SSL + reconnect, upgraded with retries) ──────────────────
+# ── DB pool (adaptive SSL + reconnect, hardened against stale conns) ──────────
 import psycopg
+from psycopg import errors as pg_errors
 from psycopg.rows import dict_row
 from psycopg_pool import ConnectionPool, PoolTimeout, PoolClosed
+from contextlib import suppress
 
 _URL_HAS_SSLMODE = ("sslmode=" in DATABASE_URL.lower())
 
-def _build_pool(sslmode: Optional[str]) -> ConnectionPool:
+def _pool_kwargs(sslmode: Optional[str]) -> Dict[str, Any]:
     kwargs: Dict[str, Any] = {}
     if sslmode:
         kwargs["sslmode"] = sslmode  # 'require' | 'prefer' | 'disable'
+    # TCP keepalives to detect half-open sockets
     kwargs.update({
         "keepalives": 1,
         "keepalives_idle": 30,
         "keepalives_interval": 10,
         "keepalives_count": 5,
     })
-    return ConnectionPool(
+    return kwargs
+
+def _build_pool(sslmode: Optional[str]) -> ConnectionPool:
+    base_args = dict(
         conninfo=DATABASE_URL,
-        kwargs=kwargs,
+        kwargs=_pool_kwargs(sslmode),
         min_size=1,
         max_size=int(os.getenv("DB_POOL_MAX", "5")),
         timeout=int(os.getenv("DB_TIMEOUT_SECS", "10")),
-        max_lifetime=int(os.getenv("DB_MAX_LIFETIME_SECS", "300")),
-        max_idle=int(os.getenv("DB_MAX_IDLE_SECS", "120")),
+        # Recycle before providers (Railway/Cloud) kill idle conns
+        max_lifetime=int(os.getenv("DB_MAX_LIFETIME_SECS", "240")),
+        max_idle=int(os.getenv("DB_MAX_IDLE_SECS", "90")),
         open=False,
     )
+
+    # psycopg_pool >= 3.2.0 supports reconnect=True; guard for older versions
+    try:
+        return ConnectionPool(reconnect=True, **base_args)
+    except TypeError:
+        return ConnectionPool(**base_args)
 
 DEFAULT_SSLMODE = None if _URL_HAS_SSLMODE else os.getenv("DB_SSLMODE", "prefer").lower()
 POOL = _build_pool(DEFAULT_SSLMODE)
 
 def _rebuild_pool(force_sslmode: Optional[str] = None):
     global POOL
-    try:
+    with suppress(Exception):
         POOL.close()
-    except Exception:
-        pass
     time.sleep(0.25)
     sslmode = force_sslmode if force_sslmode is not None else DEFAULT_SSLMODE
     POOL = _build_pool(sslmode)
@@ -84,6 +95,7 @@ def _ensure_pool_open_adaptive():
         return
     except Exception as e:
         msg = str(e).lower()
+        # Auto-toggle SSL mode if the server complains
         if (not _URL_HAS_SSLMODE) and ("server does not support ssl" in msg or "ssl was required" in msg):
             logger.warning("DB reports SSL mismatch; rebuilding pool with sslmode=disable")
             _rebuild_pool("disable")
@@ -92,19 +104,46 @@ def _ensure_pool_open_adaptive():
         raise
 
 def _warm_conn(conn: psycopg.Connection):
-    conn.execute("SET statement_timeout = 20000")
-    conn.execute("SET idle_in_transaction_session_timeout = 0")
-    conn.execute("SELECT 1")
+    """
+    Run lightweight session setup safely.
+    Use autocommit and a cursor so we don't leave a txn open.
+    If anything fails, close this connection so the pool discards it.
+    """
+    if getattr(conn, "closed", False):
+        raise psycopg.OperationalError("connection already closed")
+
+    # Use autocommit just for the warm-up
+    prev_ac = getattr(conn, "autocommit", False)
+    try:
+        conn.autocommit = True
+        with conn.cursor() as cur:
+            cur.execute("SET statement_timeout = 20000")
+            cur.execute("SET idle_in_transaction_session_timeout = 0")
+            cur.execute("SELECT 1")
+    except Exception:
+        with suppress(Exception):
+            conn.close()  # force discard of this bad connection
+        raise
+    finally:
+        # Restore previous autocommit state
+        with suppress(Exception):
+            conn.autocommit = prev_ac
 
 def _soft_reopen_pool():
-    try:
+    with suppress(Exception):
         POOL.close()
-    except Exception:
-        pass
-    time.sleep(0.3)
+    time.sleep(0.35)
     _ensure_pool_open_adaptive()
 
 def _q(query: str, params: tuple | None = None):
+    """
+    Execute a read-only query with robust retries.
+    Strategy:
+      1) Try with current pool.
+      2) If we see OperationalError/InterfaceError/PoolTimeout/PoolClosed,
+         close & reopen pool.
+      3) Final attempt: rebuild pool (recycle all conns).
+    """
     params = params or ()
     exc: Optional[Exception] = None
     for attempt in (1, 2, 3):
@@ -119,17 +158,21 @@ def _q(query: str, params: tuple | None = None):
             exc = e
             logger.warning("DB op failed (%s). Attempt %d/3", e.__class__.__name__, attempt)
             if attempt == 1:
-                _soft_reopen_pool(); time.sleep(0.2)
+                _soft_reopen_pool()
+                time.sleep(0.25)
             elif attempt == 2:
                 _rebuild_pool()
-                try:
+                with suppress(Exception):
                     POOL.open()
-                except Exception:
-                    pass
-                time.sleep(0.35)
+                time.sleep(0.4)
             else:
                 break
+        except Exception as e:
+            # Non-recoverable SQL/logic errors: don't loop forever
+            exc = e
+            break
     raise exc if exc else RuntimeError("DB query failed unexpectedly")
+
 
 # ── Series helpers ────────────────────────────────────────────────────────────
 def _daterange(start: date, end: date) -> List[date]:
