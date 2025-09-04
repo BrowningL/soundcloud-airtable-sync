@@ -637,10 +637,12 @@ def api_streams_top_deltas():
         SELECT
           t.isrc,
           t.title,
-          (regexp_split_to_array(
-             btrim(replace(t.artist, E'\u00D7', ' x ')),
-             '(?i)\s*(?:,|&|;|\+|x|×|with|feat\.?|featuring)\s*'
-           ))[1] AS artist_norm,
+          (
+            regexp_split_to_array(
+              btrim(t.artist),
+              '(?i)\s*(?:,|&|with|feat\.?|featuring)\s*'
+            )
+          )[1] AS artist_norm,
           COALESCE(s.daily_delta, 0)::bigint AS delta
         FROM streams s
         JOIN track_dim t ON t.track_uid = s.track_uid
@@ -761,10 +763,12 @@ def api_artists_top_share():
     q = r"""
         WITH base AS (
           SELECT
-            (regexp_split_to_array(
-               btrim(replace(t.artist, E'\u00D7', ' x ')),
-               '(?i)\s*(?:,|&|;|\+|x|×|with|feat\.?|featuring)\s*'
-             ))[1] AS artist_norm,
+            (
+              regexp_split_to_array(
+                btrim(t.artist),
+                '(?i)\s*(?:,|&|with|feat\.?|featuring)\s*'
+              )
+            )[1] AS artist_norm,
             GREATEST(s.daily_delta, 0)::bigint AS v
           FROM streams s
           JOIN track_dim t ON t.track_uid = s.track_uid
@@ -786,6 +790,7 @@ def api_artists_top_share():
     values = [int(r["v"]) for r in rows]
     shares = [round(v * 100.0 / total, 2) for v in values]
     return jsonify({"date": day, "labels": labels, "values": values, "shares": shares})
+
 
 # Catalogue size series API
 @app.get("/api/catalogue/size-series")
