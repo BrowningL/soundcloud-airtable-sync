@@ -36,26 +36,49 @@ logger.setLevel(logging.INFO)
 
 app = Flask(__name__)  # serves /static/* by default
 
-# ── DB pool (adaptive SSL + reconnect, hardened against stale conns) ──────────
+# ── DB access (pool with circuit-breaker to fresh connections) ────────────────
 import psycopg
-from psycopg import errors as pg_errors
 from psycopg.rows import dict_row
 from psycopg_pool import ConnectionPool, PoolTimeout, PoolClosed
 from contextlib import suppress
+import random
 
 _URL_HAS_SSLMODE = ("sslmode=" in DATABASE_URL.lower())
+DEFAULT_SSLMODE = None if _URL_HAS_SSLMODE else os.getenv("DB_SSLMODE", "prefer").lower()
+
+DB_CONNECT_TIMEOUT = int(os.getenv("DB_CONNECT_TIMEOUT_SECS", "10"))
+DB_POOL_MAX = int(os.getenv("DB_POOL_MAX", "5"))
+DB_TIMEOUT_SECS = int(os.getenv("DB_TIMEOUT_SECS", "10"))
+DB_MAX_LIFETIME_SECS = int(os.getenv("DB_MAX_LIFETIME_SECS", "240"))
+DB_MAX_IDLE_SECS = int(os.getenv("DB_MAX_IDLE_SECS", "90"))
+# If set, always bypass pool:
+DB_NO_POOL = os.getenv("DB_NO_POOL", "0") == "1"
+
+# After we see a fatal socket error, bypass the pool for this long:
+DIRECT_MODE_COOLDOWN_SECS = int(os.getenv("DB_DIRECT_COOLDOWN_SECS", "300"))
+
+_DIRECT_MODE_UNTIL: float | None = None  # epoch seconds; None = pool mode
+
+FATAL_IO_SNIPPETS = (
+    "consuming input failed",
+    "server closed the connection unexpectedly",
+    "connection already closed",
+    "connection not open",
+)
+
+def _now() -> float:
+    return time.time()
 
 def _pool_kwargs(sslmode: Optional[str]) -> Dict[str, Any]:
-    kwargs: Dict[str, Any] = {}
+    # Apply statement timeouts at connect time (no warm-up SETs)
+    kwargs: Dict[str, Any] = {
+        "options": "-c statement_timeout=20000 -c idle_in_transaction_session_timeout=0",
+        "connect_timeout": DB_CONNECT_TIMEOUT,
+        # TCP keepalives help detect half-open sockets
+        "keepalives": 1, "keepalives_idle": 30, "keepalives_interval": 10, "keepalives_count": 5,
+    }
     if sslmode:
-        kwargs["sslmode"] = sslmode  # 'require' | 'prefer' | 'disable'
-    # TCP keepalives to detect half-open sockets
-    kwargs.update({
-        "keepalives": 1,
-        "keepalives_idle": 30,
-        "keepalives_interval": 10,
-        "keepalives_count": 5,
-    })
+        kwargs["sslmode"] = sslmode  # 'require'|'prefer'|'disable'
     return kwargs
 
 def _build_pool(sslmode: Optional[str]) -> ConnectionPool:
@@ -63,21 +86,17 @@ def _build_pool(sslmode: Optional[str]) -> ConnectionPool:
         conninfo=DATABASE_URL,
         kwargs=_pool_kwargs(sslmode),
         min_size=1,
-        max_size=int(os.getenv("DB_POOL_MAX", "5")),
-        timeout=int(os.getenv("DB_TIMEOUT_SECS", "10")),
-        # Recycle before providers (Railway/Cloud) kill idle conns
-        max_lifetime=int(os.getenv("DB_MAX_LIFETIME_SECS", "240")),
-        max_idle=int(os.getenv("DB_MAX_IDLE_SECS", "90")),
+        max_size=DB_POOL_MAX,
+        timeout=DB_TIMEOUT_SECS,
+        max_lifetime=DB_MAX_LIFETIME_SECS,
+        max_idle=DB_MAX_IDLE_SECS,
         open=False,
     )
-
-    # psycopg_pool >= 3.2.0 supports reconnect=True; guard for older versions
     try:
-        return ConnectionPool(reconnect=True, **base_args)
+        return ConnectionPool(reconnect=True, **base_args)  # psycopg_pool >=3.2
     except TypeError:
         return ConnectionPool(**base_args)
 
-DEFAULT_SSLMODE = None if _URL_HAS_SSLMODE else os.getenv("DB_SSLMODE", "prefer").lower()
 POOL = _build_pool(DEFAULT_SSLMODE)
 
 def _rebuild_pool(force_sslmode: Optional[str] = None):
@@ -89,89 +108,115 @@ def _rebuild_pool(force_sslmode: Optional[str] = None):
     POOL = _build_pool(sslmode)
 
 def _ensure_pool_open_adaptive():
-    global POOL
     try:
         POOL.open()
-        return
     except Exception as e:
         msg = str(e).lower()
-        # Auto-toggle SSL mode if the server complains
         if (not _URL_HAS_SSLMODE) and ("server does not support ssl" in msg or "ssl was required" in msg):
             logger.warning("DB reports SSL mismatch; rebuilding pool with sslmode=disable")
             _rebuild_pool("disable")
             POOL.open()
-            return
-        raise
+        else:
+            raise
 
-def _warm_conn(conn: psycopg.Connection):
-    """
-    Run lightweight session setup safely.
-    Use autocommit and a cursor so we don't leave a txn open.
-    If anything fails, close this connection so the pool discards it.
-    """
-    if getattr(conn, "closed", False):
-        raise psycopg.OperationalError("connection already closed")
+def _is_fatal_io_error(e: Exception) -> bool:
+    s = str(e).lower()
+    return any(sn in s for sn in FATAL_IO_SNIPPETS)
 
-    # Use autocommit just for the warm-up
-    prev_ac = getattr(conn, "autocommit", False)
-    try:
-        conn.autocommit = True
-        with conn.cursor() as cur:
-            cur.execute("SET statement_timeout = 20000")
-            cur.execute("SET idle_in_transaction_session_timeout = 0")
-            cur.execute("SELECT 1")
-    except Exception:
-        with suppress(Exception):
-            conn.close()  # force discard of this bad connection
-        raise
-    finally:
-        # Restore previous autocommit state
-        with suppress(Exception):
-            conn.autocommit = prev_ac
+def _enter_direct_mode():
+    global _DIRECT_MODE_UNTIL
+    _DIRECT_MODE_UNTIL = _now() + DIRECT_MODE_COOLDOWN_SECS
+    logger.warning("Entering DIRECT DB mode for %d seconds (fresh connection per query).",
+                   DIRECT_MODE_COOLDOWN_SECS)
 
-def _soft_reopen_pool():
-    with suppress(Exception):
-        POOL.close()
-    time.sleep(0.35)
-    _ensure_pool_open_adaptive()
+def _direct_query(query: str, params: tuple):
+    """
+    Fresh connection per call, with retries and jitter.
+    Autocommit, no session warm-up.
+    """
+    kwargs = _pool_kwargs(DEFAULT_SSLMODE)
+    attempts = 3
+    last_exc: Optional[Exception] = None
+    for i in range(1, attempts + 1):
+        try:
+            with psycopg.connect(DATABASE_URL, **kwargs) as conn:
+                conn.autocommit = True
+                with conn.cursor(row_factory=dict_row) as cur:
+                    cur.execute(query, params)
+                    return cur.fetchall() if cur.description else []
+        except Exception as e:
+            last_exc = e
+            if i < attempts and _is_fatal_io_error(e):
+                # small backoff with jitter
+                time.sleep(0.20 + random.random() * 0.30)
+                continue
+            break
+    if last_exc:
+        raise last_exc
+    raise RuntimeError("Direct query failed unexpectedly")
 
-def _q(query: str, params: tuple | None = None):
+def _pooled_query(query: str, params: tuple):
     """
-    Execute a read-only query with robust retries.
-    Strategy:
-      1) Try with current pool.
-      2) If we see OperationalError/InterfaceError/PoolTimeout/PoolClosed,
-         close & reopen pool.
-      3) Final attempt: rebuild pool (recycle all conns).
+    Pool path with aggressive discard on any failure.
     """
-    params = params or ()
     exc: Optional[Exception] = None
     for attempt in (1, 2, 3):
         try:
             _ensure_pool_open_adaptive()
             with POOL.connection() as conn:
-                _warm_conn(conn)
                 with conn.cursor(row_factory=dict_row) as cur:
                     cur.execute(query, params)
                     return cur.fetchall() if cur.description else []
         except (psycopg.OperationalError, psycopg.InterfaceError, PoolTimeout, PoolClosed) as e:
             exc = e
-            logger.warning("DB op failed (%s). Attempt %d/3", e.__class__.__name__, attempt)
+            logger.warning("DB pooled op failed (%s). Attempt %d/3", e.__class__.__name__, attempt)
+            if _is_fatal_io_error(e):
+                _enter_direct_mode()
+                # Immediately fail over to direct mode for this call
+                return _direct_query(query, params)
             if attempt == 1:
-                _soft_reopen_pool()
+                with suppress(Exception): POOL.close()
                 time.sleep(0.25)
+                continue
             elif attempt == 2:
                 _rebuild_pool()
-                with suppress(Exception):
-                    POOL.open()
-                time.sleep(0.4)
+                with suppress(Exception): POOL.open()
+                time.sleep(0.35)
+                continue
             else:
                 break
         except Exception as e:
-            # Non-recoverable SQL/logic errors: don't loop forever
             exc = e
+            # Non-recoverable SQL/logic errors
             break
-    raise exc if exc else RuntimeError("DB query failed unexpectedly")
+    if exc:
+        # If pooled path failed repeatedly, switch to direct mode and try once
+        if _is_fatal_io_error(exc):
+            _enter_direct_mode()
+            return _direct_query(query, params)
+        raise exc
+    raise RuntimeError("Pooled query failed unexpectedly")
+
+def _q(query: str, params: tuple | None = None):
+    """
+    Unified read-only query entrypoint.
+    - If DB_NO_POOL=1: always direct.
+    - If in cooldown window: direct.
+    - Else: pooled; any fatal I/O flips to direct for a while.
+    """
+    params = params or ()
+    if DB_NO_POOL:
+        return _direct_query(query, params)
+    if _DIRECT_MODE_UNTIL and _now() < _DIRECT_MODE_UNTIL:
+        return _direct_query(query, params)
+    try:
+        return _pooled_query(query, params)
+    except Exception as e:
+        # As an ultimate fallback, try direct once more
+        if _is_fatal_io_error(e):
+            _enter_direct_mode()
+            return _direct_query(query, params)
+        raise
 
 
 # ── Series helpers ────────────────────────────────────────────────────────────
