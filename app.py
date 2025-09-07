@@ -2,7 +2,7 @@ import os
 import time
 import asyncio
 import threading
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import urlparse
 
@@ -51,7 +51,7 @@ CATALOGUE_ISRC_FIELD = os.getenv("CATALOGUE_ISRC_FIELD", "ISRC")
 CATALOGUE_ARTIST_FIELD = os.getenv("CATALOGUE_ARTIST_FIELD", "Artist")  # lookup/rollup or text
 CATALOGUE_TITLE_FIELD  = os.getenv("CATALOGUE_TITLE_FIELD",  "Track Title")   # lookup/rollup or text
 
-# ----- Track Playcounts (Airtable) -----
+# ----- Track Playcounts (Airtable)
 PLAYCOUNTS_TABLE = os.getenv("PLAYCOUNTS_TABLE", "Spotify Streams")
 PLAYCOUNTS_LINK_FIELD = os.getenv("PLAYCOUNTS_LINK_FIELD", "ISRC")
 PLAYCOUNTS_DATE_FIELD = os.getenv("PLAYCOUNTS_DATE_FIELD", "Date")
@@ -96,6 +96,13 @@ PATHFINDER_HOSTS = [
 
 airtable_sleep = float(os.getenv("AT_SLEEP", "0.2"))
 spotify_sleep = float(os.getenv("SPOTIFY_SLEEP", "0.15"))
+
+# ── Lag config (simple hard floor + caps + scheduler) ───────────────────────────
+LAG_MIN_TOTAL = int(os.getenv("LAG_MIN_TOTAL", "20000"))  # catalogue floor per completed day
+CAP_CHECKPOINT_RATIO = float(os.getenv("CAP_CHECKPOINT_RATIO", "0.30"))  # ≤30% of target per checkpoint
+CAP_DAILY_RATIO      = float(os.getenv("CAP_DAILY_RATIO", "0.60"))       # ≤60% of target per calendar day
+ENABLE_SCHEDULER     = os.getenv("ENABLE_SCHEDULER", "true").lower() in ("1","true","yes")
+SCHEDULE_EVERY_HOURS = int(os.getenv("SCHEDULE_EVERY_HOURS", "6"))
 
 # ────────────────────────────────────────────────────────────────────────────────
 # Airtable helpers
@@ -232,7 +239,6 @@ def find_today_by_isrc(isrc_code: str, day_iso: str) -> Optional[str]:
         return None
     recs = r.json().get("records", [])
     return recs[0]["id"] if recs else None
-
 
 def prev_count_by_isrc(isrc_code: str, before_iso: str) -> Optional[int]:
     clauses = [
@@ -475,6 +481,258 @@ def backfill_deltas_for_followers() -> int:
     return backfill_table_deltas(FOLLOWERS_TABLE, FOLLOWERS_LINK_FIELD, FOLLOWERS_DATE_FIELD, FOLLOWERS_COUNT_FIELD, FOLLOWERS_DELTA_FIELD, clamp_negative=not FOLLOWERS_ALLOW_NEGATIVE)
 
 # ────────────────────────────────────────────────────────────────────────────────
+# Lag schema & catalogue totals (DB-only; idempotent)
+# ────────────────────────────────────────────────────────────────────────────────
+def db_ensure_lag_schema(cur):
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS daily_totals (
+            day date PRIMARY KEY,
+            total_delta bigint NOT NULL DEFAULT 0,
+            finalized boolean NOT NULL DEFAULT false,
+            updated_at timestamptz NOT NULL DEFAULT now()
+        );
+    """)
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS lag_credits (
+            day date PRIMARY KEY,
+            moved_today bigint NOT NULL DEFAULT 0,
+            moved_alltime bigint NOT NULL DEFAULT 0,
+            updated_at timestamptz NOT NULL DEFAULT now()
+        );
+    """)
+
+def db_upsert_daily_total(cur, day_iso: str, total_delta: int, finalized: bool):
+    cur.execute("""
+        INSERT INTO daily_totals(day,total_delta,finalized)
+        VALUES (%s,%s,%s)
+        ON CONFLICT (day) DO UPDATE
+        SET total_delta=EXCLUDED.total_delta,
+            finalized = CASE WHEN daily_totals.finalized THEN daily_totals.finalized ELSE EXCLUDED.finalized END,
+            updated_at=now();
+    """, (day_iso, total_delta, finalized))
+
+def db_catalogue_delta_for_day(cur, day_iso: str) -> int:
+    """
+    Sum of positive per-track increments on day_iso.
+    delta(track, day) = max(0, pc(day) - last_pc_before(day))
+    """
+    cur.execute("""
+        WITH today AS (
+          SELECT s.track_uid, s.playcount AS pc_day
+          FROM streams s
+          WHERE s.platform='spotify' AND s.stream_date=%s
+        ),
+        prev AS (
+          SELECT s1.track_uid,
+                 (SELECT s2.playcount
+                  FROM streams s2
+                  WHERE s2.platform='spotify'
+                    AND s2.track_uid = s1.track_uid
+                    AND s2.stream_date < %s
+                  ORDER BY s2.stream_date DESC
+                  LIMIT 1) AS pc_prev
+          FROM streams s1
+          WHERE s1.platform='spotify'
+          GROUP BY s1.track_uid
+        )
+        SELECT COALESCE(SUM(GREATEST(0, t.pc_day - COALESCE(p.pc_prev,0))),0) AS delta_sum
+        FROM today t LEFT JOIN prev p USING (track_uid);
+    """, (day_iso, day_iso))
+    return int((cur.fetchone() or {}).get("delta_sum", 0))
+
+def db_get_lag_queue(cur, today_iso: str) -> List[str]:
+    """
+    All past, unfinalized days whose catalogue delta < LAG_MIN_TOTAL, oldest first.
+    """
+    cur.execute("""
+        SELECT day FROM daily_totals
+        WHERE day < %s AND finalized=false AND total_delta < %s
+        ORDER BY day ASC
+    """, (today_iso, LAG_MIN_TOTAL))
+    return [row["day"].isoformat() for row in cur.fetchall()]
+
+def db_mark_finalized_if_ready(cur, day_iso: str):
+    cur.execute("SELECT total_delta FROM daily_totals WHERE day=%s", (day_iso,))
+    row = cur.fetchone()
+    if row and int(row["total_delta"]) >= LAG_MIN_TOTAL:
+        cur.execute("UPDATE daily_totals SET finalized=true, updated_at=now() WHERE day=%s", (day_iso,))
+
+def _cap_amount_for_anchor(cur, anchor_day: str, remaining_to_move: int) -> int:
+    """
+    Enforce per-checkpoint and per-day caps for a given anchor.
+    """
+    target = LAG_MIN_TOTAL
+    cap_checkpoint = int(target * CAP_CHECKPOINT_RATIO)
+    cap_daily      = int(target * CAP_DAILY_RATIO)
+    cur.execute("SELECT moved_today FROM lag_credits WHERE day=%s", (anchor_day,))
+    row = cur.fetchone() or {"moved_today": 0}
+    room_today = max(0, cap_daily - int(row["moved_today"] or 0))
+    return max(0, min(remaining_to_move, cap_checkpoint, room_today))
+
+def _bump_lag_credits(cur, anchor_day: str, moved: int):
+    if moved <= 0: return
+    cur.execute("""
+        INSERT INTO lag_credits(day, moved_today, moved_alltime)
+        VALUES (%s, %s, %s)
+        ON CONFLICT (day) DO UPDATE
+        SET moved_today = lag_credits.moved_today + EXCLUDED.moved_today,
+            moved_alltime = lag_credits.moved_alltime + EXCLUDED.moved_alltime,
+            updated_at = now();
+    """, (anchor_day, moved, moved))
+
+def db_today_increments(cur, today_iso: str) -> List[Tuple[str,int,int]]:
+    """
+    Returns list of (track_uid, prev_pc, inc_today). inc_today = max(0, pc_today - prev_pc).
+    """
+    cur.execute("""
+        WITH today AS (
+          SELECT s.track_uid, s.playcount AS pc_today
+          FROM streams s
+          WHERE s.platform='spotify' AND s.stream_date=%s
+        ),
+        prev AS (
+          SELECT t.track_uid,
+                 (SELECT s2.playcount
+                  FROM streams s2
+                  WHERE s2.platform='spotify' AND s2.track_uid=t.track_uid AND s2.stream_date < %s
+                  ORDER BY s2.stream_date DESC LIMIT 1) AS pc_prev
+          FROM track_dim t
+        )
+        SELECT t.track_uid,
+               COALESCE(p.pc_prev,0) AS pc_prev,
+               GREATEST(0, COALESCE(t.pc_today,0) - COALESCE(p.pc_prev,0)) AS inc_today
+        FROM today t
+        JOIN prev p USING (track_uid)
+        WHERE COALESCE(t.pc_today,0) > COALESCE(p.pc_prev,0);
+    """, (today_iso, today_iso))
+    rows = cur.fetchall()
+    return [(r["track_uid"], int(r["pc_prev"]), int(r["inc_today"])) for r in rows]
+
+def daily_housekeeping(cur, today_iso: str):
+    """
+    Idempotent: safe to call every run.
+    - Ensure schema
+    - Reset lag_credits.moved_today at local midnight (UTC acceptable)
+    - Auto-finalize days strictly older than D-2 that already meet the floor
+    """
+    db_ensure_lag_schema(cur)
+    cur.execute("UPDATE lag_credits SET moved_today = 0, updated_at=now() WHERE day < CURRENT_DATE")
+    cur.execute("""
+        UPDATE daily_totals
+        SET finalized=true, updated_at=now()
+        WHERE day < CURRENT_DATE - INTERVAL '2 days' AND finalized=false AND total_delta >= %s
+    """, (LAG_MIN_TOTAL,))
+
+def reattribute_increments_to_queue(cur, today_iso: str) -> Dict[str, Any]:
+    """
+    Oldest-first fill of any number of lag days. Only moves from TODAY → ANCHOR(s).
+    """
+    # Update yesterday snapshot if we have rows for it
+    cur.execute("SELECT CURRENT_DATE - INTERVAL '1 day' AS yday")
+    yday = cur.fetchone()["yday"].date().isoformat()
+    cur.execute("SELECT 1 FROM streams WHERE platform='spotify' AND stream_date=%s LIMIT 1", (yday,))
+    if cur.fetchone():
+        y_delta = db_catalogue_delta_for_day(cur, yday)
+        db_upsert_daily_total(cur, yday, y_delta, finalized=False)
+
+    queue = db_get_lag_queue(cur, today_iso)
+    if not queue:
+        # still record today's snapshot
+        t_delta = db_catalogue_delta_for_day(cur, today_iso)
+        db_upsert_daily_total(cur, today_iso, t_delta, finalized=False)
+        return {"moved_total": 0, "anchors": []}
+
+    triples = db_today_increments(cur, today_iso)
+    if not triples:
+        t_delta = db_catalogue_delta_for_day(cur, today_iso)
+        db_upsert_daily_total(cur, today_iso, t_delta, finalized=False)
+        return {"moved_total": 0, "anchors": queue}
+
+    remaining_by_track = {tid: inc for (tid, _prev, inc) in triples}
+    prev_by_track      = {tid: prev for (tid, prev, _inc) in triples}
+    moved_overall = 0
+
+    for anchor_day in queue:
+        cur.execute("SELECT total_delta FROM daily_totals WHERE day=%s", (anchor_day,))
+        row = cur.fetchone()
+        current = int(row["total_delta"]) if row else 0
+        need = max(0, LAG_MIN_TOTAL - current)
+        if need <= 0:
+            db_mark_finalized_if_ready(cur, anchor_day)
+            continue
+
+        allowed = _cap_amount_for_anchor(cur, anchor_day, need)
+        if allowed <= 0:
+            continue
+
+        available_today = sum(remaining_by_track.values())
+        if available_today <= 0:
+            break
+
+        move_amount = min(allowed, available_today)
+        to_move = move_amount
+
+        # proportional by remaining inc, monotonic guard
+        while to_move > 0:
+            total_rem = sum(remaining_by_track.values())
+            if total_rem <= 0:
+                break
+            for tid, rem in list(remaining_by_track.items()):
+                if rem <= 0 or to_move <= 0:
+                    continue
+                share = int(round(rem * (to_move / total_rem)))
+                share = max(0, min(share, remaining_by_track[tid]))
+                if share == 0:
+                    continue
+
+                # Decrease today's pc (not below prev)
+                new_today_pc = prev_by_track[tid] + (remaining_by_track[tid] - share)
+                cur.execute("""
+                    UPDATE streams SET playcount=%s
+                    WHERE platform='spotify' AND track_uid=%s AND stream_date=%s
+                """, (new_today_pc, tid, today_iso))
+
+                # Increase anchor day's pc (upsert)
+                cur.execute("""
+                    SELECT playcount FROM streams
+                    WHERE platform='spotify' AND track_uid=%s AND stream_date=%s
+                """, (tid, anchor_day))
+                row_a = cur.fetchone()
+                if row_a:
+                    anchor_pc_base = int(row_a["playcount"] or 0)
+                else:
+                    cur.execute("""
+                        SELECT playcount FROM streams
+                        WHERE platform='spotify' AND track_uid=%s AND stream_date<%s
+                        ORDER BY stream_date DESC LIMIT 1
+                    """, (tid, anchor_day))
+                    rp = cur.fetchone()
+                    anchor_pc_base = int(rp["playcount"] or 0) if rp else 0
+
+                new_anchor_pc = anchor_pc_base + share
+                cur.execute("""
+                    INSERT INTO streams(platform, track_uid, stream_date, playcount)
+                    VALUES ('spotify', %s, %s, %s)
+                    ON CONFLICT (platform, track_uid, stream_date)
+                    DO UPDATE SET playcount=EXCLUDED.playcount
+                """, (tid, anchor_day, new_anchor_pc))
+
+                remaining_by_track[tid] -= share
+                moved_overall += share
+                to_move -= share
+
+        # Update anchor totals/credits + finalize check
+        new_total = current + min(move_amount, available_today)
+        db_upsert_daily_total(cur, anchor_day, new_total, finalized=False)
+        _bump_lag_credits(cur, anchor_day, min(move_amount, available_today))
+        db_mark_finalized_if_ready(cur, anchor_day)
+
+    # Update today's snapshot (not finalized)
+    t_delta = db_catalogue_delta_for_day(cur, today_iso)
+    db_upsert_daily_total(cur, today_iso, t_delta, finalized=False)
+    return {"moved_total": moved_overall, "anchors": queue}
+
+# ────────────────────────────────────────────────────────────────────────────────
 # Streams daily sync (with logging)  >>> RETRY-ON-ZERO UPGRADE
 # ────────────────────────────────────────────────────────────────────────────────
 async def sync(max_retries: int = 1, retry_sleep_sec: float = 3.0):
@@ -606,6 +864,17 @@ async def sync(max_retries: int = 1, retry_sleep_sec: float = 3.0):
             logger.error("[streams] hard-zero after retry (both sum_delta_like and sum_pc are 0).")
         else:
             logger.info("[streams] retry succeeded (non-zero signal detected).")
+
+    # ── Lag reconciliation (DB-only; restart/idempotent-safe)
+    try:
+        today_iso = date.today().isoformat()
+        with db_conn() as conn, conn.cursor() as cur:
+            daily_housekeeping(cur, today_iso)
+            res = reattribute_increments_to_queue(cur, today_iso)
+            conn.commit()
+        logger.info(f"[lag] moved={res['moved_total']} anchors={res['anchors']}")
+    except Exception as e:
+        logger.exception("[lag] reconciliation failed: %s", e)
 
 # ────────────────────────────────────────────────────────────────────────────────
 # Followers backfill / today (with logging)
@@ -877,58 +1146,46 @@ def backfill_airtable_to_postgres(days: Optional[str] = None) -> int:
     logger.info(f"[backfill/airtable→postgres] completed: inserted={inserted} days={days}")
     return inserted
 
-# Followers-only DAILY run (unchanged signature, logging in body)
-@app.post("/backfill_followers_to_db")
-def backfill_followers_to_db():
-    _check_token()
-    try:
-        n = backfill_playlist_followers_all(platform="spotify")
-        return jsonify({"ok": True, "inserted_or_updated": n}), 200
-    except Exception as e:
-        logger.exception(f"[followers/backfill→db] failed: {e}")
-        return jsonify({"ok": False, "error": str(e)}), 500
+# ────────────────────────────────────────────────────────────────────────────────
+# 6h scheduler (aligned 00/06/12/18) with advisory-lock singleton
+# ────────────────────────────────────────────────────────────────────────────────
+def _seconds_until_next_tick(now: datetime, step_hours: int = 6) -> int:
+    block = ((now.hour // step_hours) + 1) * step_hours
+    next_dt = now.replace(minute=0, second=0, microsecond=0)
+    if block >= 24:
+        next_dt = (next_dt.replace(hour=0) + timedelta(days=1))
+    else:
+        next_dt = next_dt.replace(hour=block)
+    return max(1, int((next_dt - now).total_seconds()))
 
-@app.post("/run_followers_today")
-def _run_followers_today():
-    _check_token()
-    try:
-        logger.info("[followers] daily run start")
-        res = run_followers_today(platform="spotify")
-        logger.info(f"[followers] daily run finish: {res}")
-        return jsonify({"ok": True, **res}), 200
-    except Exception as e:
-        logger.exception(f"[followers] daily run failed: {e}")
-        return jsonify({"ok": False, "error": str(e)}), 500
+def _try_advisory_lock(conn, key_bigint: int) -> bool:
+    with conn.cursor() as cur:
+        cur.execute("SELECT pg_try_advisory_lock(%s) AS ok", (key_bigint,))
+        return bool(cur.fetchone()["ok"])
 
-@app.post("/ingest/playlist_followers")
-def ingest_playlist_followers():
-    _check_token()
-    data = request.get_json(force=True) or {}
-    platform = (data.get("platform") or "spotify").lower()
-    records = data.get("records") or []
-    if not records:
-        return jsonify({"ok": False, "error": "no records"}), 400
-    with db_conn() as conn, conn.cursor() as cur:
-        db_ensure_platform(cur, platform)
-        for rec in records:
-            urn = rec.get("playlist_id")
-            day = rec.get("date")
-            followers = int(rec.get("followers") or 0)
-            name = rec.get("playlist_name")
-            if not (urn and day):
-                continue
-            db_upsert_playlist_followers(cur, platform, urn, day, followers, name)
-        conn.commit()
-    logger.info(f"[followers/ingest] completed: count={len(records)}")
-    return jsonify({"ok": True, "count": len(records)}), 200
+def _schedule_loop():
+    # stable 64-bit key for singleton lock (any constant works)
+    LOCK_KEY = 634269201837461123
+    while True:
+        try:
+            with db_conn() as c:
+                if not _try_advisory_lock(c, LOCK_KEY):
+                    # Another worker holds the scheduler; sleep briefly and retry
+                    time.sleep(15)
+                    continue
+            # We hold the lock: run sync immediately, then align to next boundary
+            logger.info("[scheduler] tick → running sync()")
+            asyncio.run(sync())
+            sleep_s = _seconds_until_next_tick(datetime.now())
+            logger.info(f"[scheduler] sleeping {sleep_s}s until next 6h boundary")
+            time.sleep(sleep_s)
+        except Exception as e:
+            logger.exception("[scheduler] loop error: %s", e)
+            time.sleep(30)
 
-@app.get("/diag")
-def diag():
-    isrc = request.args.get("isrc")
-    day  = request.args.get("day")
-    if not isrc or not day:
-        return jsonify({"error": "isrc & day required"}), 400
-    return jsonify({"find_today_id": find_today_by_isrc(isrc, day), "prev_count": prev_count_by_isrc(isrc, day)})
+# Start scheduler (singleton via DB lock)
+if ENABLE_SCHEDULER:
+    threading.Thread(target=_schedule_loop, daemon=True).start()
 
 # ────────────────────────────────────────────────────────────────────────────────
 # Timezone helpers (single source of truth)
