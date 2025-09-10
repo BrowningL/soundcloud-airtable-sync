@@ -53,7 +53,7 @@ CATALOGUE_TABLE = os.getenv("CATALOGUE_TABLE", "Catalogue")
 CATALOGUE_VIEW = os.getenv("CATALOGUE_VIEW", "Inner Catalogue")
 CATALOGUE_ISRC_FIELD = os.getenv("CATALOGUE_ISRC_FIELD", "ISRC")
 CATALOGUE_ARTIST_FIELD = os.getenv("CATALOGUE_ARTIST_FIELD", "Artist")  # lookup/rollup or text
-CATALOGUE_TITLE_FIELD  = os.getenv("CATALOGUE_TITLE_FIELD",  "Track Title")    # lookup/rollup or text
+CATALOGUE_TITLE_FIELD  = os.getenv("CATALOGUE_TITLE_FIELD",  "Track Title")   # lookup/rollup or text
 
 # ----- Track Playcounts (Airtable)
 PLAYCOUNTS_TABLE = os.getenv("PLAYCOUNTS_TABLE", "Spotify Streams")
@@ -357,9 +357,9 @@ def search_track(isrc: str, bearer: str) -> Optional[Tuple[str, str, str, Option
     or None if not found.
     """
     r = requests.get("https://api.spotify.com/v1/search",
-                       headers={"Authorization": f"Bearer {bearer}"},
-                       params={"q": f"isrc:{isrc}", "type": "track", "limit": 5},
-                       timeout=60)
+                        headers={"Authorization": f"Bearer {bearer}"},
+                        params={"q": f"isrc:{isrc}", "type": "track", "limit": 5},
+                        timeout=60)
     if r.status_code != 200:
         return None
     items = r.json().get("tracks", {}).get("items", [])
@@ -681,7 +681,7 @@ async def run_once(day_override: Optional[str] = None, attempt_idx: int = 1, out
                             prev = prev_count_by_isrc(isrc, day_iso)
                             if prev is not None and playcount > prev:
                                 delta_like = playcount - prev
-                    break
+                        break
             
             records_to_process.append({
                 "isrc": isrc,
@@ -830,7 +830,7 @@ def run_playlist_followers(day_override: Optional[str] = None):
         plain_id = urn_to_plain_id(urn)
         try:
             r = requests.get(f"https://api.spotify.com/v1/playlists/{plain_id}?fields=followers(total)",
-                               headers={"Authorization": f"Bearer {bearer}"}, timeout=30)
+                                headers={"Authorization": f"Bearer {bearer}"}, timeout=30)
             if r.status_code == 404:
                 followers_logger.warning("playlist not found (404): id=%s name=%s", plain_id, name)
                 continue
@@ -862,7 +862,15 @@ def run_playlist_followers(day_override: Optional[str] = None):
     if OUTPUT_TARGET in ("airtable", "both") and records_to_write_at:
         try:
             followers_logger.info("writing %d follower counts to Airtable", len(records_to_write_at))
-            at_batch_patch(FOLLOWERS_TABLE, records_to_write_at)
+            # This endpoint creates new records, it doesn't patch. We need a create helper.
+            i = 0
+            while i < len(records_to_write_at):
+                chunk = records_to_write_at[i:i+10]
+                r = requests.post(at_url(FOLLOWERS_TABLE), headers=at_headers(), json={"records": chunk}, timeout=60)
+                if r.status_code not in (200, 201):
+                    raise RuntimeError(f"Airtable create error {r.status_code}: {r.text}")
+                i += 10
+                time.sleep(airtable_sleep)
         except Exception as e:
             followers_logger.error("Airtable batch update failed: %s", e)
             errors += len(records_to_write_at)
@@ -888,6 +896,327 @@ def run_playlist_followers(day_override: Optional[str] = None):
     stats = {"processed": processed, "errors": errors, "date": day_iso}
     followers_logger.info("completed followers run: %s", " ".join(f"{k}={v}" for k, v in stats.items()))
     return stats
+
+# ────────────────────────────────────────────────────────────────────────────────
+# PLAYLIST SYNC WORKER
+# ────────────────────────────────────────────────────────────────────────────────
+sync_logger = logging.getLogger("playlist_sync")
+
+# --- Environment variables for Playlist Sync ---
+SPOTIFY_REFRESH_TOKEN = os.getenv("SPOTIFY_REFRESH_TOKEN")
+
+# Table/Field names from Airtable Script
+CAT_F_URI = os.getenv("CAT_F_URI", "Spotify URI")
+CAT_F_ISRC = os.getenv("CAT_F_ISRC", "ISRC")
+
+PLY_F_LAST_SNAPSHOT = os.getenv("PLY_F_LAST_SNAPSHOT", "Last Snapshot ID")
+PLY_F_ORDER_HASH = os.getenv("PLY_F_ORDER_HASH", "Last Order Hash")
+PLY_F_LAST_SYNC = os.getenv("PLY_F_LAST_SYNC", "Last Synced")
+PLY_POSSIBLE_PLAYLIST_FIELDS = [
+    "Playlist","Spotify Playlist","Spotify Playlist URI",
+    "Spotify URL","Spotify URI","URL","URI","Playlist ID","Playlist Web URL"
+]
+
+PLACEMENTS_TABLE = os.getenv("PLACEMENTS_TABLE", "Placements")
+PL_F_PLAYLIST = os.getenv("PLACEMENTS_PLAYLIST_LINK_FIELD", "Playlist")
+PL_F_TRACK_LINK = os.getenv("PLACEMENTS_TRACK_LINK_FIELD", "Track Title")
+PL_F_POSITION = os.getenv("PLACEMENTS_POSITION_FIELD", "Position")
+
+
+def get_spotify_token_refreshed() -> str:
+    """Gets a new Spotify access token using the refresh token."""
+    if not SPOTIFY_REFRESH_TOKEN:
+        raise ValueError("SPOTIFY_REFRESH_TOKEN is not set.")
+    
+    sync_logger.info("Requesting new Spotify access token...")
+    r = requests.post(
+        "https://accounts.spotify.com/api/token",
+        auth=(CLIENT_ID, CLIENT_SECRET),
+        data={
+            "grant_type": "refresh_token",
+            "refresh_token": SPOTIFY_REFRESH_TOKEN,
+        },
+        timeout=30,
+    )
+    r.raise_for_status()
+    token = r.json().get("access_token")
+    if not token:
+        raise RuntimeError("Failed to get access_token from Spotify.")
+    sync_logger.info("Successfully refreshed Spotify access token.")
+    return token
+
+
+def extract_playlist_id(raw: Any) -> Optional[str]:
+    """Extracts a Spotify playlist ID from various string formats."""
+    if not raw:
+        return None
+    
+    if isinstance(raw, list) and raw:
+        val = raw[0].get("name") or raw[0].get("url") or raw[0].get("text") or raw[0]
+        return extract_playlist_id(val)
+
+    s = str(raw).strip()
+    import re
+    patterns = [
+        r"spotify:playlist:([A-Za-z0-9]+)",
+        r"playlist\/([A-Za-z0-9]+)",
+        r"^([A-Za-z0-9]{22})$",
+        r"([A-Za-z0-9]{22})",
+    ]
+    for pattern in patterns:
+        match = re.search(pattern, s)
+        if match:
+            return match.group(1)
+    return None
+
+
+def get_playlist_snapshot(token: str, playlist_id: str) -> Dict[str, Any]:
+    """Fetches just the snapshot_id and total track count for a playlist."""
+    url = f"https://api.spotify.com/v1/playlists/{playlist_id}?fields=snapshot_id,tracks(total)"
+    r = requests.get(url, headers={"Authorization": f"Bearer {token}"}, timeout=30)
+    r.raise_for_status()
+    return r.json()
+
+
+def fetch_all_playlist_tracks(token: str, playlist_id: str) -> List[Dict[str, Any]]:
+    """Paginates through a playlist to get all its tracks."""
+    items = []
+    url = f"https://api.spotify.com/v1/playlists/{playlist_id}/tracks?limit=100&fields=items(track(uri,name,artists(name),album(id))),next"
+    
+    page = 1
+    while url:
+        sync_logger.info(f"Fetching page {page} for playlist {playlist_id}...")
+        r = requests.get(url, headers={"Authorization": f"Bearer {token}"}, timeout=60)
+        r.raise_for_status()
+        data = r.json()
+        
+        for item in data.get("items", []):
+            track = item.get("track")
+            if not track: continue
+            items.append({
+                "uri": track.get("uri"),
+                "name": track.get("name"),
+                "artist": ", ".join([a["name"] for a in track.get("artists", []) if a.get("name")]),
+                "albumId": track.get("album", {}).get("id"),
+            })
+        
+        url = data.get("next")
+        page += 1
+        time.sleep(spotify_sleep)
+        
+    return items
+
+def diff_placements_multi(existing: List[Dict], desired: List[Dict]) -> Dict[str, List]:
+    """
+    Compares existing placements with desired placements to find what needs
+    to be created, updated, or deleted. Handles duplicate tracks.
+    `existing`: [{"recId": str, "catId": str, "pos": int}]
+    `desired`: [{"catId": str, "pos": int}]
+    """
+    ex_by_cat = {}
+    for e in existing:
+        ex_by_cat.setdefault(e["catId"], []).append({"recId": e["recId"], "pos": e["pos"]})
+    for arr in ex_by_cat.values():
+        arr.sort(key=lambda x: x["pos"])
+
+    de_by_cat = {}
+    for d in desired:
+        de_by_cat.setdefault(d["catId"], []).append(d["pos"])
+    for arr in de_by_cat.values():
+        arr.sort()
+
+    to_create, to_update, to_delete = [], [], []
+    all_cat_ids = set(ex_by_cat.keys()) | set(de_by_cat.keys())
+
+    for cat_id in all_cat_ids:
+        ex = ex_by_cat.get(cat_id, [])
+        de = de_by_cat.get(cat_id, [])
+        match_count = min(len(ex), len(de))
+
+        for i in range(match_count):
+            if ex[i]["pos"] != de[i]:
+                to_update.append({"recId": ex[i]["recId"], "pos": de[i]})
+        
+        for i in range(match_count, len(de)):
+            to_create.append({"catId": cat_id, "pos": de[i]})
+        
+        for i in range(match_count, len(ex)):
+            to_delete.append(ex[i]["recId"])
+
+    return {"toCreate": to_create, "toUpdate": to_update, "toDelete": to_delete}
+
+def at_batch_delete(table: str, record_ids: List[str]):
+    """Deletes records from Airtable in batches of 10."""
+    i = 0
+    while i < len(record_ids):
+        chunk = record_ids[i:i+10]
+        params = {"records[]": chunk}
+        r = requests.delete(at_url(table), headers=at_headers(), params=params, timeout=60)
+        if r.status_code != 200:
+            raise RuntimeError(f"Airtable delete error {r.status_code}: {r.text}")
+        sync_logger.info(f"Deleted {len(chunk)} records from {table}")
+        i += 10
+        time.sleep(airtable_sleep)
+
+def run_playlist_sync():
+    """Main worker function to sync Spotify playlists to Airtable."""
+    sync_logger.info("Starting playlist sync process...")
+    
+    # 1. Get Spotify Token
+    try:
+        token = get_spotify_token_refreshed()
+    except Exception as e:
+        sync_logger.exception("Fatal: Could not get Spotify token.")
+        return {"status": "error", "message": "Spotify authentication failed"}
+
+    # 2. Fetch all necessary data from Airtable first
+    sync_logger.info("Fetching initial data from Airtable...")
+    try:
+        all_playlists = at_paginate(PLAYLISTS_TABLE, {"pageSize": 100})
+        all_placements_raw = at_paginate(PLACEMENTS_TABLE, {"pageSize": 100, "fields[]": [PL_F_PLAYLIST, PL_F_TRACK_LINK, PL_F_POSITION]})
+        catalogue_raw = at_paginate(CATALOGUE_TABLE, {"pageSize": 100, "fields[]": [CAT_F_URI, CAT_F_ISRC]})
+    except Exception as e:
+        sync_logger.exception("Fatal: Could not fetch initial data from Airtable.")
+        return {"status": "error", "message": "Airtable data fetch failed"}
+
+    # 3. Build in-memory indexes
+    cat_by_uri = {rec["fields"].get(CAT_F_URI): rec["id"] for rec in catalogue_raw if rec["fields"].get(CAT_F_URI)}
+    
+    placements_by_playlist_id = {}
+    for plac in all_placements_raw:
+        playlist_links = plac["fields"].get(PL_F_PLAYLIST, [])
+        track_links = plac["fields"].get(PL_F_TRACK_LINK, [])
+        if not playlist_links or not track_links:
+            continue
+        
+        playlist_id = playlist_links[0]["id"]
+        placements_by_playlist_id.setdefault(playlist_id, []).append({
+            "recId": plac["id"],
+            "catId": track_links[0]["id"],
+            "pos": plac["fields"].get(PL_F_POSITION, 0)
+        })
+    
+    sync_logger.info(f"Indexed {len(cat_by_uri)} catalogue items and placements for {len(placements_by_playlist_id)} playlists.")
+
+    # 4. Process each playlist
+    summary = []
+    processed_count = 0
+    for p_rec in all_playlists:
+        p_name = p_rec.get("fields", {}).get(PLAYLISTS_NAME_FIELD, p_rec["id"])
+        
+        # Find a usable Spotify ID from any relevant field
+        raw_id_val = None
+        for field_name in PLY_POSSIBLE_PLAYLIST_FIELDS:
+            raw_id_val = p_rec.get("fields", {}).get(field_name)
+            if raw_id_val:
+                break
+        
+        pid = extract_playlist_id(raw_id_val or p_name)
+        
+        if not pid:
+            sync_logger.warning(f'Skipping playlist "{p_name}": No Spotify ID found.')
+            summary.append({"playlist": p_name, "status": "no_spotify_id"})
+            continue
+
+        sync_logger.info(f'Processing playlist "{p_name}" (ID: {pid})...')
+        
+        try:
+            # Snapshot Gate: Check if the playlist has changed
+            meta = get_playlist_snapshot(token, pid)
+            snapshot_id = meta.get("snapshot_id")
+            last_snapshot = p_rec.get("fields", {}).get(PLY_F_LAST_SNAPSHOT)
+
+            if last_snapshot and snapshot_id and last_snapshot == snapshot_id:
+                sync_logger.info(f'Playlist "{p_name}" is unchanged (snapshot match).')
+                summary.append({"playlist": p_name, "status": "unchanged_snapshot"})
+                # Optionally touch the "Last Synced" field
+                at_batch_patch(PLAYLISTS_TABLE, [{"id": p_rec["id"], "fields": {PLY_F_LAST_SYNC: datetime.utcnow().isoformat()}}])
+                continue
+
+            # Fetch all tracks from Spotify for the changed playlist
+            live_tracks = fetch_all_playlist_tracks(token, pid)
+            sync_logger.info(f'Fetched {len(live_tracks)} tracks from Spotify for "{p_name}".')
+
+            # Build the desired state of placements
+            desired = []
+            for i, track in enumerate(live_tracks):
+                cat_id = cat_by_uri.get(track["uri"])
+                if cat_id:
+                    desired.append({"catId": cat_id, "pos": i + 1})
+                else:
+                    # Note: This version doesn't auto-create catalogue items to keep it simpler.
+                    # That logic can be added back if needed.
+                    sync_logger.warning(f'Track URI {track["uri"]} ({track["name"]}) not in Catalogue. Skipping placement.')
+
+            # Get existing placements and diff
+            existing = placements_by_playlist_id.get(p_rec["id"], [])
+            diff = diff_placements_multi(existing, desired)
+            
+            to_create = diff["toCreate"]
+            to_update = diff["toUpdate"]
+            to_delete = diff["toDelete"]
+            
+            sync_logger.info(f'Diff for "{p_name}": +{len(to_create)} create, ~{len(to_update)} update, -{len(to_delete)} delete.')
+
+            # Apply changes to Airtable
+            if to_delete:
+                at_batch_delete(PLACEMENTS_TABLE, to_delete)
+            
+            if to_update:
+                update_payload = [{"id": u["recId"], "fields": {PL_F_POSITION: u["pos"]}} for u in to_update]
+                at_batch_patch(PLACEMENTS_TABLE, update_payload)
+
+            if to_create:
+                create_payload = [
+                    {"fields": {
+                        PL_F_PLAYLIST: [{"id": p_rec["id"]}],
+                        PL_F_TRACK_LINK: [{"id": c["catId"]}],
+                        PL_F_POSITION: c["pos"],
+                    }} for c in to_create
+                ]
+                # The existing app.py doesn't have a create helper, so we build it here.
+                i = 0
+                while i < len(create_payload):
+                    chunk = create_payload[i:i+10]
+                    r = requests.post(at_url(PLACEMENTS_TABLE), headers=at_headers(), json={"records": chunk}, timeout=60)
+                    r.raise_for_status()
+                    i += 10
+                    time.sleep(airtable_sleep)
+                sync_logger.info(f"Created {len(create_payload)} new placement records.")
+
+
+            # Update the playlist's metadata (snapshot, sync time)
+            playlist_update_payload = {
+                "id": p_rec["id"],
+                "fields": {
+                    PLY_F_LAST_SNAPSHOT: snapshot_id,
+                    PLY_F_LAST_SYNC: datetime.utcnow().isoformat()
+                }
+            }
+            at_batch_patch(PLAYLISTS_TABLE, [playlist_update_payload])
+            
+            summary.append({
+                "playlist": p_name, 
+                "status": "synced",
+                "tracks": len(live_tracks),
+                "created": len(to_create),
+                "updated": len(to_update),
+                "deleted": len(to_delete)
+            })
+            processed_count += 1
+
+        except Exception as e:
+            sync_logger.exception(f'Error processing playlist "{p_name}": {e}')
+            summary.append({"playlist": p_name, "status": "error", "message": str(e)})
+
+    final_report = {
+        "status": "complete",
+        "playlists_processed": processed_count,
+        "total_playlists": len(all_playlists),
+        "summary": summary
+    }
+    sync_logger.info(f"Playlist sync finished. Processed {processed_count}/{len(all_playlists)} playlists.")
+    return final_report
 
 
 # ────────────────────────────────────────────────────────────────────────────────
@@ -981,6 +1310,18 @@ def run_playlist_followers_handler():
         return jsonify(stats)
     except Exception as e:
         followers_logger.exception("followers run failed: %s", e)
+        return jsonify({"error": str(e)}), 500
+
+@app.route("/sync_playlists", methods=["POST"])
+def run_playlist_sync_handler():
+    # As requested, the token check has been removed.
+    # WARNING: This endpoint is now public.
+    # _check_token() 
+    try:
+        stats = run_playlist_sync()
+        return jsonify(stats)
+    except Exception as e:
+        sync_logger.exception("Playlist sync run failed: %s", e)
         return jsonify({"error": str(e)}), 500
 
 @app.route("/backfill/<table>", methods=["POST"])
