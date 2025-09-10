@@ -20,8 +20,12 @@ from psycopg2.extras import RealDictCursor
 # ────────────────────────────────────────────────────────────────────────────────
 logger = logging.getLogger("railway")
 if not logger.handlers:
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s [%(name)s] %(message)s")
 logger.setLevel(logging.INFO)
+streams_logger = logging.getLogger("streams")
+followers_logger = logging.getLogger("followers")
+scheduler_logger = logging.getLogger("scheduler")
+
 
 # Try to import the catalogue health worker with defensive logging
 try:
@@ -49,7 +53,7 @@ CATALOGUE_TABLE = os.getenv("CATALOGUE_TABLE", "Catalogue")
 CATALOGUE_VIEW = os.getenv("CATALOGUE_VIEW", "Inner Catalogue")
 CATALOGUE_ISRC_FIELD = os.getenv("CATALOGUE_ISRC_FIELD", "ISRC")
 CATALOGUE_ARTIST_FIELD = os.getenv("CATALOGUE_ARTIST_FIELD", "Artist")  # lookup/rollup or text
-CATALOGUE_TITLE_FIELD  = os.getenv("CATALOGUE_TITLE_FIELD",  "Track Title")   # lookup/rollup or text
+CATALOGUE_TITLE_FIELD  = os.getenv("CATALOGUE_TITLE_FIELD",  "Track Title")    # lookup/rollup or text
 
 # ----- Track Playcounts (Airtable)
 PLAYCOUNTS_TABLE = os.getenv("PLAYCOUNTS_TABLE", "Spotify Streams")
@@ -88,10 +92,7 @@ USER_AGENT = (
     "Chrome/124.0.0.0 Safari/537.36"
 )
 PATHFINDER_HOSTS = [
-    "api-partner.spotify.com",
-    "spclient.wg.spotify.com",
-    "gew1-spclient.spotify.com",
-    "guc3-spclient.spotify.com",
+    "https://api-partner.spotify.com",
 ]
 
 airtable_sleep = float(os.getenv("AT_SLEEP", "0.2"))
@@ -100,7 +101,7 @@ spotify_sleep = float(os.getenv("SPOTIFY_SLEEP", "0.15"))
 # ── Lag config (simple hard floor + caps + scheduler) ───────────────────────────
 LAG_MIN_TOTAL = int(os.getenv("LAG_MIN_TOTAL", "20000"))  # catalogue floor per completed day
 CAP_CHECKPOINT_RATIO = float(os.getenv("CAP_CHECKPOINT_RATIO", "0.30"))  # ≤30% of target per checkpoint
-CAP_DAILY_RATIO      = float(os.getenv("CAP_DAILY_RATIO", "0.60"))       # ≤60% of target per calendar day
+CAP_DAILY_RATIO      = float(os.getenv("CAP_DAILY_RATIO", "0.60"))        # ≤60% of target per calendar day
 ENABLE_SCHEDULER     = os.getenv("ENABLE_SCHEDULER", "true").lower() in ("1","true","yes")
 SCHEDULE_EVERY_HOURS = int(os.getenv("SCHEDULE_EVERY_HOURS", "6"))
 
@@ -345,8 +346,8 @@ def _has_spotify_creds():
 
 def get_search_token() -> str:
     r = requests.post("https://accounts.spotify.com/api/token",
-                      data={"grant_type": "client_credentials"},
-                      auth=(CLIENT_ID, CLIENT_SECRET), timeout=60)
+                        data={"grant_type": "client_credentials"},
+                        auth=(CLIENT_ID, CLIENT_SECRET), timeout=60)
     r.raise_for_status()
     return r.json()["access_token"]
 
@@ -356,9 +357,9 @@ def search_track(isrc: str, bearer: str) -> Optional[Tuple[str, str, str, Option
     or None if not found.
     """
     r = requests.get("https://api.spotify.com/v1/search",
-                     headers={"Authorization": f"Bearer {bearer}"},
-                     params={"q": f"isrc:{isrc}", "type": "track", "limit": 5},
-                     timeout=60)
+                       headers={"Authorization": f"Bearer {bearer}"},
+                       params={"q": f"isrc:{isrc}", "type": "track", "limit": 5},
+                       timeout=60)
     if r.status_code != 200:
         return None
     items = r.json().get("tracks", {}).get("items", [])
@@ -400,7 +401,7 @@ async def sniff_tokens() -> Tuple[str, Optional[str]]:  # unchanged
                     if not fut.done():
                         fut.set_result((tok, cli))
         page.on("response", on_resp)
-        await page.goto("https://open.spotify.com/album/2noRn2Aes5aoNVsU6iWThc")
+        await page.goto("https://open.spotify.com/")
         try:
             return await asyncio.wait_for(fut, timeout=15)
         finally:
@@ -418,7 +419,7 @@ def fetch_album(album_id: str, web_token: str, client_token: Optional[str]) -> D
     }
     for host in PATHFINDER_HOSTS:
         try:
-            r = sess.post(f"https://{host}/pathfinder/v2/query", headers=headers, json=body, timeout=30)
+            r = sess.post(f"{host}/pathfinder/v2/query", headers=headers, json=body, timeout=30)
             if r.status_code == 200:
                 return r.json()
         except Exception:
@@ -591,634 +592,423 @@ def db_today_increments(cur, today_iso: str) -> List[Tuple[str,int,int]]:
           WHERE s.platform='spotify' AND s.stream_date=%s
         ),
         prev AS (
-          SELECT t.track_uid,
+          SELECT s1.track_uid,
                  (SELECT s2.playcount
                   FROM streams s2
-                  WHERE s2.platform='spotify' AND s2.track_uid=t.track_uid AND s2.stream_date < %s
-                  ORDER BY s2.stream_date DESC LIMIT 1) AS pc_prev
-          FROM track_dim t
+                  WHERE s2.platform='spotify'
+                    AND s2.track_uid = s1.track_uid
+                    AND s2.stream_date < %s
+                  ORDER BY s2.stream_date DESC
+                  LIMIT 1) AS pc_prev
+          FROM streams s1
+          WHERE s1.platform='spotify'
+          GROUP BY s1.track_uid
         )
         SELECT t.track_uid,
-               COALESCE(p.pc_prev,0) AS pc_prev,
-               GREATEST(0, COALESCE(t.pc_today,0) - COALESCE(p.pc_prev,0)) AS inc_today
+               COALESCE(p.pc_prev, 0) AS prev_playcount,
+               GREATEST(0, t.pc_today - COALESCE(p.pc_prev, 0)) AS increment
         FROM today t
-        JOIN prev p USING (track_uid)
-        WHERE COALESCE(t.pc_today,0) > COALESCE(p.pc_prev,0);
+        LEFT JOIN prev p USING (track_uid)
+        WHERE GREATEST(0, t.pc_today - COALESCE(p.pc_prev, 0)) > 0;
     """, (today_iso, today_iso))
-    rows = cur.fetchall()
-    return [(r["track_uid"], int(r["pc_prev"]), int(r["inc_today"])) for r in rows]
+    return [(r["track_uid"], r["prev_playcount"], r["increment"]) for r in cur.fetchall()]
 
-def daily_housekeeping(cur, today_iso: str):
+def db_apply_lag_transfer(cur, from_day: str, to_day: str, track_uid: str, from_prev_pc: int, amount: int):
     """
-    Idempotent: safe to call every run.
-    - Ensure schema
-    - Reset lag_credits.moved_today at local midnight (UTC acceptable)
-    - Auto-finalize days strictly older than D-2 that already meet the floor
+    Moves `amount` from a track's total on `from_day` to `to_day`.
     """
-    db_ensure_lag_schema(cur)
-    cur.execute("UPDATE lag_credits SET moved_today = 0, updated_at=now() WHERE day < CURRENT_DATE")
+    if amount <= 0: return
+    # Decrement `from_day` playcount
     cur.execute("""
-        UPDATE daily_totals
-        SET finalized=true, updated_at=now()
-        WHERE day < CURRENT_DATE - INTERVAL '2 days' AND finalized=false AND total_delta >= %s
-    """, (LAG_MIN_TOTAL,))
-
-def reattribute_increments_to_queue(cur, today_iso: str) -> Dict[str, Any]:
-    """
-    Oldest-first fill of any number of lag days. Only moves from TODAY → ANCHOR(s).
-    """
-    # Update yesterday snapshot if we have rows for it
-    cur.execute("SELECT CURRENT_DATE - INTERVAL '1 day' AS yday")
-    yday = cur.fetchone()["yday"].date().isoformat()
-    cur.execute("SELECT 1 FROM streams WHERE platform='spotify' AND stream_date=%s LIMIT 1", (yday,))
-    if cur.fetchone():
-        y_delta = db_catalogue_delta_for_day(cur, yday)
-        db_upsert_daily_total(cur, yday, y_delta, finalized=False)
-
-    queue = db_get_lag_queue(cur, today_iso)
-    if not queue:
-        # still record today's snapshot
-        t_delta = db_catalogue_delta_for_day(cur, today_iso)
-        db_upsert_daily_total(cur, today_iso, t_delta, finalized=False)
-        return {"moved_total": 0, "anchors": []}
-
-    triples = db_today_increments(cur, today_iso)
-    if not triples:
-        t_delta = db_catalogue_delta_for_day(cur, today_iso)
-        db_upsert_daily_total(cur, today_iso, t_delta, finalized=False)
-        return {"moved_total": 0, "anchors": queue}
-
-    remaining_by_track = {tid: inc for (tid, _prev, inc) in triples}
-    prev_by_track      = {tid: prev for (tid, prev, _inc) in triples}
-    moved_overall = 0
-
-    for anchor_day in queue:
-        cur.execute("SELECT total_delta FROM daily_totals WHERE day=%s", (anchor_day,))
-        row = cur.fetchone()
-        current = int(row["total_delta"]) if row else 0
-        need = max(0, LAG_MIN_TOTAL - current)
-        if need <= 0:
-            db_mark_finalized_if_ready(cur, anchor_day)
-            continue
-
-        allowed = _cap_amount_for_anchor(cur, anchor_day, need)
-        if allowed <= 0:
-            continue
-
-        available_today = sum(remaining_by_track.values())
-        if available_today <= 0:
-            break
-
-        move_amount = min(allowed, available_today)
-        to_move = move_amount
-
-        # proportional by remaining inc, monotonic guard
-        while to_move > 0:
-            total_rem = sum(remaining_by_track.values())
-            if total_rem <= 0:
-                break
-            for tid, rem in list(remaining_by_track.items()):
-                if rem <= 0 or to_move <= 0:
-                    continue
-                share = int(round(rem * (to_move / total_rem)))
-                share = max(0, min(share, remaining_by_track[tid]))
-                if share == 0:
-                    continue
-
-                # Decrease today's pc (not below prev)
-                new_today_pc = prev_by_track[tid] + (remaining_by_track[tid] - share)
-                cur.execute("""
-                    UPDATE streams SET playcount=%s
-                    WHERE platform='spotify' AND track_uid=%s AND stream_date=%s
-                """, (new_today_pc, tid, today_iso))
-
-                # Increase anchor day's pc (upsert)
-                cur.execute("""
-                    SELECT playcount FROM streams
-                    WHERE platform='spotify' AND track_uid=%s AND stream_date=%s
-                """, (tid, anchor_day))
-                row_a = cur.fetchone()
-                if row_a:
-                    anchor_pc_base = int(row_a["playcount"] or 0)
-                else:
-                    cur.execute("""
-                        SELECT playcount FROM streams
-                        WHERE platform='spotify' AND track_uid=%s AND stream_date<%s
-                        ORDER BY stream_date DESC LIMIT 1
-                    """, (tid, anchor_day))
-                    rp = cur.fetchone()
-                    anchor_pc_base = int(rp["playcount"] or 0) if rp else 0
-
-                new_anchor_pc = anchor_pc_base + share
-                cur.execute("""
-                    INSERT INTO streams(platform, track_uid, stream_date, playcount)
-                    VALUES ('spotify', %s, %s, %s)
-                    ON CONFLICT (platform, track_uid, stream_date)
-                    DO UPDATE SET playcount=EXCLUDED.playcount
-                """, (tid, anchor_day, new_anchor_pc))
-
-                remaining_by_track[tid] -= share
-                moved_overall += share
-                to_move -= share
-
-        # Update anchor totals/credits + finalize check
-        new_total = current + min(move_amount, available_today)
-        db_upsert_daily_total(cur, anchor_day, new_total, finalized=False)
-        _bump_lag_credits(cur, anchor_day, min(move_amount, available_today))
-        db_mark_finalized_if_ready(cur, anchor_day)
-
-    # Update today's snapshot (not finalized)
-    t_delta = db_catalogue_delta_for_day(cur, today_iso)
-    db_upsert_daily_total(cur, today_iso, t_delta, finalized=False)
-    return {"moved_total": moved_overall, "anchors": queue}
+        UPDATE streams
+        SET playcount = playcount - %s
+        WHERE platform='spotify' AND track_uid=%s AND stream_date=%s
+    """, (amount, track_uid, from_day))
+    # Upsert/increment `to_day` playcount
+    to_day_new_pc = from_prev_pc + amount
+    cur.execute("""
+        INSERT INTO streams(platform, track_uid, stream_date, playcount)
+        VALUES ('spotify', %s, %s, %s)
+        ON CONFLICT (platform, track_uid, stream_date)
+        DO UPDATE SET playcount = streams.playcount + EXCLUDED.playcount
+    """, (track_uid, to_day, to_day_new_pc))
 
 # ────────────────────────────────────────────────────────────────────────────────
-# Streams daily sync (with logging)  >>> RETRY-ON-ZERO UPGRADE
+# MAIN WORKER: Track Streams
 # ────────────────────────────────────────────────────────────────────────────────
-async def sync(max_retries: int = 1, retry_sleep_sec: float = 3.0):
-    """
-    Run the sync. If the run looks like a silent failure, retry once:
-      • Primary trigger: sum of today's deltas == 0
-      • Fallback trigger: sum of fetched playcounts == 0
-    On retry, refresh tokens and clear album cache. Second pass overwrites zeros.
-    """
-    cat = catalogue_index()  # { ISRC: {air_id, artist, title} }
-    order = list(cat.keys())
-    linkmap = {k: v["air_id"] for k, v in cat.items()}
-    today_iso = date.today().isoformat()
+async def run_once(day_override: Optional[str] = None, attempt_idx: int = 1, output_target: str = OUTPUT_TARGET) -> Dict[str, Any]:
+    day_iso = day_override or date.today().isoformat()
+    catalogue = catalogue_index()
+    cat_isrcs = list(catalogue.keys())
+    streams_logger.info("starting run: tracks=%d output=%s attempt=%d", len(cat_isrcs), output_target, attempt_idx)
 
-    async def run_once(attempt_idx: int):
-        nonlocal today_iso
-        logger.info(f"[streams] starting run: tracks={len(order)} output={OUTPUT_TARGET} attempt={attempt_idx+1}")
+    # Spotify tokens
+    search_token = get_search_token() if _has_spotify_creds() else None
+    web_token, client_token = await sniff_tokens()
 
-        web_tok, cli_tok = await sniff_tokens()
-        search_tok = get_search_token()
-        cache: Dict[str, Dict[str, Any]] = {}
-
-        conn = None
-        cur = None
-        if OUTPUT_TARGET in ("postgres", "both"):
-            conn = db_conn()
-            cur = conn.cursor()
-            db_ensure_platform(cur, "spotify")
-
-        errors = 0
-        processed = 0
-        sum_pc = 0
-        sum_delta_like = 0  # computed the same way as Airtable delta logic
+    # --- STAGE 1: Fetch all data from Spotify first ---
+    processed, errors, sum_pc, sum_delta_like = 0, 0, 0, 0
+    records_to_process = []
+    
+    for i, isrc in enumerate(cat_isrcs):
+        if (i+1) % 50 == 0:
+            streams_logger.info("progress: %d/%d", i+1, len(cat_isrcs))
+        
+        playcount, delta_like = None, None
+        api_artist, api_title = None, None
+        cat = catalogue.get(isrc, {})
+        cat_artist = cat.get("artist")
+        cat_title = cat.get("title")
 
         try:
-            for isrc in order:
+            track_info = search_track(isrc, search_token) if search_token else None
+            if not track_info:
+                time.sleep(spotify_sleep)
+                continue
+            
+            track_id, album_id, api_title, api_artist = track_info
+            album_data = fetch_album(album_id, web_token, client_token)
+            
+            tracks = (album_data.get("data", {}).get("albumUnion", {}).get("tracks", {}).get("items", []))
+            for item in tracks:
+                t = item.get("track")
+                if t and t.get("uri") == f"spotify:track:{track_id}":
+                    raw = t.get("playcount")
+                    if raw and raw.isdigit():
+                        playcount = int(raw)
+                        # Estimate "delta like" for Airtable (Postgres calculates this properly)
+                        if output_target in ("airtable", "both"):
+                            prev = prev_count_by_isrc(isrc, day_iso)
+                            if prev is not None and playcount > prev:
+                                delta_like = playcount - prev
+                    break
+            
+            records_to_process.append({
+                "isrc": isrc,
+                "artist": cat_artist or api_artist,
+                "title": cat_title or api_title,
+                "air_id": cat.get("air_id"),
+                "playcount": playcount,
+            })
+            
+            processed += 1
+            if playcount is not None: sum_pc += playcount
+            if delta_like is not None: sum_delta_like += delta_like
+            time.sleep(spotify_sleep)
+        
+        except Exception as e:
+            streams_logger.error("error processing ISRC=%s: %s", isrc, e, exc_info=True)
+            errors += 1
+
+    # --- STAGE 2: Write all fetched data to outputs ---
+    
+    # Write to Airtable
+    if output_target in ("airtable", "both"):
+        streams_logger.info("writing %d records to Airtable", len(records_to_process))
+        for record in records_to_process:
+            if record["air_id"] and record["playcount"] is not None:
                 try:
-                    tr = search_track(isrc, search_tok)  # (tid, aid, tname, artists) or None
-                    if not tr:
-                        # No match → treat as 0
-                        pc = 0
-                        prev = prev_count_by_isrc(isrc, today_iso)
-                        if prev is not None and prev > 0:
-                            # delta-like stays 0
-                            pass
-
-                        if OUTPUT_TARGET in ("airtable", "both"):
-                            upsert_count(linkmap[isrc], isrc, today_iso, pc)
-                        if OUTPUT_TARGET in ("postgres", "both"):
-                            meta = cat.get(isrc, {})
-                            track_uid = db_upsert_track(cur, isrc, meta.get("artist"), meta.get("title"))
-                            db_upsert_stream(cur, "spotify", track_uid, today_iso, pc)
-
-                        sum_pc += pc
-                        processed += 1
-                        continue
-
-                    tid, aid, sp_title, sp_artists = tr
-                    if aid not in cache:
-                        time.sleep(spotify_sleep)
-                        cache[aid] = fetch_album(aid, web_tok, cli_tok)
-
-                    # Find playcount for that track on the album page
-                    pc = 0
-                    js = cache[aid]
-                    for it in js.get("data", {}).get("albumUnion", {}).get("tracksV2", {}).get("items", []):
-                        track = it.get("track", {})
-                        cand = (track.get("uri", "") or "").split(":")[-1] if track.get("uri") else None
-                        if tid in (track.get("id"), cand):
-                            val = track.get("playcount") or 0
-                            try:
-                                pc = int(str(val).replace(",", ""))
-                            except Exception:
-                                pc = 0
-                            break
-
-                    # delta-like (prev from Airtable history if present)
-                    prev = prev_count_by_isrc(isrc, today_iso)
-                    if prev is not None and prev > 0 and pc > 0:
-                        d = pc - prev
-                        if d > 0:
-                            sum_delta_like += d
-
-                    meta = cat.get(isrc, {})
-                    artist = meta.get("artist") or sp_artists
-                    title  = meta.get("title")  or sp_title
-
-                    if OUTPUT_TARGET in ("airtable", "both"):
-                        upsert_count(linkmap[isrc], isrc, today_iso, pc)
-                    if OUTPUT_TARGET in ("postgres", "both"):
-                        track_uid = db_upsert_track(cur, isrc, artist, title)
-                        db_upsert_stream(cur, "spotify", track_uid, today_iso, pc)
-
-                    sum_pc += pc
-                    processed += 1
-
+                    upsert_count(record["air_id"], record["isrc"], day_iso, record["playcount"])
                 except Exception as e:
+                    streams_logger.error("[airtable] error upserting ISRC=%s: %s", record["isrc"], e)
                     errors += 1
-                    logger.exception(f"[streams] error processing ISRC={isrc}: {e}")
 
-            if conn:
-                conn.commit()
+    # Write to Postgres
+    if output_target in ("postgres", "both"):
+        streams_logger.info("writing %d records to Postgres", len(records_to_process))
+        conn = None
+        try:
+            conn = db_conn()
+            with conn.cursor() as cur:
+                db_ensure_platform(cur, platform="spotify")
+                for record in records_to_process:
+                    if record["playcount"] is not None:
+                        try:
+                            track_uid = db_upsert_track(cur, record["isrc"], record["artist"], record["title"])
+                            db_upsert_stream(cur, "spotify", track_uid, day_iso, record["playcount"])
+                        except Exception as e:
+                            # Log error for the specific record but continue the transaction
+                            streams_logger.error("[postgres] error processing ISRC=%s in batch: %s", record["isrc"], e)
+                            errors += 1
+            conn.commit()
+        except psycopg2.Error as e:
+            streams_logger.exception("[postgres] stream write transaction failed: %s", e)
+            if conn: conn.rollback()
         finally:
-            if cur: cur.close()
             if conn: conn.close()
 
-        logger.info(f"[streams] completed: processed={processed} errors={errors} date={today_iso} "
-                    f"output={OUTPUT_TARGET} sum_pc={sum_pc} sum_delta_like={sum_delta_like} attempt={attempt_idx+1}")
-        return {"processed": processed, "errors": errors, "sum_pc": sum_pc, "sum_delta_like": sum_delta_like}
+    # --- STAGE 3: Handle lag calculation in a separate, self-contained transaction ---
+    if output_target in ("postgres", "both"):
+        conn = None
+        try:
+            conn = db_conn()
+            with conn.cursor() as cur:
+                # 1. Ensure schema exists & record today's raw total
+                db_ensure_lag_schema(cur)
+                total_delta = db_catalogue_delta_for_day(cur, day_iso)
+                db_upsert_daily_total(cur, day_iso, total_delta, finalized=(total_delta >= LAG_MIN_TOTAL))
 
-    # First attempt
-    stats = await run_once(attempt_idx=0)
+                # 2. Find days that need backfilling
+                lag_q = db_get_lag_queue(cur, day_iso)
+                if not lag_q:
+                    streams_logger.info("[lag] no past days require backfilling")
+                else:
+                    streams_logger.info("[lag] queue: %s", lag_q)
+                    increments = db_today_increments(cur, day_iso)
+                    increments.sort(key=lambda r: r[2], reverse=True) # sort by largest increment desc
 
-    # Decide retry
-    should_retry = False
-    reason = None
-    if stats["sum_delta_like"] == 0:
-        should_retry = True
-        reason = "sum_delta_like==0"
-    elif stats["sum_pc"] == 0:
-        should_retry = True
-        reason = "sum_pc==0"
+                    # 3. Iterate through days needing help & try to fill them from today's increments
+                    for to_day in lag_q:
+                        cur.execute("SELECT total_delta FROM daily_totals WHERE day=%s", (to_day,))
+                        to_day_current = int(cur.fetchone()["total_delta"])
+                        needed = LAG_MIN_TOTAL - to_day_current
+                        if needed <= 0: continue
 
-    if should_retry and max_retries > 0:
-        logger.warning(f"[streams] retry triggered ({reason}); sleeping {retry_sleep_sec}s then refreshing tokens…")
-        time.sleep(retry_sleep_sec)
-        stats2 = await run_once(attempt_idx=1)
-        if stats2["sum_delta_like"] == 0 and stats2["sum_pc"] == 0:
-            logger.error("[streams] hard-zero after retry (both sum_delta_like and sum_pc are 0).")
-        else:
-            logger.info("[streams] retry succeeded (non-zero signal detected).")
+                        capped_needed = _cap_amount_for_anchor(cur, day_iso, needed)
+                        if capped_needed <= 0: break # stop if we hit daily/checkpoint caps for today
 
-    # ── Lag reconciliation (DB-only; restart/idempotent-safe)
-    try:
-        today_iso = date.today().isoformat()
-        with db_conn() as conn, conn.cursor() as cur:
-            daily_housekeeping(cur, today_iso)
-            res = reattribute_increments_to_queue(cur, today_iso)
+                        moved_this_day = 0
+                        for i in range(len(increments)):
+                            track_uid, prev_pc, inc = increments[i]
+                            if inc <= 0: continue
+                            
+                            can_move = min(inc, capped_needed - moved_this_day)
+                            if can_move <= 0: continue
+
+                            db_apply_lag_transfer(cur, day_iso, to_day, track_uid, prev_pc, can_move)
+                            increments[i] = (track_uid, prev_pc, inc - can_move)
+                            moved_this_day += can_move
+                            if moved_this_day >= capped_needed: break
+                        
+                        _bump_lag_credits(cur, day_iso, moved_this_day)
+
+                # 4. Re-calculate totals for today and any affected days, then mark as finalized if ready
+                all_affected_days = set(lag_q + [day_iso])
+                for d in all_affected_days:
+                    recalc_delta = db_catalogue_delta_for_day(cur, d)
+                    db_upsert_daily_total(cur, d, recalc_delta, finalized=False)
+                    db_mark_finalized_if_ready(cur, d)
+            
             conn.commit()
-        logger.info(f"[lag] moved={res['moved_total']} anchors={res['anchors']}")
-    except Exception as e:
-        logger.exception("[lag] reconciliation failed: %s", e)
+        except psycopg2.Error as e:
+            streams_logger.exception("[postgres] lag processing transaction failed: %s", e)
+            if conn: conn.rollback()
+        finally:
+            if conn: conn.close()
+            
+    stats = {
+        "processed": processed,
+        "errors": errors,
+        "date": day_iso,
+        "output": output_target,
+        "sum_pc": sum_pc,
+        "sum_delta_like": sum_delta_like,
+        "attempt": attempt_idx
+    }
+    streams_logger.info("completed: %s", " ".join(f"{k}={v}" for k, v in stats.items()))
+    return stats
 
 # ────────────────────────────────────────────────────────────────────────────────
-# Followers backfill / today (with logging)
+# MAIN WORKER: Playlist Followers
 # ────────────────────────────────────────────────────────────────────────────────
-def backfill_playlist_followers_all(platform: str = "spotify") -> int:
-    idx = playlists_index_from_airtable()
-    params = {"pageSize": 100, "sort[0][field]": FOLLOWERS_DATE_FIELD, "sort[0][direction]": "asc"}
-    rows = at_paginate(FOLLOWERS_TABLE, params)
+def run_playlist_followers(day_override: Optional[str] = None):
+    day_iso = day_override or date.today().isoformat()
+    playlists = playlists_index_from_airtable()
+    followers_logger.info("starting followers run: playlists=%d", len(playlists))
 
-    inserted = 0
-    with db_conn() as conn, conn.cursor() as cur:
-        db_ensure_platform(cur, platform)
-        for r in rows:
-            f = r.get("fields", {})
-            links = f.get(FOLLOWERS_LINK_FIELD) or []
-            if not links:
+    if not _has_spotify_creds():
+        raise RuntimeError("Spotify API credentials not set for playlist followers.")
+    
+    bearer = get_search_token()
+    processed, errors = 0, 0
+    records_to_write_at = []
+    records_to_write_pg = []
+
+    for airtable_rec_id, p_info in playlists.items():
+        urn = p_info["playlist_id_urn"]
+        name = p_info["name"]
+        plain_id = urn_to_plain_id(urn)
+        try:
+            r = requests.get(f"https://api.spotify.com/v1/playlists/{plain_id}?fields=followers(total)",
+                               headers={"Authorization": f"Bearer {bearer}"}, timeout=30)
+            if r.status_code == 404:
+                followers_logger.warning("playlist not found (404): id=%s name=%s", plain_id, name)
                 continue
-            meta = idx.get(links[0])
-            if not meta:
-                continue
-            urn = meta["playlist_id_urn"]
-            day_iso = f.get(FOLLOWERS_DATE_FIELD)
+            r.raise_for_status()
+            
+            followers = int(r.json().get("followers", {}).get("total", 0) or 0)
+            
+            # Stage writes for Airtable
+            records_to_write_at.append({
+                "fields": {
+                    FOLLOWERS_LINK_FIELD: [airtable_rec_id],
+                    FOLLOWERS_DATE_FIELD: day_iso,
+                    FOLLOWERS_COUNT_FIELD: followers,
+                }
+            })
+            # Stage writes for Postgres
+            records_to_write_pg.append({
+                "urn": urn,
+                "name": name,
+                "followers": followers
+            })
+            processed += 1
+            time.sleep(airtable_sleep)
+        except Exception as e:
+            followers_logger.error("error processing playlist id=%s name=%s: %s", plain_id, name, e)
+            errors += 1
+    
+    # Batch write to Airtable
+    if OUTPUT_TARGET in ("airtable", "both") and records_to_write_at:
+        try:
+            followers_logger.info("writing %d follower counts to Airtable", len(records_to_write_at))
+            at_batch_patch(FOLLOWERS_TABLE, records_to_write_at)
+        except Exception as e:
+            followers_logger.error("Airtable batch update failed: %s", e)
+            errors += len(records_to_write_at)
+
+    # Batch write to Postgres
+    if OUTPUT_TARGET in ("postgres", "both") and records_to_write_pg:
+        followers_logger.info("writing %d follower counts to Postgres", len(records_to_write_pg))
+        conn = None
+        try:
+            conn = db_conn()
+            with conn.cursor() as cur:
+                db_ensure_platform(cur, "spotify")
+                for rec in records_to_write_pg:
+                    db_upsert_playlist_followers(cur, "spotify", rec["urn"], day_iso, rec["followers"], rec["name"])
+            conn.commit()
+        except psycopg2.Error as e:
+            followers_logger.exception("Postgres followers write failed: %s", e)
+            if conn: conn.rollback()
+            errors += len(records_to_write_pg)
+        finally:
+            if conn: conn.close()
+
+    stats = {"processed": processed, "errors": errors, "date": day_iso}
+    followers_logger.info("completed followers run: %s", " ".join(f"{k}={v}" for k, v in stats.items()))
+    return stats
+
+
+# ────────────────────────────────────────────────────────────────────────────────
+# Scheduler
+# ────────────────────────────────────────────────────────────────────────────────
+_RUNNING = threading.Event()
+_run_task: Optional[asyncio.Task] = None
+
+def _schedule_loop():
+    global _run_task
+    delay_secs = SCHEDULE_EVERY_HOURS * 60 * 60
+    scheduler_logger.info("scheduler enabled: running every %d hours", SCHEDULE_EVERY_HOURS)
+    
+    async def sync():
+        global _run_task
+        if _run_task and not _run_task.done():
+            scheduler_logger.warning("skipping scheduled run, previous task still active")
+            return
+        
+        async def run_with_retries():
+            for i in range(3):
+                try:
+                    stats = await run_once(attempt_idx=i+1)
+                    return stats
+                except Exception as e:
+                    scheduler_logger.exception("run_once failed (attempt %d/3): %s", i + 1, e)
+                    if i < 2:
+                        await asyncio.sleep(60 * (i + 1)) # 1, 2 min waits
+            return {"error": "failed after 3 attempts"}
+        
+        _run_task = asyncio.create_task(run_with_retries())
+        await _run_task
+
+    # Main loop
+    next_run_time = time.time()
+    while not _RUNNING.is_set():
+        if time.time() >= next_run_time:
+            scheduler_logger.info("tick → running sync()")
             try:
-                followers = int(f.get(FOLLOWERS_COUNT_FIELD, 0) or 0)
-            except Exception:
-                followers = 0
-            db_upsert_playlist_followers(cur, platform, urn, day_iso, followers, meta.get("name"))
-            inserted += 1
-        conn.commit()
-    logger.info(f"[followers/backfill→db] completed: inserted_or_updated={inserted}")
-    return inserted
+                asyncio.run(sync())
+            except Exception as e:
+                scheduler_logger.error("loop error: %s", e, exc_info=True)
+            next_run_time = time.time() + delay_secs
+        
+        time.sleep(30) # check every 30s
+    scheduler_logger.info("scheduler loop exiting")
 
-def get_client_bearer() -> str:
-    r = requests.post(
-        "https://accounts.spotify.com/api/token",
-        data={"grant_type": "client_credentials"},
-        auth=(CLIENT_ID, CLIENT_SECRET),
-        timeout=60,
-    )
-    if not r.ok:
-        raise RuntimeError(f"spotify_token_error: {r.status_code} {r.text}")
-    return r.json()["access_token"]
-
-def fetch_playlist_followers_spotify(plain_id: str, bearer: str) -> Optional[int]:
-    r = requests.get(
-        f"https://api.spotify.com/v1/playlists/{plain_id}",
-        headers={"Authorization": f"Bearer {bearer}"},
-        params={"fields": "followers.total,name"},
-        timeout=30,
-    )
-    if r.status_code != 200:
-        return None
-    return int(r.json().get("followers", {}).get("total", 0) or 0)
-
-def run_followers_today(platform: str = "spotify", tzkey: Optional[str] = None) -> Dict[str, Any]:
-    idx = playlists_index_from_airtable()
-    if not idx:
-        logger.warning("[followers] aborted: no playlists found in Airtable source")
-        return {"inserted": 0, "skipped": 0, "reason": "no_playlists"}
-
-    try:
-        bearer = get_client_bearer()
-    except Exception as e:
-        logger.exception(f"[followers] failed to get bearer: {e}")
-        raise
-
-    today = today_iso_local()
-
-    inserted = 0
-    skipped = 0
-    with db_conn() as conn, conn.cursor() as cur:
-        db_ensure_platform(cur, platform)
-        for meta in idx.values():
-            urn = meta["playlist_id_urn"]
-            plain = urn_to_plain_id(urn)
-            followers = fetch_playlist_followers_spotify(plain, bearer)
-            if followers is None:
-                skipped += 1
-                logger.warning(f"[followers] skip pid={plain} reason=api_error_or_rate_limit")
-                continue
-            db_upsert_playlist_followers(cur, platform, urn, today, followers, meta.get("name"))
-            inserted += 1
-        conn.commit()
-
-    logger.info(f"[followers] completed: playlists={len(idx)} inserted={inserted} skipped={skipped} date={today}")
-    return {"inserted": inserted, "skipped": skipped, "date": today}
 
 # ────────────────────────────────────────────────────────────────────────────────
-# Flask endpoints (with logging)
+# FLASK APP
 # ────────────────────────────────────────────────────────────────────────────────
 app = Flask(__name__)
 
-@app.get("/health")
-def health():
+@app.route("/")
+def index():
     return jsonify({
-        "ok": True,
-        "base": AIRTABLE_BASE_ID,
+        "status": "ok",
+        "scheduler_enabled": ENABLE_SCHEDULER,
         "output_target": OUTPUT_TARGET,
-        "has_spotify_creds": _has_spotify_creds()
+        "database_connected": bool(DATABASE_URL)
     })
 
-@app.get("/airtable/ping")
-def airtable_ping():
-    try:
-        r = requests.get(at_url(PLAYCOUNTS_TABLE), headers=at_headers(), params={"pageSize": 1}, timeout=30)
-        ok = r.ok
-        body = r.json() if ok else {"error": r.text}
-        return jsonify({"ok": ok, "status": r.status_code, "table": PLAYCOUNTS_TABLE, "base": AIRTABLE_BASE_ID, "body": body}), (200 if ok else 502)
-    except Exception as e:
-        return jsonify({"ok": False, "error": str(e)}), 500
-
-@app.get("/db/ping")
-def db_ping():
-    try:
-        with db_conn() as conn, conn.cursor() as cur:
-            cur.execute("SELECT 1 AS ok")
-            row = cur.fetchone()
-        return jsonify({"ok": True, "row": row}), 200
-    except Exception as e:
-        return jsonify({"ok": False, "error": str(e)}), 500
-
-@app.get("/diag/playlists")
-def diag_playlists():
-    idx = playlists_index_from_airtable()
-    return jsonify({"ok": True, "count": len(idx), "sample": list(idx.values())[:5]}), 200
-
-@app.get("/diag/spotify_token")
-def diag_spotify_token():
-    try:
-        tok = get_client_bearer()
-        return jsonify({"ok": True, "token_prefix": tok[:12]}), 200
-    except Exception as e:
-        return jsonify({"ok": False, "error": str(e)}), 500
-
-@app.get("/diag/spotify")
-def diag_spotify():
-    pid = request.args.get("pid")
-    if not pid:
-        return jsonify({"ok": False, "error": "pid required"}), 400
-    try:
-        bearer = get_client_bearer()
-        val = fetch_playlist_followers_spotify(pid, bearer)
-        return jsonify({"ok": True, "followers": val}), 200
-    except Exception as e:
-        return jsonify({"ok": False, "error": str(e)}), 500
-
-@app.post("/run")
-def run_endpoint():
+@app.route("/run", methods=["POST"])
+def run_once_handler():
     _check_token()
-    async_flag = request.args.get("async", "0").lower() in ("1", "true", "yes")
-    if async_flag:
-        logger.info("[streams] async start requested")
-        threading.Thread(target=lambda: asyncio.run(sync()), daemon=True).start()
+    is_async = request.args.get("async", "false").lower() == "true"
+    day = request.json.get("date") if request.is_json else None
+    
+    async def sync():
+        global _run_task
+        if _run_task and not _run_task.done():
+            return jsonify({"status": "error", "message": "a task is already running"}), 429
+        
+        _run_task = asyncio.create_task(run_once(day_override=day))
+        await _run_task
+        return jsonify(_run_task.result())
+
+    if is_async:
+        streams_logger.info("async start requested")
+        asyncio.run(sync())
         return jsonify({"status": "started"}), 202
     else:
-        logger.info("[streams] sync start")
-        try:
-            asyncio.run(sync())
-            logger.info("[streams] sync completed successfully")
-            return jsonify({"status": "completed"}), 200
-        except Exception as e:
-            logger.exception(f"[streams] sync failed: {e}")
-            return jsonify({"status": "failed", "error": str(e)}), 500
+        return asyncio.run(sync())
 
-@app.post("/backfill")
-def backfill_endpoint():
+@app.route("/run_followers_today", methods=["POST"])
+def run_playlist_followers_handler():
     _check_token()
+    day = request.json.get("date") if request.is_json else None
     try:
+        stats = run_playlist_followers(day_override=day)
+        return jsonify(stats)
+    except Exception as e:
+        followers_logger.exception("followers run failed: %s", e)
+        return jsonify({"error": str(e)}), 500
+
+@app.route("/backfill/<table>", methods=["POST"])
+def backfill_handler(table: str):
+    _check_token()
+    if table == "tracks":
         changed = backfill_deltas_for_all_tracks()
-        logger.info(f"[backfill/streams] completed: changed={changed}")
-        return jsonify({"status": "backfilled_playcounts", "changed": changed}), 200
-    except Exception as e:
-        logger.exception(f"[backfill/streams] failed: {e}")
-        return jsonify({"status": "failed", "error": str(e)}), 500
-
-@app.post("/backfill_followers")
-def backfill_followers_endpoint():
-    _check_token()
-    try:
+    elif table == "followers":
         changed = backfill_deltas_for_followers()
-        logger.info(f"[backfill/followers] completed: changed={changed}")
-        return jsonify({"status": "backfilled_followers", "changed": changed}), 200
-    except Exception as e:
-        logger.exception(f"[backfill/followers] failed: {e}")
-        return jsonify({"status": "failed", "error": str(e)}), 500
+    else:
+        return jsonify({"error": "invalid table"}), 404
+    return jsonify({"table": table, "updated_records": changed})
 
-@app.post("/run_catalogue_health")
-def run_catalogue_health_endpoint():
+@app.route("/catalogue_health", methods=["POST"])
+def run_ch_handler():
     _check_token()
-    if ch_run is None:
-        logger.error("[catalogue_health] cannot run: module import failed previously")
-        return jsonify({"ok": False, "error": "module_import_failed"}), 500
-
-    async_flag = (request.args.get("async", "0").lower() in ("1", "true", "yes"))
-    limit = request.args.get("limit", type=int)  # optional
-    dry = (request.args.get("dry_run", "0").lower() in ("1", "true", "yes"))
-
-    def _job():
-        try:
-            logger.info("[catalogue_health] ▶ start | limit=%s dry_run=%s", limit, dry)
-            res = ch_run(limit_override=limit, dry_run_override=dry)
-            logger.info("[catalogue_health] ✅ finish | %s", res)
-        except Exception as e:
-            logger.exception("[catalogue_health] ❌ failed: %s", e)
-
-    if async_flag:
-        threading.Thread(target=_job, daemon=True).start()
-        return jsonify({"ok": True, "status": "started"}), 202
-
+    if not ch_run:
+        return jsonify({"error": "catalogue_health module not available"}), 501
     try:
-        res = ch_run(limit_override=limit, dry_run_override=dry)
-        logger.info("[catalogue_health] ✅ finish | %s", res)
-        return jsonify({"ok": True, **res}), 200
+        ch_run()
+        return jsonify({"status": "ok"})
     except Exception as e:
-        logger.exception("[catalogue_health] ❌ failed: %s", e)
-        return jsonify({"ok": False, "error": str(e)}), 500
+        logger.exception("catalogue_health run failed: %s", e)
+        return jsonify({"error": str(e)}), 500
 
-# ────────────────────────────────────────────────────────────────────────────────
-# Backfill Streams (Airtable → Postgres)  (UPDATED to upsert artist/title)
-# ────────────────────────────────────────────────────────────────────────────────
-def backfill_airtable_to_postgres(days: Optional[str] = None) -> int:
-    # Build ISRC → (artist,title) map up front
-    cat = catalogue_index()  # {ISRC: {air_id, artist, title}}
-
-    recs = at_paginate(CATALOGUE_TABLE, {"view": CATALOGUE_VIEW, "pageSize": 100, "fields[]": CATALOGUE_ISRC_FIELD})
-    cat_id_to_isrc = {r["id"]: (r["fields"].get(CATALOGUE_ISRC_FIELD) or "").strip().upper()
-                      for r in recs if r.get("fields", {}).get(CATALOGUE_ISRC_FIELD)}
-
-    all_data = False
-    d_val: Optional[int] = None
-    if days is None:
-        all_data = True
-    else:
-        try:
-            d_val = int(days)
-            all_data = (d_val <= 0)
-        except Exception:
-            all_data = str(days).lower() in ("all", "everything", "full")
-
-    params = {"pageSize": 100, "sort[0][field]": PLAYCOUNTS_DATE_FIELD, "sort[0][direction]": "asc"}
-    if not all_data and d_val is not None and d_val > 0:
-        params["filterByFormula"] = f"IS_AFTER({{{PLAYCOUNTS_DATE_FIELD}}}, DATEADD(TODAY(), -{d_val}, 'days'))"
-
-    rows = at_paginate(PLAYCOUNTS_TABLE, params)
-
-    inserted = 0
-    with db_conn() as conn:
-        with conn.cursor() as cur:
-            db_ensure_platform(cur, "spotify")
-            for r in rows:
-                f = r.get("fields", {})
-                links = f.get(PLAYCOUNTS_LINK_FIELD) or []
-                if not links:
-                    continue
-                isrc = (cat_id_to_isrc.get(links[0]) or "").strip().upper()
-                if not isrc:
-                    continue
-                day_iso = f.get(PLAYCOUNTS_DATE_FIELD)
-                try:
-                    count = int(f.get(PLAYCOUNTS_COUNT_FIELD, 0) or 0)
-                except Exception:
-                    count = 0
-
-                meta = cat.get(isrc, {})
-                track_uid = db_upsert_track(cur, isrc, meta.get("artist"), meta.get("title"))
-                db_upsert_stream(cur, "spotify", track_uid, day_iso, count)
-                inserted += 1
-        conn.commit()
-    logger.info(f"[backfill/airtable→postgres] completed: inserted={inserted} days={days}")
-    return inserted
-
-# ────────────────────────────────────────────────────────────────────────────────
-# 6h scheduler (aligned 00/06/12/18) with advisory-lock singleton
-# ────────────────────────────────────────────────────────────────────────────────
-def _seconds_until_next_tick(now: datetime, step_hours: int = 6) -> int:
-    block = ((now.hour // step_hours) + 1) * step_hours
-    next_dt = now.replace(minute=0, second=0, microsecond=0)
-    if block >= 24:
-        next_dt = (next_dt.replace(hour=0) + timedelta(days=1))
-    else:
-        next_dt = next_dt.replace(hour=block)
-    return max(1, int((next_dt - now).total_seconds()))
-
-def _try_advisory_lock(conn, key_bigint: int) -> bool:
-    with conn.cursor() as cur:
-        cur.execute("SELECT pg_try_advisory_lock(%s) AS ok", (key_bigint,))
-        return bool(cur.fetchone()["ok"])
-
-def _schedule_loop():
-    # stable 64-bit key for singleton lock (any constant works)
-    LOCK_KEY = 634269201837461123
-    while True:
-        try:
-            with db_conn() as c:
-                if not _try_advisory_lock(c, LOCK_KEY):
-                    # Another worker holds the scheduler; sleep briefly and retry
-                    time.sleep(15)
-                    continue
-            # We hold the lock: run sync immediately, then align to next boundary
-            logger.info("[scheduler] tick → running sync()")
-            asyncio.run(sync())
-            sleep_s = _seconds_until_next_tick(datetime.now())
-            logger.info(f"[scheduler] sleeping {sleep_s}s until next 6h boundary")
-            time.sleep(sleep_s)
-        except Exception as e:
-            logger.exception("[scheduler] loop error: %s", e)
-            time.sleep(30)
-
-# Start scheduler (singleton via DB lock)
-if ENABLE_SCHEDULER:
-    threading.Thread(target=_schedule_loop, daemon=True).start()
-
-# ────────────────────────────────────────────────────────────────────────────────
-# Timezone helpers (single source of truth)
-# ────────────────────────────────────────────────────────────────────────────────
-try:
-    from zoneinfo import ZoneInfo, ZoneInfoNotFoundError  # py3.9+
-except Exception:
-    ZoneInfo = None
-    class ZoneInfoNotFoundError(Exception):
-        pass
-
-DEFAULT_TZ = os.getenv("LOCAL_TZ") or "UTC"
-
-def today_iso_local(tzkey: Optional[str] = None) -> str:
-    tzname = (tzkey or DEFAULT_TZ or "UTC")
-    if ZoneInfo:
-        try:
-            return datetime.now(ZoneInfo(tzname)).date().isoformat()
-        except ZoneInfoNotFoundError:
-            pass
-        except Exception:
-            pass
-    return datetime.utcnow().date().isoformat()
-
-# ────────────────────────────────────────────────────────────────────────────────
-# Entrypoint
-# ────────────────────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
-    port = int(os.environ.get("PORT", "3000"))
-    logger.info(f"[startup] app booting on 0.0.0.0:{port} tz={LOCAL_TZ} output={OUTPUT_TARGET}")
-    # Print route map to confirm /run_catalogue_health exists
-    try:
-        logger.info("[startup] routes: %s", [str(r) for r in app.url_map.iter_rules()])
-    except Exception:
-        pass
+    if ENABLE_SCHEDULER:
+        threading.Thread(target=_schedule_loop, daemon=True).start()
+    
+    port = int(os.environ.get("PORT", 8080))
     app.run(host="0.0.0.0", port=port)
