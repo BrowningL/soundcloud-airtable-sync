@@ -138,6 +138,13 @@ def at_batch_patch(table: str, records: List[Dict[str, Any]]):
         chunk = records[i:i+10]
         r = requests.patch(at_url(table), headers=at_headers(), json={"records": chunk}, timeout=60)
         if r.status_code not in (200, 201):
+            # Enhanced error logging
+            error_details = r.text
+            try:
+                error_details = r.json()
+            except Exception:
+                pass
+            logger.error(f"Airtable batch patch error details: {error_details}")
             raise RuntimeError(f"Airtable error {r.status_code}: {r.text}")
         i += 10
         time.sleep(airtable_sleep)
@@ -909,7 +916,8 @@ SPOTIFY_REFRESH_TOKEN = os.getenv("SPOTIFY_REFRESH_TOKEN")
 CAT_F_URI = os.getenv("CAT_F_URI", "Spotify URI")
 CAT_F_ISRC = os.getenv("CAT_F_ISRC", "ISRC")
 
-PLY_F_LAST_SNAPSHOT = os.getenv("PLY_F_LAST_SNAPSHOT", "Last Snapshot ID")
+# FIX: Default value updated to match user's schema ("Snapshot ID")
+PLY_F_LAST_SNAPSHOT = os.getenv("PLY_F_LAST_SNAPSHOT", "Snapshot ID")
 PLY_F_ORDER_HASH = os.getenv("PLY_F_ORDER_HASH", "Last Order Hash")
 PLY_F_LAST_SYNC = os.getenv("PLY_F_LAST_SYNC", "Last Synced")
 PLY_POSSIBLE_PLAYLIST_FIELDS = [
@@ -1083,8 +1091,6 @@ def run_playlist_sync():
     cat_by_uri = {rec["fields"].get(CAT_F_URI): rec["id"] for rec in catalogue_raw if rec["fields"].get(CAT_F_URI)}
     
     placements_by_playlist_id = {}
-    # Replace it with this corrected block
-    # Replace it with this corrected block
     for plac in all_placements_raw:
         playlist_links = plac["fields"].get(PL_F_PLAYLIST, [])
         track_links = plac["fields"].get(PL_F_TRACK_LINK, [])
@@ -1097,6 +1103,7 @@ def run_playlist_sync():
             "catId": track_links[0],
             "pos": plac["fields"].get(PL_F_POSITION, 0)
         })
+    
     sync_logger.info(f"Indexed {len(cat_by_uri)} catalogue items and placements for {len(placements_by_playlist_id)} playlists.")
 
     # 4. Process each playlist
@@ -1145,8 +1152,6 @@ def run_playlist_sync():
                 if cat_id:
                     desired.append({"catId": cat_id, "pos": i + 1})
                 else:
-                    # Note: This version doesn't auto-create catalogue items to keep it simpler.
-                    # That logic can be added back if needed.
                     sync_logger.warning(f'Track URI {track["uri"]} ({track["name"]}) not in Catalogue. Skipping placement.')
 
             # Get existing placements and diff
@@ -1175,12 +1180,16 @@ def run_playlist_sync():
                         PL_F_POSITION: c["pos"],
                     }} for c in to_create
                 ]
-                # The existing app.py doesn't have a create helper, so we build it here.
                 i = 0
                 while i < len(create_payload):
                     chunk = create_payload[i:i+10]
                     r = requests.post(at_url(PLACEMENTS_TABLE), headers=at_headers(), json={"records": chunk}, timeout=60)
-                    r.raise_for_status()
+                    try:
+                        r.raise_for_status()
+                    except requests.exceptions.HTTPError as e:
+                        # FIX: Add detailed error logging
+                        sync_logger.error(f"Airtable create error on chunk: {r.status_code} - {r.text}")
+                        raise e
                     i += 10
                     time.sleep(airtable_sleep)
                 sync_logger.info(f"Created {len(create_payload)} new placement records.")
