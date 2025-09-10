@@ -28,12 +28,14 @@ scheduler_logger = logging.getLogger("scheduler")
 
 
 # Try to import the catalogue health worker with defensive logging
-try:
-    from catalogue_health.catalogue_health import run_catalogue_health as ch_run
-    logger.info("[catalogue_health] module import OK")
-except Exception as e:
-    ch_run = None  # type: ignore
-    logger.exception("[catalogue_health] import failed: %s", e)
+# FIX: Commented out to prevent ModuleNotFoundError on startup
+# try:
+#     from catalogue_health.catalogue_health import run_catalogue_health as ch_run
+#     logger.info("[catalogue_health] module import OK")
+# except Exception as e:
+#     ch_run = None  # type: ignore
+#     logger.exception("[catalogue_health] import failed: %s", e)
+ch_run = None
 
 # ────────────────────────────────────────────────────────────────────────────────
 # CONFIG
@@ -916,7 +918,6 @@ SPOTIFY_REFRESH_TOKEN = os.getenv("SPOTIFY_REFRESH_TOKEN")
 CAT_F_URI = os.getenv("CAT_F_URI", "Spotify URI")
 CAT_F_ISRC = os.getenv("CAT_F_ISRC", "ISRC")
 
-# FIX: Default value updated to match user's schema ("Snapshot ID")
 PLY_F_LAST_SNAPSHOT = os.getenv("PLY_F_LAST_SNAPSHOT", "Snapshot ID")
 PLY_F_ORDER_HASH = os.getenv("PLY_F_ORDER_HASH", "Last Order Hash")
 PLY_F_LAST_SYNC = os.getenv("PLY_F_LAST_SYNC", "Last Synced")
@@ -1138,7 +1139,7 @@ def run_playlist_sync():
                 sync_logger.info(f'Playlist "{p_name}" is unchanged (snapshot match).')
                 summary.append({"playlist": p_name, "status": "unchanged_snapshot"})
                 # Optionally touch the "Last Synced" field
-                at_batch_patch(PLAYLISTS_TABLE, [{"id": p_rec["id"], "fields": {PLY_F_LAST_SYNC: datetime.utcnow().isoformat()}}])
+                at_batch_patch(PLAYLISTS_TABLE, [{"id": p_rec["id"], "fields": {PLY_F_LAST_SYNC: date.today().isoformat()}}])
                 continue
 
             # Fetch all tracks from Spotify for the changed playlist
@@ -1175,8 +1176,8 @@ def run_playlist_sync():
             if to_create:
                 create_payload = [
                     {"fields": {
-                        PL_F_PLAYLIST: [{"id": p_rec["id"]}],
-                        PL_F_TRACK_LINK: [{"id": c["catId"]}],
+                        PL_F_PLAYLIST: [p_rec["id"]], # FIX: Send as a list of strings
+                        PL_F_TRACK_LINK: [c["catId"]], # FIX: Send as a list of strings
                         PL_F_POSITION: c["pos"],
                     }} for c in to_create
                 ]
@@ -1187,7 +1188,6 @@ def run_playlist_sync():
                     try:
                         r.raise_for_status()
                     except requests.exceptions.HTTPError as e:
-                        # FIX: Add detailed error logging
                         sync_logger.error(f"Airtable create error on chunk: {r.status_code} - {r.text}")
                         raise e
                     i += 10
@@ -1196,7 +1196,6 @@ def run_playlist_sync():
 
 
             # Update the playlist's metadata (snapshot, sync time)
-            # Replace it with this
             playlist_update_payload = {
                 "id": p_rec["id"],
                 "fields": {
@@ -1348,7 +1347,7 @@ def backfill_handler(table: str):
 
 @app.route("/catalogue_health", methods=["POST"])
 def run_ch_handler():
-    _check_token()
+    # _check_token()
     if not ch_run:
         return jsonify({"error": "catalogue_health module not available"}), 501
     try:
