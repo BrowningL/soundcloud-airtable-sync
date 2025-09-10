@@ -1083,19 +1083,19 @@ def run_playlist_sync():
     cat_by_uri = {rec["fields"].get(CAT_F_URI): rec["id"] for rec in catalogue_raw if rec["fields"].get(CAT_F_URI)}
     
     placements_by_playlist_id = {}
+    # Replace it with this corrected block
     for plac in all_placements_raw:
         playlist_links = plac["fields"].get(PL_F_PLAYLIST, [])
         track_links = plac["fields"].get(PL_F_TRACK_LINK, [])
         if not playlist_links or not track_links:
             continue
-        
-        playlist_id = playlist_links[0]["id"]
+    
+        **playlist_id = playlist_links[0]**
         placements_by_playlist_id.setdefault(playlist_id, []).append({
             "recId": plac["id"],
-            "catId": track_links[0]["id"],
+            **"catId": track_links[0],**
             "pos": plac["fields"].get(PL_F_POSITION, 0)
         })
-    
     sync_logger.info(f"Indexed {len(cat_by_uri)} catalogue items and placements for {len(placements_by_playlist_id)} playlists.")
 
     # 4. Process each playlist
