@@ -1196,11 +1196,12 @@ def run_playlist_sync():
 
 
             # Update the playlist's metadata (snapshot, sync time)
+            # Replace it with this
             playlist_update_payload = {
                 "id": p_rec["id"],
                 "fields": {
                     PLY_F_LAST_SNAPSHOT: snapshot_id,
-                    PLY_F_LAST_SYNC: datetime.utcnow().isoformat()
+                    PLY_F_LAST_SYNC: date.today().isoformat()
                 }
             }
             at_batch_patch(PLAYLISTS_TABLE, [playlist_update_payload])
