@@ -28,13 +28,6 @@ scheduler_logger = logging.getLogger("scheduler")
 
 
 # Try to import the catalogue health worker with defensive logging
-# FIX: Commented out to prevent ModuleNotFoundError on startup
-# try:
-#     from catalogue_health.catalogue_health import run_catalogue_health as ch_run
-#     logger.info("[catalogue_health] module import OK")
-# except Exception as e:
-#     ch_run = None  # type: ignore
-#     logger.exception("[catalogue_health] import failed: %s", e)
 ch_run = None
 
 # ────────────────────────────────────────────────────────────────────────────────
@@ -45,17 +38,17 @@ AIRTABLE_BASE_ID = os.getenv("AIRTABLE_BASE_ID") or os.getenv("AT_BASE_ID") or "
 if not AIRTABLE_API_KEY or not AIRTABLE_API_KEY.startswith("pat"):
     raise RuntimeError("Set AIRTABLE_API_KEY to a valid Airtable Personal Access Token (starts with 'pat').")
 
-DATABASE_URL = os.getenv("DATABASE_URL")  # e.g. postgresql://railway:***@.../timeseriesdb
-OUTPUT_TARGET = os.getenv("OUTPUT_TARGET", "postgres").lower()  # 'postgres' | 'airtable' | 'both'
-AUTOMATION_TOKEN = os.getenv("AUTOMATION_TOKEN")  # optional: set to protect write routes
+DATABASE_URL = os.getenv("DATABASE_URL")
+OUTPUT_TARGET = os.getenv("OUTPUT_TARGET", "postgres").lower()
+AUTOMATION_TOKEN = os.getenv("AUTOMATION_TOKEN")
 LOCAL_TZ = os.getenv("LOCAL_TZ", "Europe/London")
 
 # ----- Catalogue (ISRC list) -----
 CATALOGUE_TABLE = os.getenv("CATALOGUE_TABLE", "Catalogue")
 CATALOGUE_VIEW = os.getenv("CATALOGUE_VIEW", "Inner Catalogue")
 CATALOGUE_ISRC_FIELD = os.getenv("CATALOGUE_ISRC_FIELD", "ISRC")
-CATALOGUE_ARTIST_FIELD = os.getenv("CATALOGUE_ARTIST_FIELD", "Artist")  # lookup/rollup or text
-CATALOGUE_TITLE_FIELD  = os.getenv("CATALOGUE_TITLE_FIELD",  "Track Title")   # lookup/rollup or text
+CATALOGUE_ARTIST_FIELD = os.getenv("CATALOGUE_ARTIST_FIELD", "Artist")
+CATALOGUE_TITLE_FIELD  = os.getenv("CATALOGUE_TITLE_FIELD",  "Track Title")
 
 # ----- Track Playcounts (Airtable)
 PLAYCOUNTS_TABLE = os.getenv("PLAYCOUNTS_TABLE", "Spotify Streams")
@@ -73,7 +66,7 @@ PLAYLISTS_WEB_URL_FIELD = os.getenv("PLAYLISTS_WEB_URL_FIELD", "Playlist Web URL
 
 # ----- Playlist Followers (Airtable) -----
 FOLLOWERS_TABLE = os.getenv("FOLLOWERS_TABLE", "Playlist Followers")
-FOLLOWERS_LINK_FIELD = os.getenv("FOLLOWERS_LINK_FIELD", "Playlist")  # linked → Playlists
+FOLLOWERS_LINK_FIELD = os.getenv("FOLLOWERS_LINK_FIELD", "Playlist")
 FOLLOWERS_DATE_FIELD = os.getenv("FOLLOWERS_DATE_FIELD", "Date")
 FOLLOWERS_COUNT_FIELD = os.getenv("FOLLOWERS_COUNT_FIELD", "Followers")
 FOLLOWERS_DELTA_FIELD = os.getenv("FOLLOWERS_DELTA_FIELD", "Delta")
@@ -101,9 +94,10 @@ airtable_sleep = float(os.getenv("AT_SLEEP", "0.2"))
 spotify_sleep = float(os.getenv("SPOTIFY_SLEEP", "0.15"))
 
 # ── Lag config (simple hard floor + caps + scheduler) ───────────────────────────
-LAG_MIN_TOTAL = int(os.getenv("LAG_MIN_TOTAL", "20000"))  # catalogue floor per completed day
-CAP_CHECKPOINT_RATIO = float(os.getenv("CAP_CHECKPOINT_RATIO", "0.30"))  # ≤30% of target per checkpoint
-CAP_DAILY_RATIO      = float(os.getenv("CAP_DAILY_RATIO", "0.60"))        # ≤60% of target per calendar day
+# FIX: Default changed to "0" to disable the stream backfilling/smoothing feature.
+LAG_MIN_TOTAL = int(os.getenv("LAG_MIN_TOTAL", "0"))
+CAP_CHECKPOINT_RATIO = float(os.getenv("CAP_CHECKPOINT_RATIO", "0.30"))
+CAP_DAILY_RATIO      = float(os.getenv("CAP_DAILY_RATIO", "0.60"))
 ENABLE_SCHEDULER     = os.getenv("ENABLE_SCHEDULER", "true").lower() in ("1","true","yes")
 SCHEDULE_EVERY_HOURS = int(os.getenv("SCHEDULE_EVERY_HOURS", "6"))
 
@@ -140,7 +134,6 @@ def at_batch_patch(table: str, records: List[Dict[str, Any]]):
         chunk = records[i:i+10]
         r = requests.patch(at_url(table), headers=at_headers(), json={"records": chunk}, timeout=60)
         if r.status_code not in (200, 201):
-            # Enhanced error logging
             error_details = r.text
             try:
                 error_details = r.json()
@@ -252,7 +245,7 @@ def find_today_by_isrc(isrc_code: str, day_iso: str) -> Optional[str]:
 
 def prev_count_by_isrc(isrc_code: str, before_iso: str) -> Optional[int]:
     clauses = [
-        f"SEARCH('{_q(isrc_code)}', ARRAYJOIN({{{PLAYCOUNTS_LINK_FIELD}}}))",
+        f"SEARCH('{_q(isrc_code)}', ARRAYJOIN({{{PLAYCOUNTS_LINK_FIELD}}})),"
         f"IS_BEFORE({{{PLAYCOUNTS_DATE_FIELD}}}, '{before_iso}')",
         f"{{{PLAYCOUNTS_COUNT_FIELD}}} > 0"
     ]
@@ -375,7 +368,6 @@ def search_track(isrc: str, bearer: str) -> Optional[Tuple[str, str, str, Option
     if not items:
         return None
 
-    # Prefer exact ISRC match if available
     best = None
     for t in items:
         if t.get("external_ids", {}).get("isrc", "").upper() == isrc.upper():
@@ -394,7 +386,7 @@ def search_track(isrc: str, bearer: str) -> Optional[Tuple[str, str, str, Option
         return None
     return track_id, album_id, track_name, artists_joined
 
-async def sniff_tokens() -> Tuple[str, Optional[str]]:  # unchanged
+async def sniff_tokens() -> Tuple[str, Optional[str]]:
     async with async_playwright() as p:
         browser = await p.chromium.launch(headless=True, args=["--no-sandbox"])
         ctx = await browser.new_context(user_agent=USER_AGENT)
@@ -436,7 +428,7 @@ def fetch_album(album_id: str, web_token: str, client_token: Optional[str]) -> D
     return {}
 
 # ────────────────────────────────────────────────────────────────────────────────
-# Generic Airtable delta recompute (unchanged)
+# Generic Airtable delta recompute
 # ────────────────────────────────────────────────────────────────────────────────
 def backfill_table_deltas(table: str, link_field: str, date_field: str, count_field: str, delta_field: str, clamp_negative: bool) -> int:
     recs = at_paginate(table, {"pageSize": 100, "sort[0][field]": date_field, "sort[0][direction]": "asc"})
@@ -522,10 +514,6 @@ def db_upsert_daily_total(cur, day_iso: str, total_delta: int, finalized: bool):
     """, (day_iso, total_delta, finalized))
 
 def db_catalogue_delta_for_day(cur, day_iso: str) -> int:
-    """
-    Sum of positive per-track increments on day_iso.
-    delta(track, day) = max(0, pc(day) - last_pc_before(day))
-    """
     cur.execute("""
         WITH today AS (
           SELECT s.track_uid, s.playcount AS pc_day
@@ -551,9 +539,6 @@ def db_catalogue_delta_for_day(cur, day_iso: str) -> int:
     return int((cur.fetchone() or {}).get("delta_sum", 0))
 
 def db_get_lag_queue(cur, today_iso: str) -> List[str]:
-    """
-    All past, unfinalized days whose catalogue delta < LAG_MIN_TOTAL, oldest first.
-    """
     cur.execute("""
         SELECT day FROM daily_totals
         WHERE day < %s AND finalized=false AND total_delta < %s
@@ -568,9 +553,6 @@ def db_mark_finalized_if_ready(cur, day_iso: str):
         cur.execute("UPDATE daily_totals SET finalized=true, updated_at=now() WHERE day=%s", (day_iso,))
 
 def _cap_amount_for_anchor(cur, anchor_day: str, remaining_to_move: int) -> int:
-    """
-    Enforce per-checkpoint and per-day caps for a given anchor.
-    """
     target = LAG_MIN_TOTAL
     cap_checkpoint = int(target * CAP_CHECKPOINT_RATIO)
     cap_daily      = int(target * CAP_DAILY_RATIO)
@@ -591,9 +573,6 @@ def _bump_lag_credits(cur, anchor_day: str, moved: int):
     """, (anchor_day, moved, moved))
 
 def db_today_increments(cur, today_iso: str) -> List[Tuple[str,int,int]]:
-    """
-    Returns list of (track_uid, prev_pc, inc_today). inc_today = max(0, pc_today - prev_pc).
-    """
     cur.execute("""
         WITH today AS (
           SELECT s.track_uid, s.playcount AS pc_today
@@ -623,17 +602,12 @@ def db_today_increments(cur, today_iso: str) -> List[Tuple[str,int,int]]:
     return [(r["track_uid"], r["prev_playcount"], r["increment"]) for r in cur.fetchall()]
 
 def db_apply_lag_transfer(cur, from_day: str, to_day: str, track_uid: str, from_prev_pc: int, amount: int):
-    """
-    Moves `amount` from a track's total on `from_day` to `to_day`.
-    """
     if amount <= 0: return
-    # Decrement `from_day` playcount
     cur.execute("""
         UPDATE streams
         SET playcount = playcount - %s
         WHERE platform='spotify' AND track_uid=%s AND stream_date=%s
     """, (amount, track_uid, from_day))
-    # Upsert/increment `to_day` playcount
     to_day_new_pc = from_prev_pc + amount
     cur.execute("""
         INSERT INTO streams(platform, track_uid, stream_date, playcount)
@@ -646,16 +620,16 @@ def db_apply_lag_transfer(cur, from_day: str, to_day: str, track_uid: str, from_
 # MAIN WORKER: Track Streams
 # ────────────────────────────────────────────────────────────────────────────────
 async def run_once(day_override: Optional[str] = None, attempt_idx: int = 1, output_target: str = OUTPUT_TARGET) -> Dict[str, Any]:
-    day_iso = day_override or date.today().isoformat()
+    # FIX: The script now runs for the most recently completed day (yesterday).
+    day_iso = day_override or (date.today() - timedelta(days=1)).isoformat()
+    
     catalogue = catalogue_index()
     cat_isrcs = list(catalogue.keys())
-    streams_logger.info("starting run: tracks=%d output=%s attempt=%d", len(cat_isrcs), output_target, attempt_idx)
+    streams_logger.info("starting run: tracks=%d output=%s attempt=%d date=%s", len(cat_isrcs), output_target, attempt_idx, day_iso)
 
-    # Spotify tokens
     search_token = get_search_token() if _has_spotify_creds() else None
     web_token, client_token = await sniff_tokens()
 
-    # --- STAGE 1: Fetch all data from Spotify first ---
     processed, errors, sum_pc, sum_delta_like = 0, 0, 0, 0
     records_to_process = []
     
@@ -685,7 +659,6 @@ async def run_once(day_override: Optional[str] = None, attempt_idx: int = 1, out
                     raw = t.get("playcount")
                     if raw and raw.isdigit():
                         playcount = int(raw)
-                        # Estimate "delta like" for Airtable (Postgres calculates this properly)
                         if output_target in ("airtable", "both"):
                             prev = prev_count_by_isrc(isrc, day_iso)
                             if prev is not None and playcount > prev:
@@ -709,9 +682,6 @@ async def run_once(day_override: Optional[str] = None, attempt_idx: int = 1, out
             streams_logger.error("error processing ISRC=%s: %s", isrc, e, exc_info=True)
             errors += 1
 
-    # --- STAGE 2: Write all fetched data to outputs ---
-    
-    # Write to Airtable
     if output_target in ("airtable", "both"):
         streams_logger.info("writing %d records to Airtable", len(records_to_process))
         for record in records_to_process:
@@ -722,7 +692,6 @@ async def run_once(day_override: Optional[str] = None, attempt_idx: int = 1, out
                     streams_logger.error("[airtable] error upserting ISRC=%s: %s", record["isrc"], e)
                     errors += 1
 
-    # Write to Postgres
     if output_target in ("postgres", "both"):
         streams_logger.info("writing %d records to Postgres", len(records_to_process))
         conn = None
@@ -736,7 +705,6 @@ async def run_once(day_override: Optional[str] = None, attempt_idx: int = 1, out
                             track_uid = db_upsert_track(cur, record["isrc"], record["artist"], record["title"])
                             db_upsert_stream(cur, "spotify", track_uid, day_iso, record["playcount"])
                         except Exception as e:
-                            # Log error for the specific record but continue the transaction
                             streams_logger.error("[postgres] error processing ISRC=%s in batch: %s", record["isrc"], e)
                             errors += 1
             conn.commit()
@@ -746,27 +714,23 @@ async def run_once(day_override: Optional[str] = None, attempt_idx: int = 1, out
         finally:
             if conn: conn.close()
 
-    # --- STAGE 3: Handle lag calculation in a separate, self-contained transaction ---
-    if output_target in ("postgres", "both"):
+    if output_target in ("postgres", "both") and LAG_MIN_TOTAL > 0:
         conn = None
         try:
             conn = db_conn()
             with conn.cursor() as cur:
-                # 1. Ensure schema exists & record today's raw total
                 db_ensure_lag_schema(cur)
                 total_delta = db_catalogue_delta_for_day(cur, day_iso)
                 db_upsert_daily_total(cur, day_iso, total_delta, finalized=(total_delta >= LAG_MIN_TOTAL))
 
-                # 2. Find days that need backfilling
                 lag_q = db_get_lag_queue(cur, day_iso)
                 if not lag_q:
                     streams_logger.info("[lag] no past days require backfilling")
                 else:
                     streams_logger.info("[lag] queue: %s", lag_q)
                     increments = db_today_increments(cur, day_iso)
-                    increments.sort(key=lambda r: r[2], reverse=True) # sort by largest increment desc
-
-                    # 3. Iterate through days needing help & try to fill them from today's increments
+                    increments.sort(key=lambda r: r[2], reverse=True)
+                    
                     for to_day in lag_q:
                         cur.execute("SELECT total_delta FROM daily_totals WHERE day=%s", (to_day,))
                         to_day_current = int(cur.fetchone()["total_delta"])
@@ -774,7 +738,7 @@ async def run_once(day_override: Optional[str] = None, attempt_idx: int = 1, out
                         if needed <= 0: continue
 
                         capped_needed = _cap_amount_for_anchor(cur, day_iso, needed)
-                        if capped_needed <= 0: break # stop if we hit daily/checkpoint caps for today
+                        if capped_needed <= 0: break
 
                         moved_this_day = 0
                         for i in range(len(increments)):
@@ -791,7 +755,6 @@ async def run_once(day_override: Optional[str] = None, attempt_idx: int = 1, out
                         
                         _bump_lag_credits(cur, day_iso, moved_this_day)
 
-                # 4. Re-calculate totals for today and any affected days, then mark as finalized if ready
                 all_affected_days = set(lag_q + [day_iso])
                 for d in all_affected_days:
                     recalc_delta = db_catalogue_delta_for_day(cur, d)
@@ -810,8 +773,8 @@ async def run_once(day_override: Optional[str] = None, attempt_idx: int = 1, out
         "errors": errors,
         "date": day_iso,
         "output": output_target,
-        "sum_pc": sum_pc,
-        "sum_delta_like": sum_delta_like,
+        "sum_pc_lifetime_total": sum_pc,
+        "sum_delta_like_airtable": sum_delta_like,
         "attempt": attempt_idx
     }
     streams_logger.info("completed: %s", " ".join(f"{k}={v}" for k, v in stats.items()))
@@ -821,9 +784,11 @@ async def run_once(day_override: Optional[str] = None, attempt_idx: int = 1, out
 # MAIN WORKER: Playlist Followers
 # ────────────────────────────────────────────────────────────────────────────────
 def run_playlist_followers(day_override: Optional[str] = None):
+    # NOTE: Reverted to 'today' as per user request. Follower counts are often real-time.
     day_iso = day_override or date.today().isoformat()
+
     playlists = playlists_index_from_airtable()
-    followers_logger.info("starting followers run: playlists=%d", len(playlists))
+    followers_logger.info("starting followers run: playlists=%d date=%s", len(playlists), day_iso)
 
     if not _has_spotify_creds():
         raise RuntimeError("Spotify API credentials not set for playlist followers.")
@@ -839,7 +804,7 @@ def run_playlist_followers(day_override: Optional[str] = None):
         plain_id = urn_to_plain_id(urn)
         try:
             r = requests.get(f"https://api.spotify.com/v1/playlists/{plain_id}?fields=followers(total)",
-                                headers={"Authorization": f"Bearer {bearer}"}, timeout=30)
+                                 headers={"Authorization": f"Bearer {bearer}"}, timeout=30)
             if r.status_code == 404:
                 followers_logger.warning("playlist not found (404): id=%s name=%s", plain_id, name)
                 continue
@@ -847,7 +812,6 @@ def run_playlist_followers(day_override: Optional[str] = None):
             
             followers = int(r.json().get("followers", {}).get("total", 0) or 0)
             
-            # Stage writes for Airtable
             records_to_write_at.append({
                 "fields": {
                     FOLLOWERS_LINK_FIELD: [airtable_rec_id],
@@ -855,7 +819,6 @@ def run_playlist_followers(day_override: Optional[str] = None):
                     FOLLOWERS_COUNT_FIELD: followers,
                 }
             })
-            # Stage writes for Postgres
             records_to_write_pg.append({
                 "urn": urn,
                 "name": name,
@@ -867,11 +830,9 @@ def run_playlist_followers(day_override: Optional[str] = None):
             followers_logger.error("error processing playlist id=%s name=%s: %s", plain_id, name, e)
             errors += 1
     
-    # Batch write to Airtable
     if OUTPUT_TARGET in ("airtable", "both") and records_to_write_at:
         try:
             followers_logger.info("writing %d follower counts to Airtable", len(records_to_write_at))
-            # This endpoint creates new records, it doesn't patch. We need a create helper.
             i = 0
             while i < len(records_to_write_at):
                 chunk = records_to_write_at[i:i+10]
@@ -884,7 +845,6 @@ def run_playlist_followers(day_override: Optional[str] = None):
             followers_logger.error("Airtable batch update failed: %s", e)
             errors += len(records_to_write_at)
 
-    # Batch write to Postgres
     if OUTPUT_TARGET in ("postgres", "both") and records_to_write_pg:
         followers_logger.info("writing %d follower counts to Postgres", len(records_to_write_pg))
         conn = None
@@ -1176,8 +1136,8 @@ def run_playlist_sync():
             if to_create:
                 create_payload = [
                     {"fields": {
-                        PL_F_PLAYLIST: [p_rec["id"]], # FIX: Send as a list of strings
-                        PL_F_TRACK_LINK: [c["catId"]], # FIX: Send as a list of strings
+                        PL_F_PLAYLIST: [p_rec["id"]],
+                        PL_F_TRACK_LINK: [c["catId"]],
                         PL_F_POSITION: c["pos"],
                     }} for c in to_create
                 ]
