@@ -652,12 +652,14 @@ async def run_once(day_override: Optional[str] = None, attempt_idx: int = 1, out
             track_id, album_id, api_title, api_artist = track_info
             album_data = fetch_album(album_id, web_token, client_token)
             
-            tracks = (album_data.get("data", {}).get("albumUnion", {}).get("tracks", {}).get("items", []))
+            # --- FIX APPLIED HERE ---
+            # Changed "tracks" to "tracksV2" to match the new Spotify API structure
+            tracks = (album_data.get("data", {}).get("albumUnion", {}).get("tracksV2", {}).get("items", []))
             for item in tracks:
                 t = item.get("track")
                 if t and t.get("uri") == f"spotify:track:{track_id}":
                     raw = t.get("playcount")
-                    if raw and raw.isdigit():
+                    if raw and str(raw).isdigit():
                         playcount = int(raw)
                         if output_target in ("airtable", "both"):
                             prev = prev_count_by_isrc(isrc, day_iso)
@@ -710,7 +712,6 @@ async def run_once(day_override: Optional[str] = None, attempt_idx: int = 1, out
                             errors += 1
             conn.commit()
             
-            # After committing, calculate the delta for the day we just wrote
             streams_logger.info("[postgres] calculating total daily streams for %s", day_iso)
             with conn.cursor() as cur:
                 daily_delta_pg = db_catalogue_delta_for_day(cur, day_iso)
@@ -727,7 +728,6 @@ async def run_once(day_override: Optional[str] = None, attempt_idx: int = 1, out
             conn = db_conn()
             with conn.cursor() as cur:
                 db_ensure_lag_schema(cur)
-                # Note: db_catalogue_delta_for_day is called again here, which is fine.
                 total_delta = db_catalogue_delta_for_day(cur, day_iso)
                 db_upsert_daily_total(cur, day_iso, total_delta, finalized=(total_delta >= LAG_MIN_TOTAL))
 
@@ -776,7 +776,6 @@ async def run_once(day_override: Optional[str] = None, attempt_idx: int = 1, out
         finally:
             if conn: conn.close()
     
-    # New, clearer summary logging
     final_delta = daily_delta_pg if output_target in ("postgres", "both") else sum_delta_like
     stats = {
         "processed": processed,
@@ -801,7 +800,6 @@ async def run_once(day_override: Optional[str] = None, attempt_idx: int = 1, out
 # MAIN WORKER: Playlist Followers
 # ────────────────────────────────────────────────────────────────────────────────
 def run_playlist_followers(day_override: Optional[str] = None):
-    # NOTE: Reverted to 'today' as per user request. Follower counts are often real-time.
     day_iso = day_override or date.today().isoformat()
 
     playlists = playlists_index_from_airtable()
@@ -1115,7 +1113,6 @@ def run_playlist_sync():
             if last_snapshot and snapshot_id and last_snapshot == snapshot_id:
                 sync_logger.info(f'Playlist "{p_name}" is unchanged (snapshot match).')
                 summary.append({"playlist": p_name, "status": "unchanged_snapshot"})
-                # Optionally touch the "Last Synced" field
                 at_batch_patch(PLAYLISTS_TABLE, [{"id": p_rec["id"], "fields": {PLY_F_LAST_SYNC: date.today().isoformat()}}])
                 continue
 
