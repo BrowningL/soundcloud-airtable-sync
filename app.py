@@ -359,9 +359,9 @@ def search_track(isrc: str, bearer: str) -> Optional[Tuple[str, str, str, Option
     or None if not found.
     """
     r = requests.get("https://api.spotify.com/v1/search",
-                        headers={"Authorization": f"Bearer {bearer}"},
-                        params={"q": f"isrc:{isrc}", "type": "track", "limit": 5},
-                        timeout=60)
+                     headers={"Authorization": f"Bearer {bearer}"},
+                     params={"q": f"isrc:{isrc}", "type": "track", "limit": 5},
+                     timeout=60)
     if r.status_code != 200:
         return None
     items = r.json().get("tracks", {}).get("items", [])
@@ -692,6 +692,7 @@ async def run_once(day_override: Optional[str] = None, attempt_idx: int = 1, out
                     streams_logger.error("[airtable] error upserting ISRC=%s: %s", record["isrc"], e)
                     errors += 1
 
+    daily_delta_pg = 0
     if output_target in ("postgres", "both"):
         streams_logger.info("writing %d records to Postgres", len(records_to_process))
         conn = None
@@ -708,6 +709,12 @@ async def run_once(day_override: Optional[str] = None, attempt_idx: int = 1, out
                             streams_logger.error("[postgres] error processing ISRC=%s in batch: %s", record["isrc"], e)
                             errors += 1
             conn.commit()
+            
+            # After committing, calculate the delta for the day we just wrote
+            streams_logger.info("[postgres] calculating total daily streams for %s", day_iso)
+            with conn.cursor() as cur:
+                daily_delta_pg = db_catalogue_delta_for_day(cur, day_iso)
+            
         except psycopg2.Error as e:
             streams_logger.exception("[postgres] stream write transaction failed: %s", e)
             if conn: conn.rollback()
@@ -720,6 +727,7 @@ async def run_once(day_override: Optional[str] = None, attempt_idx: int = 1, out
             conn = db_conn()
             with conn.cursor() as cur:
                 db_ensure_lag_schema(cur)
+                # Note: db_catalogue_delta_for_day is called again here, which is fine.
                 total_delta = db_catalogue_delta_for_day(cur, day_iso)
                 db_upsert_daily_total(cur, day_iso, total_delta, finalized=(total_delta >= LAG_MIN_TOTAL))
 
@@ -767,17 +775,26 @@ async def run_once(day_override: Optional[str] = None, attempt_idx: int = 1, out
             if conn: conn.rollback()
         finally:
             if conn: conn.close()
-            
+    
+    # New, clearer summary logging
+    final_delta = daily_delta_pg if output_target in ("postgres", "both") else sum_delta_like
     stats = {
         "processed": processed,
         "errors": errors,
         "date": day_iso,
         "output": output_target,
-        "sum_pc_lifetime_total": sum_pc,
-        "sum_delta_like_airtable": sum_delta_like,
-        "attempt": attempt_idx
+        "total_lifetime_streams_found": sum_pc,
+        "total_daily_streams_gained": final_delta,
+        "attempt": attempt_idx,
     }
-    streams_logger.info("completed: %s", " ".join(f"{k}={v}" for k, v in stats.items()))
+
+    log_summary = (
+        f"Run completed for {day_iso}. "
+        f"Processed: {processed}, Errors: {errors}. "
+        f"Total lifetime streams found: {sum_pc:,}. "
+        f"Total daily streams gained: {final_delta:,}."
+    )
+    streams_logger.info(log_summary)
     return stats
 
 # ────────────────────────────────────────────────────────────────────────────────
