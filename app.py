@@ -15,6 +15,12 @@ from playwright.async_api import async_playwright
 import psycopg2
 from psycopg2.extras import RealDictCursor
 
+# --- NEW IMPORTS FOR CATALOGUE HEALTH ---
+import difflib
+import spotipy
+from spotipy.oauth2 import SpotifyClientCredentials
+# --- END NEW IMPORTS ---
+
 # ────────────────────────────────────────────────────────────────────────────────
 # LOGGING (Railway captures stdout/stderr and python logging)
 # ────────────────────────────────────────────────────────────────────────────────
@@ -25,6 +31,8 @@ logger.setLevel(logging.INFO)
 streams_logger = logging.getLogger("streams")
 followers_logger = logging.getLogger("followers")
 scheduler_logger = logging.getLogger("scheduler")
+# --- NEW LOGGER FOR HEALTH CHECK ---
+health_logger = logging.getLogger("catalogue_health")
 
 
 # Try to import the catalogue health worker with defensive logging
@@ -48,7 +56,7 @@ CATALOGUE_TABLE = os.getenv("CATALOGUE_TABLE", "Catalogue")
 CATALOGUE_VIEW = os.getenv("CATALOGUE_VIEW", "Inner Catalogue")
 CATALOGUE_ISRC_FIELD = os.getenv("CATALOGUE_ISRC_FIELD", "ISRC")
 CATALOGUE_ARTIST_FIELD = os.getenv("CATALOGUE_ARTIST_FIELD", "Artist")
-CATALOGUE_TITLE_FIELD  = os.getenv("CATALOGUE_TITLE_FIELD",  "Track Title")
+CATALOGUE_TITLE_FIELD = os.getenv("CATALOGUE_TITLE_FIELD", "Track Title")
 
 # ----- Track Playcounts (Airtable)
 PLAYCOUNTS_TABLE = os.getenv("PLAYCOUNTS_TABLE", "Spotify Streams")
@@ -97,8 +105,8 @@ spotify_sleep = float(os.getenv("SPOTIFY_SLEEP", "0.15"))
 # FIX: Default changed to "0" to disable the stream backfilling/smoothing feature.
 LAG_MIN_TOTAL = int(os.getenv("LAG_MIN_TOTAL", "0"))
 CAP_CHECKPOINT_RATIO = float(os.getenv("CAP_CHECKPOINT_RATIO", "0.30"))
-CAP_DAILY_RATIO      = float(os.getenv("CAP_DAILY_RATIO", "0.60"))
-ENABLE_SCHEDULER     = os.getenv("ENABLE_SCHEDULER", "true").lower() in ("1","true","yes")
+CAP_DAILY_RATIO = float(os.getenv("CAP_DAILY_RATIO", "0.60"))
+ENABLE_SCHEDULER = os.getenv("ENABLE_SCHEDULER", "true").lower() in ("1","true","yes")
 SCHEDULE_EVERY_HOURS = int(os.getenv("SCHEDULE_EVERY_HOURS", "6"))
 
 # ────────────────────────────────────────────────────────────────────────────────
@@ -173,7 +181,7 @@ def catalogue_index() -> Dict[str, Dict[str, Optional[str]]]:
         out[isrc] = {
             "air_id": rec["id"],
             "artist": _norm_lookup(f.get(CATALOGUE_ARTIST_FIELD)),
-            "title":  _norm_lookup(f.get(CATALOGUE_TITLE_FIELD)),
+            "title": _norm_lookup(f.get(CATALOGUE_TITLE_FIELD)),
         }
     return out
 
@@ -215,6 +223,35 @@ def db_upsert_playlist_followers(cur, platform: str, playlist_id_urn: str, day_i
         DO UPDATE SET followers = EXCLUDED.followers,
                       playlist_name = COALESCE(EXCLUDED.playlist_name, playlist_followers.playlist_name)
     """, (platform, playlist_id_urn, day_iso, followers, playlist_name))
+
+# --- START: NEW DB HELPERS FOR CATALOGUE HEALTH ---
+def db_ensure_catalogue_health_schema(cur):
+    """Creates the catalogue_health_status table if it doesn't exist."""
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS catalogue_health_status (
+            check_date DATE NOT NULL,
+            track_uid UUID NOT NULL REFERENCES track_dim(track_uid),
+            apple_music_status BOOLEAN NOT NULL,
+            spotify_status BOOLEAN NOT NULL,
+            updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            PRIMARY KEY (check_date, track_uid)
+        );
+    """)
+    health_logger.info("Ensured catalogue_health_status table exists.")
+
+def db_upsert_catalogue_health_status(cur, check_date_iso: str, track_uid: str, apple_status: bool, spotify_status: bool):
+    """Inserts or updates a health status record for a given track and date."""
+    cur.execute("""
+        INSERT INTO catalogue_health_status (check_date, track_uid, apple_music_status, spotify_status)
+        VALUES (%s, %s, %s, %s)
+        ON CONFLICT (check_date, track_uid)
+        DO UPDATE SET
+            apple_music_status = EXCLUDED.apple_music_status,
+            spotify_status = EXCLUDED.spotify_status,
+            updated_at = NOW();
+    """, (check_date_iso, track_uid, apple_status, spotify_status))
+# --- END: NEW DB HELPERS FOR CATALOGUE HEALTH ---
+
 
 # ────────────────────────────────────────────────────────────────────────────────
 # Track Playcounts helpers (Airtable)
@@ -359,9 +396,9 @@ def search_track(isrc: str, bearer: str) -> Optional[Tuple[str, str, str, Option
     or None if not found.
     """
     r = requests.get("https://api.spotify.com/v1/search",
-                     headers={"Authorization": f"Bearer {bearer}"},
-                     params={"q": f"isrc:{isrc}", "type": "track", "limit": 5},
-                     timeout=60)
+                       headers={"Authorization": f"Bearer {bearer}"},
+                       params={"q": f"isrc:{isrc}", "type": "track", "limit": 5},
+                       timeout=60)
     if r.status_code != 200:
         return None
     items = r.json().get("tracks", {}).get("items", [])
@@ -484,6 +521,7 @@ def backfill_deltas_for_followers() -> int:
 
 # ────────────────────────────────────────────────────────────────────────────────
 # Lag schema & catalogue totals (DB-only; idempotent)
+# ... (this section is unchanged)
 # ────────────────────────────────────────────────────────────────────────────────
 def db_ensure_lag_schema(cur):
     cur.execute("""
@@ -618,6 +656,7 @@ def db_apply_lag_transfer(cur, from_day: str, to_day: str, track_uid: str, from_
 
 # ────────────────────────────────────────────────────────────────────────────────
 # MAIN WORKER: Track Streams
+# ... (this section is unchanged)
 # ────────────────────────────────────────────────────────────────────────────────
 async def run_once(day_override: Optional[str] = None, attempt_idx: int = 1, output_target: str = OUTPUT_TARGET) -> Dict[str, Any]:
     # FIX: The script now runs for the most recently completed day (yesterday).
@@ -798,6 +837,7 @@ async def run_once(day_override: Optional[str] = None, attempt_idx: int = 1, out
 
 # ────────────────────────────────────────────────────────────────────────────────
 # MAIN WORKER: Playlist Followers
+# ... (this section is unchanged)
 # ────────────────────────────────────────────────────────────────────────────────
 def run_playlist_followers(day_override: Optional[str] = None):
     day_iso = day_override or date.today().isoformat()
@@ -819,7 +859,7 @@ def run_playlist_followers(day_override: Optional[str] = None):
         plain_id = urn_to_plain_id(urn)
         try:
             r = requests.get(f"https://api.spotify.com/v1/playlists/{plain_id}?fields=followers(total)",
-                                 headers={"Authorization": f"Bearer {bearer}"}, timeout=30)
+                                   headers={"Authorization": f"Bearer {bearer}"}, timeout=30)
             if r.status_code == 404:
                 followers_logger.warning("playlist not found (404): id=%s name=%s", plain_id, name)
                 continue
@@ -881,8 +921,10 @@ def run_playlist_followers(day_override: Optional[str] = None):
     followers_logger.info("completed followers run: %s", " ".join(f"{k}={v}" for k, v in stats.items()))
     return stats
 
+
 # ────────────────────────────────────────────────────────────────────────────────
 # PLAYLIST SYNC WORKER
+# ... (this section is unchanged)
 # ────────────────────────────────────────────────────────────────────────────────
 sync_logger = logging.getLogger("playlist_sync")
 
@@ -1203,6 +1245,133 @@ def run_playlist_sync():
     return final_report
 
 
+# ─── START: CATALOGUE HEALTH WORKER ───────────────────────────────────────────
+def similar(a: str, b: str) -> float:
+    """Return a similarity ratio between two strings (case-insensitive)."""
+    if not a or not b:
+        return 0.0
+    return difflib.SequenceMatcher(None, a.lower(), b.lower()).ratio()
+
+def check_apple_music_api(artist: str, title: str) -> bool:
+    """Searches for a track/album on Apple Music using the public iTunes Search API."""
+    base_url = "https://itunes.apple.com/search"
+    params = {'term': f"{artist} {title}", 'entity': 'musicTrack,album', 'country': 'GB', 'limit': 20}
+    health_logger.info(f"[Apple] Checking for '{title}' by {artist}")
+    try:
+        response = requests.get(base_url, params=params, timeout=15)
+        response.raise_for_status()
+        data = response.json()
+        for result in data.get('results', []):
+            result_track = result.get('trackName', '')
+            result_album = result.get('collectionName', '')
+            result_artist = result.get('artistName', '')
+            if similar(result_artist, artist) >= 0.85 and \
+               (similar(result_track, title) >= 0.85 or similar(result_album, title) >= 0.85):
+                health_logger.info(f"✅ [Apple] Found a match: '{result_track or result_album}'")
+                return True
+        health_logger.warning(f"❌ [Apple] No strong match found for '{title}'.")
+        return False
+    except requests.exceptions.RequestException as e:
+        health_logger.error(f"❗️ [Apple] Network error for '{title}': {e}")
+        return False
+
+def check_spotify_api(sp_client, artist: str, title: str) -> bool:
+    """Searches for a track on Spotify using the Spotipy library."""
+    query = f"track:{title} artist:{artist}"
+    health_logger.info(f"[Spotify] Checking for '{title}' by {artist}")
+    try:
+        results = sp_client.search(q=query, type='track', limit=10)
+        for item in results.get('tracks', {}).get('items', []):
+            item_name = item.get('name', '')
+            item_artists = [a.get('name', '') for a in item.get('artists', [])]
+            if similar(item_name, title) >= 0.85 and \
+               any(similar(a_name, artist) >= 0.85 for a_name in item_artists):
+                health_logger.info(f"✅ [Spotify] Found a match: '{item_name}'")
+                return True
+        health_logger.warning(f"❌ [Spotify] No strong match found for '{title}'.")
+        return False
+    except Exception as e:
+        health_logger.error(f"❗️ [Spotify] API error for '{title}': {e}")
+        return False
+
+def run_catalogue_health_worker():
+    """
+    Main worker to check catalogue health and store results in Postgres.
+    """
+    health_logger.info("--- Starting Catalogue Health Check ---")
+
+    if not _has_spotify_creds():
+        raise RuntimeError("Spotify API credentials (SPOTIFY_CLIENT_ID, SPOTIFY_CLIENT_SECRET) must be set for health checks.")
+
+    # 1. Set up Spotify client
+    try:
+        auth_manager = SpotifyClientCredentials(client_id=CLIENT_ID, client_secret=CLIENT_SECRET)
+        spotify_client = spotipy.Spotify(auth_manager=auth_manager)
+        health_logger.info("Spotipy client initialized successfully.")
+    except Exception as e:
+        health_logger.exception("Failed to initialize Spotipy client.")
+        raise e
+
+    # 2. Fetch catalogue from Airtable
+    health_logger.info("Fetching catalogue from Airtable...")
+    catalogue = catalogue_index()
+    health_logger.info(f"Found {len(catalogue)} tracks in the catalogue.")
+
+    # 3. Connect to DB and run checks
+    conn = None
+    check_date_iso = date.today().isoformat()
+    checked_count = 0
+    errors = 0
+
+    try:
+        conn = db_conn()
+        with conn.cursor() as cur:
+            # Ensure the table exists
+            db_ensure_catalogue_health_schema(cur)
+            conn.commit()
+
+            # Iterate over each track from Airtable
+            for isrc, track_data in catalogue.items():
+                title = track_data.get('title')
+                artist = track_data.get('artist')
+
+                if not title or not artist:
+                    health_logger.warning(f"Skipping ISRC {isrc} due to missing title or artist.")
+                    continue
+                try:
+                    # Perform checks
+                    apple_exists = check_apple_music_api(artist, title)
+                    spotify_exists = check_spotify_api(spotify_client, artist, title)
+                    time.sleep(0.5) # Polite delay
+
+                    # Get track_uid from our DB, creating the track if it's new
+                    track_uid = db_upsert_track(cur, isrc, artist, title)
+
+                    # Save the result to the database
+                    db_upsert_catalogue_health_status(cur, check_date_iso, track_uid, apple_exists, spotify_exists)
+                    checked_count += 1
+                    if checked_count % 10 == 0:
+                        conn.commit() # Commit periodically
+                        health_logger.info(f"Progress: {checked_count}/{len(catalogue)} tracks checked. Committing batch.")
+
+                except Exception as e:
+                    health_logger.exception(f"An error occurred while processing ISRC {isrc}")
+                    errors += 1
+                    conn.rollback() # Rollback this single track's transaction
+
+        conn.commit() # Final commit
+    except psycopg2.Error as e:
+        health_logger.exception("Database error during health check process: %s", e)
+        if conn: conn.rollback()
+        raise e
+    finally:
+        if conn: conn.close()
+    health_logger.info(f"--- Catalogue Health Check Finished. Checked: {checked_count}, Errors: {errors} ---")
+
+# Assign the worker function to the ch_run variable
+ch_run = run_catalogue_health_worker
+# ─── END: CATALOGUE HEALTH WORKER ─────────────────────────────────────────────
+
 # ────────────────────────────────────────────────────────────────────────────────
 # Scheduler
 # ────────────────────────────────────────────────────────────────────────────────
@@ -1321,12 +1490,13 @@ def backfill_handler(table: str):
 
 @app.route("/catalogue_health", methods=["POST"])
 def run_ch_handler():
-    # _check_token()
+    # _check_token() # As requested, token check is disabled.
     if not ch_run:
         return jsonify({"error": "catalogue_health module not available"}), 501
     try:
-        ch_run()
-        return jsonify({"status": "ok"})
+        # Run the health check in a background thread to avoid long request timeouts
+        threading.Thread(target=ch_run, daemon=True).start()
+        return jsonify({"status": "Catalogue health check started in the background."}), 202
     except Exception as e:
         logger.exception("catalogue_health run failed: %s", e)
         return jsonify({"error": str(e)}), 500
