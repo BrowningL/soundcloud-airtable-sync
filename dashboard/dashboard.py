@@ -350,6 +350,7 @@ def ui():
   <meta charset="utf-8" /><meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>KAIZEN — Streams & Playlists</title>
   <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/chartjs-chart-matrix@^2/dist/chartjs-chart-matrix.min.js"></script>
   <script src="https://cdn.tailwindcss.com"></script>
   <link rel="stylesheet" href="/static/styles.css" />
   <style>
@@ -406,7 +407,6 @@ def ui():
       <div class="brand-title text-xl sm:text-2xl">Catalogue Dashboard</div>
     </header>
 
-    <!-- Row 1: Daily Streams -->
     <section class="grid grid-cols-1 gap-6">
       <div class="card">
         <div class="flex items-center justify-between mb-3">
@@ -424,7 +424,6 @@ def ui():
       </div>
     </section>
 
-    <!-- Row 2: Playlists selector + Playlist Growth -->
     <section class="grid grid-cols-1 lg:grid-cols-[320px,1fr] gap-6 mt-6">
       <div class="card">
         <h2 class="mb-3">Playlists</h2>
@@ -453,7 +452,6 @@ def ui():
       </div>
     </section>
 
-    <!-- Row 3: Catalogue size -->
     <section class="grid grid-cols-1 gap-6 mt-6">
       <div class="card">
         <div class="flex items-center justify-between mb-3">
@@ -464,7 +462,15 @@ def ui():
       </div>
     </section>
 
-    <!-- Row 4: Best artists today -->
+    <section class="grid grid-cols-1 gap-6 mt-6">
+        <div class="card">
+            <h2 class="mb-3">Catalogue Status Heatmap</h2>
+            <div id="healthHeatmapContainer" class="w-full h-[600px] overflow-x-auto overflow-y-hidden relative">
+                 <canvas id="healthHeatmapChart"></canvas>
+            </div>
+        </div>
+    </section>
+
     <section class="grid grid-cols-1 gap-6 mt-6">
       <div class="card">
         <div class="flex items-center justify-between mb-3">
@@ -475,7 +481,6 @@ def ui():
       </div>
     </section>
 
-    <!-- Row 5: Table -->
     <section class="grid grid-cols-1 gap-6 mt-6">
       <div class="card">
         <div class="flex items-center justify-between mb-3">
@@ -500,7 +505,7 @@ def ui():
 
 <script>
   const DEFAULT_PLAYLIST_NAME = {{ default_playlist_name | tojson }};
-  let streamsChart, playlistChart, bestArtistsChart, catalogueChart;
+  let streamsChart, playlistChart, bestArtistsChart, catalogueChart, healthHeatmapChart; // Added healthHeatmapChart
   const fmt = (n) => Number(n).toLocaleString();
   async function api(path) { const r = await fetch(path); if (!r.ok) throw new Error(await r.text()); return r.json(); }
 
@@ -512,8 +517,8 @@ def ui():
       type: 'line',
       data: { labels: data.labels, datasets: [{ label: 'Streams Δ (sum)', data: data.values, tension: 0.3, fill: false }] },
       options: { responsive: true, maintainAspectRatio: true,
-                 scales: { x: { ticks: { maxRotation: 0, autoSkip: true } }, y: { beginAtZero: true } },
-                 plugins: { tooltip: { callbacks: { label: (c) => ' ' + fmt(c.parsed.y) } } } }
+                  scales: { x: { ticks: { maxRotation: 0, autoSkip: true } }, y: { beginAtZero: true } },
+                  plugins: { tooltip: { callbacks: { label: (c) => ' ' + fmt(c.parsed.y) } } } }
     };
     if (streamsChart) streamsChart.destroy(); streamsChart = new Chart(ctx, cfg);
   }
@@ -609,6 +614,96 @@ def ui():
     });
   }
 
+  // --- NEW: Function to load and render the Catalogue Health Heatmap ---
+  async function loadHealthHeatmap() {
+    const data = await api('/api/catalogue/health-status-heatmap');
+    const container = document.getElementById('healthHeatmapContainer');
+    if (!data || !data.data || data.data.length === 0) {
+        console.warn("No data received for health heatmap.");
+        container.innerHTML = '<p class="text-center opacity-70 p-8">No catalogue health data available to display.</p>';
+        return;
+    }
+
+    const ctx = document.getElementById('healthHeatmapChart').getContext('2d');
+    const statusMap = {
+        3: { name: 'Exists on Apple Music and Spotify', color: 'limegreen' },
+        2: { name: 'Exists on Apple Music only', color: 'lightcoral' },
+        1: { name: 'Exists on Spotify only', color: '#006400' }, // Dark Green
+        0: { name: 'Does Not Exist', color: '#dc2626' } // Red
+    };
+
+    // Dynamically calculate canvas dimensions to achieve the fixed-width effect
+    const boxHeight = 12; // Height of each track row
+    const boxWidth = 20; // Width of each date column
+    const yLabelsCount = Math.max(data.yLabels.length, data.catalogueTotalSize);
+    
+    const canvasHeight = yLabelsCount * boxHeight;
+    const canvasWidth = data.xLabels.length * boxWidth;
+
+    const chartCanvas = document.getElementById('healthHeatmapChart');
+    chartCanvas.height = canvasHeight;
+    chartCanvas.width = canvasWidth;
+    
+    const cfg = {
+        type: 'matrix',
+        data: {
+            datasets: [{
+                label: 'Catalogue Status',
+                data: data.data,
+                backgroundColor: (c) => statusMap[c.raw.v]?.color || 'lightgray',
+                borderColor: (c) => statusMap[c.raw.v]?.color || 'lightgray',
+                borderWidth: 1,
+                width: boxWidth - 2,
+                height: boxHeight - 2,
+            }]
+        },
+        options: {
+            responsive: false, // Important for scrolling canvas
+            maintainAspectRatio: false,
+            plugins: {
+                legend: { display: false },
+                tooltip: {
+                    callbacks: {
+                        title: (c) => c[0].raw.y,
+                        label: (c) => {
+                            const status = statusMap[c.raw.v];
+                            return `Date: ${c.raw.x}\\nStatus: ${status ? status.name : 'Not Collected'}`;
+                        }
+                    }
+                }
+            },
+            scales: {
+                x: {
+                    type: 'category',
+                    labels: data.xLabels,
+                    ticks: { autoSkip: false, maxRotation: 90, minRotation: 90 },
+                    grid: { display: false }
+                },
+                y: {
+                    type: 'category',
+                    labels: data.yLabels,
+                    offset: true,
+                    ticks: { 
+                        autoSkip: false,
+                        // Show only every Nth label to prevent clutter
+                        callback: function(value, index, values) {
+                            return (index % 15 === 0 || index === values.length - 1) ? (index+1) : '';
+                        },
+                        font: { size: 10 }
+                    },
+                    grid: { display: false },
+                    // Set a minimum height based on total catalogue size
+                    min: 0,
+                    max: yLabelsCount -1,
+                }
+            }
+        }
+    };
+
+    if (healthHeatmapChart) healthHeatmapChart.destroy();
+    healthHeatmapChart = new Chart(ctx, cfg);
+  }
+
   // Listeners
   document.getElementById('streamsDays').addEventListener('change', e => loadStreams(e.target.value));
   document.getElementById('playlistDays').addEventListener('change', e => loadPlaylistChart(e.target.value));
@@ -621,6 +716,7 @@ def ui():
     await loadPlaylists();
     await loadPlaylistChart(document.getElementById('playlistDays').value);
     await loadCatalogue();
+    await loadHealthHeatmap(); // NEW: Load the heatmap
     await loadBestArtists();
     await loadDeltaDates(90);
     await loadDeltaTable();
@@ -836,6 +932,63 @@ def api_artists_top_share():
     shares = [round(v * 100.0 / total, 2) for v in values]
     return jsonify({"date": day, "labels": labels, "values": values, "shares": shares})
 
+# --- NEW API ENDPOINT FOR HEATMAP ---
+@app.get("/api/catalogue/health-status-heatmap")
+def api_catalogue_health_status_heatmap():
+    q = """
+        SELECT
+            h.check_date,
+            t.artist,
+            t.title,
+            h.apple_music_status,
+            h.spotify_status
+        FROM catalogue_health_status h
+        JOIN track_dim t ON h.track_uid = t.track_uid
+        ORDER BY t.artist, t.title, h.check_date;
+    """
+    rows = _q(q)
+
+    # Fetch total catalogue size to inform the y-axis range
+    *_unused, total_count, ok, err = _fetch_catalogue_cumulative()
+    if not ok:
+        logger.warning(f"Could not fetch Airtable catalogue size for heatmap: {err}")
+        total_count = 0 # Fallback
+
+    if not rows:
+        return jsonify({"xLabels": [], "yLabels": [], "data": [], "catalogueTotalSize": total_count})
+
+    x_labels = sorted(list(set(r["check_date"].isoformat() for r in rows)))
+
+    track_map = {}
+    for r in rows:
+        track_key = f"{r['artist'] or 'N/A'} - {r['title'] or 'N/A'}"
+        if track_key not in track_map:
+            track_map[track_key] = {}
+        track_map[track_key][r["check_date"].isoformat()] = {
+            "apple": r["apple_music_status"],
+            "spotify": r["spotify_status"],
+        }
+
+    y_labels = sorted(track_map.keys())
+    data_points = []
+    for track_name in y_labels:
+        for date_str in x_labels:
+            status = track_map[track_name].get(date_str)
+            if status:
+                # 3: Both, 2: Apple only, 1: Spotify only, 0: Neither
+                status_code = (1 if status["spotify"] else 0) + (2 if status["apple"] else 0)
+                data_points.append({"x": date_str, "y": track_name, "v": status_code})
+    
+    # If total_count from Airtable is less than what we have in the DB, use the DB count
+    if total_count < len(y_labels):
+        total_count = len(y_labels)
+
+    return jsonify({
+        "xLabels": x_labels,
+        "yLabels": y_labels,
+        "data": data_points,
+        "catalogueTotalSize": total_count
+    })
 
 # Catalogue size series API
 @app.get("/api/catalogue/size-series")
