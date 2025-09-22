@@ -465,8 +465,8 @@ def ui():
     <section class="grid grid-cols-1 gap-6 mt-6">
         <div class="card">
             <h2 class="mb-3">Catalogue Status Heatmap</h2>
-            <div id="healthHeatmapContainer" class="w-full h-[600px] overflow-x-auto overflow-y-hidden relative">
-                 <canvas id="healthHeatmapChart"></canvas>
+            <div id="healthHeatmapContainer" class="w-full h-[600px] overflow-x-auto overflow-y-auto relative">
+                <canvas id="healthHeatmapChart"></canvas>
             </div>
         </div>
     </section>
@@ -505,7 +505,7 @@ def ui():
 
 <script>
   const DEFAULT_PLAYLIST_NAME = {{ default_playlist_name | tojson }};
-  let streamsChart, playlistChart, bestArtistsChart, catalogueChart, healthHeatmapChart; // Added healthHeatmapChart
+  let streamsChart, playlistChart, bestArtistsChart, catalogueChart, healthHeatmapChart;
   const fmt = (n) => Number(n).toLocaleString();
   async function api(path) { const r = await fetch(path); if (!r.ok) throw new Error(await r.text()); return r.json(); }
 
@@ -517,8 +517,8 @@ def ui():
       type: 'line',
       data: { labels: data.labels, datasets: [{ label: 'Streams Δ (sum)', data: data.values, tension: 0.3, fill: false }] },
       options: { responsive: true, maintainAspectRatio: true,
-                  scales: { x: { ticks: { maxRotation: 0, autoSkip: true } }, y: { beginAtZero: true } },
-                  plugins: { tooltip: { callbacks: { label: (c) => ' ' + fmt(c.parsed.y) } } } }
+                 scales: { x: { ticks: { maxRotation: 0, autoSkip: true } }, y: { beginAtZero: true } },
+                 plugins: { tooltip: { callbacks: { label: (c) => ' ' + fmt(c.parsed.y) } } } }
     };
     if (streamsChart) streamsChart.destroy(); streamsChart = new Chart(ctx, cfg);
   }
@@ -614,7 +614,7 @@ def ui():
     });
   }
 
-  // --- NEW: Function to load and render the Catalogue Health Heatmap ---
+  // --- Catalogue Health Heatmap ---
   async function loadHealthHeatmap() {
     const data = await api('/api/catalogue/health-status-heatmap');
     const container = document.getElementById('healthHeatmapContainer');
@@ -628,13 +628,13 @@ def ui():
     const statusMap = {
         3: { name: 'Exists on Apple Music and Spotify', color: 'limegreen' },
         2: { name: 'Exists on Apple Music only', color: 'lightcoral' },
-        1: { name: 'Exists on Spotify only', color: '#006400' }, // Dark Green
-        0: { name: 'Does Not Exist', color: '#dc2626' } // Red
+        1: { name: 'Exists on Spotify only', color: '#006400' },
+        0: { name: 'Does Not Exist', color: '#dc2626' }
     };
 
-    // Dynamically calculate canvas dimensions to achieve the fixed-width effect
+    // Dynamically calculate canvas dimensions
     const boxHeight = 12; // Height of each track row
-    const boxWidth = 20; // Width of each date column
+    const boxWidth = 20;  // Width of each date column
     const yLabelsCount = Math.max(data.yLabels.length, data.catalogueTotalSize);
     
     const canvasHeight = yLabelsCount * boxHeight;
@@ -716,7 +716,7 @@ def ui():
     await loadPlaylists();
     await loadPlaylistChart(document.getElementById('playlistDays').value);
     await loadCatalogue();
-    await loadHealthHeatmap(); // NEW: Load the heatmap
+    await loadHealthHeatmap();
     await loadBestArtists();
     await loadDeltaDates(90);
     await loadDeltaTable();
@@ -932,7 +932,7 @@ def api_artists_top_share():
     shares = [round(v * 100.0 / total, 2) for v in values]
     return jsonify({"date": day, "labels": labels, "values": values, "shares": shares})
 
-# --- NEW API ENDPOINT FOR HEATMAP ---
+# --- API ENDPOINT FOR HEATMAP ---
 @app.get("/api/catalogue/health-status-heatmap")
 def api_catalogue_health_status_heatmap():
     q = """
