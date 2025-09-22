@@ -1283,7 +1283,8 @@ def check_apple_music_api(artist: str, title: str) -> bool:
     params = {'term': f"{artist} {title}", 'entity': 'musicTrack,album', 'country': 'GB', 'limit': 20}
     health_logger.info(f"[Apple] Checking for '{title}' by {artist}")
     try:
-        response = requests.get(base_url, params=params, timeout=15)
+        # ### FIX: Added User-Agent header to mimic a browser and avoid 403 Forbidden errors ###
+        response = requests.get(base_url, params=params, timeout=15, headers={"User-Agent": USER_AGENT})
         response.raise_for_status()
         data = response.json()
         for result in data.get('results', []):
