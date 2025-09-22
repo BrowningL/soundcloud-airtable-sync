@@ -21,8 +21,10 @@ import spotipy
 from spotipy.oauth2 import SpotifyClientCredentials
 # --- END NEW IMPORTS ---
 
+#
 # ────────────────────────────────────────────────────────────────────────────────
 # LOGGING (Railway captures stdout/stderr and python logging)
+#
 # ────────────────────────────────────────────────────────────────────────────────
 logger = logging.getLogger("railway")
 if not logger.handlers:
@@ -38,8 +40,10 @@ health_logger = logging.getLogger("catalogue_health")
 # Try to import the catalogue health worker with defensive logging
 ch_run = None
 
+#
 # ────────────────────────────────────────────────────────────────────────────────
 # CONFIG
+#
 # ────────────────────────────────────────────────────────────────────────────────
 AIRTABLE_API_KEY = os.getenv("AIRTABLE_API_KEY") or os.getenv("AT_API_KEY")
 AIRTABLE_BASE_ID = os.getenv("AIRTABLE_BASE_ID") or os.getenv("AT_BASE_ID") or "appAmLhYAVcmKmRC3"
@@ -95,7 +99,8 @@ USER_AGENT = (
     "Chrome/124.0.0.0 Safari/537.36"
 )
 PATHFINDER_HOSTS = [
-    "https://api-partner.spotify.com",
+    "https://gue1-spclient.spotify.com",
+    "https://spclient.wg.spotify.com",
 ]
 
 airtable_sleep = float(os.getenv("AT_SLEEP", "0.2"))
@@ -109,8 +114,10 @@ CAP_DAILY_RATIO = float(os.getenv("CAP_DAILY_RATIO", "0.60"))
 ENABLE_SCHEDULER = os.getenv("ENABLE_SCHEDULER", "true").lower() in ("1","true","yes")
 SCHEDULE_EVERY_HOURS = int(os.getenv("SCHEDULE_EVERY_HOURS", "6"))
 
+#
 # ────────────────────────────────────────────────────────────────────────────────
 # Airtable helpers
+#
 # ────────────────────────────────────────────────────────────────────────────────
 def at_headers():
     return {"Authorization": f"Bearer {AIRTABLE_API_KEY}", "Content-Type": "application/json"}
@@ -185,8 +192,10 @@ def catalogue_index() -> Dict[str, Dict[str, Optional[str]]]:
         }
     return out
 
+#
 # ────────────────────────────────────────────────────────────────────────────────
 # Postgres helpers
+#
 # ────────────────────────────────────────────────────────────────────────────────
 def db_conn():
     if not DATABASE_URL:
@@ -253,8 +262,10 @@ def db_upsert_catalogue_health_status(cur, check_date_iso: str, track_uid: str, 
 # --- END: NEW DB HELPERS FOR CATALOGUE HEALTH ---
 
 
+#
 # ────────────────────────────────────────────────────────────────────────────────
 # Track Playcounts helpers (Airtable)
+#
 # ────────────────────────────────────────────────────────────────────────────────
 def _key(isrc_code: str, day_iso: str) -> str:
     return f"{isrc_code}|{day_iso}"
@@ -330,8 +341,10 @@ def upsert_count(linked_catalogue_rec_id: str, isrc_code: str, day_iso: str, cou
         raise RuntimeError(f"Airtable error {r.status_code}: {r.text}")
     time.sleep(airtable_sleep)
 
+#
 # ────────────────────────────────────────────────────────────────────────────────
 # Playlists master (Airtable list → which playlists to track)
+#
 # ────────────────────────────────────────────────────────────────────────────────
 def playlists_index_from_airtable():
     rows = at_paginate(PLAYLISTS_TABLE, {
@@ -348,8 +361,10 @@ def playlists_index_from_airtable():
             out[r["id"]] = {"playlist_id_urn": urn, "name": name}
     return out
 
+#
 # ────────────────────────────────────────────────────────────────────────────────
 # Spotify helpers for streams
+#
 # ────────────────────────────────────────────────────────────────────────────────
 def parse_spotify_playlist_id(val: Optional[str]) -> Optional[str]:
     if not val: return None
@@ -385,8 +400,8 @@ def _has_spotify_creds():
 
 def get_search_token() -> str:
     r = requests.post("https://accounts.spotify.com/api/token",
-                        data={"grant_type": "client_credentials"},
-                        auth=(CLIENT_ID, CLIENT_SECRET), timeout=60)
+                      data={"grant_type": "client_credentials"},
+                      auth=(CLIENT_ID, CLIENT_SECRET), timeout=60)
     r.raise_for_status()
     return r.json()["access_token"]
 
@@ -396,9 +411,9 @@ def search_track(isrc: str, bearer: str) -> Optional[Tuple[str, str, str, Option
     or None if not found.
     """
     r = requests.get("https://api.spotify.com/v1/search",
-                       headers={"Authorization": f"Bearer {bearer}"},
-                       params={"q": f"isrc:{isrc}", "type": "track", "limit": 5},
-                       timeout=60)
+                     headers={"Authorization": f"Bearer {bearer}"},
+                     params={"q": f"isrc:{isrc}", "type": "track", "limit": 5},
+                     timeout=60)
     if r.status_code != 200:
         return None
     items = r.json().get("tracks", {}).get("items", [])
@@ -464,8 +479,10 @@ def fetch_album(album_id: str, web_token: str, client_token: Optional[str]) -> D
             continue
     return {}
 
+#
 # ────────────────────────────────────────────────────────────────────────────────
 # Generic Airtable delta recompute
+#
 # ────────────────────────────────────────────────────────────────────────────────
 def backfill_table_deltas(table: str, link_field: str, date_field: str, count_field: str, delta_field: str, clamp_negative: bool) -> int:
     recs = at_paginate(table, {"pageSize": 100, "sort[0][field]": date_field, "sort[0][direction]": "asc"})
@@ -519,9 +536,11 @@ def backfill_deltas_for_all_tracks() -> int:
 def backfill_deltas_for_followers() -> int:
     return backfill_table_deltas(FOLLOWERS_TABLE, FOLLOWERS_LINK_FIELD, FOLLOWERS_DATE_FIELD, FOLLOWERS_COUNT_FIELD, FOLLOWERS_DELTA_FIELD, clamp_negative=not FOLLOWERS_ALLOW_NEGATIVE)
 
+#
 # ────────────────────────────────────────────────────────────────────────────────
 # Lag schema & catalogue totals (DB-only; idempotent)
 # ... (this section is unchanged)
+#
 # ────────────────────────────────────────────────────────────────────────────────
 def db_ensure_lag_schema(cur):
     cur.execute("""
@@ -561,15 +580,15 @@ def db_catalogue_delta_for_day(cur, day_iso: str) -> int:
         prev AS (
           SELECT s1.track_uid,
                  (SELECT s2.playcount
-                  FROM streams s2
-                  WHERE s2.platform='spotify'
-                    AND s2.track_uid = s1.track_uid
-                    AND s2.stream_date < %s
-                  ORDER BY s2.stream_date DESC
-                  LIMIT 1) AS pc_prev
-          FROM streams s1
-          WHERE s1.platform='spotify'
-          GROUP BY s1.track_uid
+                    FROM streams s2
+                   WHERE s2.platform='spotify'
+                     AND s2.track_uid = s1.track_uid
+                     AND s2.stream_date < %s
+                   ORDER BY s2.stream_date DESC
+                   LIMIT 1) AS pc_prev
+            FROM streams s1
+           WHERE s1.platform='spotify'
+           GROUP BY s1.track_uid
         )
         SELECT COALESCE(SUM(GREATEST(0, t.pc_day - COALESCE(p.pc_prev,0))),0) AS delta_sum
         FROM today t LEFT JOIN prev p USING (track_uid);
@@ -620,15 +639,15 @@ def db_today_increments(cur, today_iso: str) -> List[Tuple[str,int,int]]:
         prev AS (
           SELECT s1.track_uid,
                  (SELECT s2.playcount
-                  FROM streams s2
-                  WHERE s2.platform='spotify'
-                    AND s2.track_uid = s1.track_uid
-                    AND s2.stream_date < %s
-                  ORDER BY s2.stream_date DESC
-                  LIMIT 1) AS pc_prev
-          FROM streams s1
-          WHERE s1.platform='spotify'
-          GROUP BY s1.track_uid
+                    FROM streams s2
+                   WHERE s2.platform='spotify'
+                     AND s2.track_uid = s1.track_uid
+                     AND s2.stream_date < %s
+                   ORDER BY s2.stream_date DESC
+                   LIMIT 1) AS pc_prev
+            FROM streams s1
+           WHERE s1.platform='spotify'
+           GROUP BY s1.track_uid
         )
         SELECT t.track_uid,
                COALESCE(p.pc_prev, 0) AS prev_playcount,
@@ -654,9 +673,11 @@ def db_apply_lag_transfer(cur, from_day: str, to_day: str, track_uid: str, from_
         DO UPDATE SET playcount = streams.playcount + EXCLUDED.playcount
     """, (track_uid, to_day, to_day_new_pc))
 
+#
 # ────────────────────────────────────────────────────────────────────────────────
 # MAIN WORKER: Track Streams
 # ... (this section is unchanged)
+#
 # ────────────────────────────────────────────────────────────────────────────────
 async def run_once(day_override: Optional[str] = None, attempt_idx: int = 1, output_target: str = OUTPUT_TARGET) -> Dict[str, Any]:
     # FIX: The script now runs for the most recently completed day (yesterday).
@@ -835,9 +856,11 @@ async def run_once(day_override: Optional[str] = None, attempt_idx: int = 1, out
     streams_logger.info(log_summary)
     return stats
 
+#
 # ────────────────────────────────────────────────────────────────────────────────
 # MAIN WORKER: Playlist Followers
 # ... (this section is unchanged)
+#
 # ────────────────────────────────────────────────────────────────────────────────
 def run_playlist_followers(day_override: Optional[str] = None):
     day_iso = day_override or date.today().isoformat()
@@ -859,7 +882,7 @@ def run_playlist_followers(day_override: Optional[str] = None):
         plain_id = urn_to_plain_id(urn)
         try:
             r = requests.get(f"https://api.spotify.com/v1/playlists/{plain_id}?fields=followers(total)",
-                                   headers={"Authorization": f"Bearer {bearer}"}, timeout=30)
+                             headers={"Authorization": f"Bearer {bearer}"}, timeout=30)
             if r.status_code == 404:
                 followers_logger.warning("playlist not found (404): id=%s name=%s", plain_id, name)
                 continue
@@ -922,9 +945,11 @@ def run_playlist_followers(day_override: Optional[str] = None):
     return stats
 
 
+#
 # ────────────────────────────────────────────────────────────────────────────────
 # PLAYLIST SYNC WORKER
 # ... (this section is unchanged)
+#
 # ────────────────────────────────────────────────────────────────────────────────
 sync_logger = logging.getLogger("playlist_sync")
 
@@ -1372,8 +1397,10 @@ def run_catalogue_health_worker():
 ch_run = run_catalogue_health_worker
 # ─── END: CATALOGUE HEALTH WORKER ─────────────────────────────────────────────
 
+#
 # ────────────────────────────────────────────────────────────────────────────────
 # Scheduler
+#
 # ────────────────────────────────────────────────────────────────────────────────
 _RUNNING = threading.Event()
 _run_task: Optional[asyncio.Task] = None
@@ -1418,8 +1445,10 @@ def _schedule_loop():
     scheduler_logger.info("scheduler loop exiting")
 
 
+#
 # ────────────────────────────────────────────────────────────────────────────────
 # FLASK APP
+#
 # ────────────────────────────────────────────────────────────────────────────────
 app = Flask(__name__)
 
@@ -1490,7 +1519,7 @@ def backfill_handler(table: str):
 
 @app.route("/catalogue_health", methods=["POST"])
 def run_ch_handler():
-    # _check_token() # As requested, token check is disabled.
+    # _check_token() # As requested, token check is disabled for easier triggering.
     if not ch_run:
         return jsonify({"error": "catalogue_health module not available"}), 501
     try:
