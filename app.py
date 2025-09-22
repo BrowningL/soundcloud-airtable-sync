@@ -6,6 +6,9 @@ from datetime import date, datetime, timedelta
 from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import urlparse
 
+# --- NEW: Import random for jittered delay ---
+import random
+
 import logging
 import requests
 from flask import Flask, jsonify, request, abort
@@ -1278,28 +1281,49 @@ def similar(a: str, b: str) -> float:
     return difflib.SequenceMatcher(None, a.lower(), b.lower()).ratio()
 
 def check_apple_music_api(artist: str, title: str) -> bool:
-    """Searches for a track/album on Apple Music using the public iTunes Search API."""
+    """
+    Searches for a track on Apple Music with retries for rate limiting.
+    """
     base_url = "https://itunes.apple.com/search"
     params = {'term': f"{artist} {title}", 'entity': 'musicTrack,album', 'country': 'GB', 'limit': 20}
-    health_logger.info(f"[Apple] Checking for '{title}' by {artist}")
-    try:
-        # ### FIX: Added User-Agent header to mimic a browser and avoid 403 Forbidden errors ###
-        response = requests.get(base_url, params=params, timeout=15, headers={"User-Agent": USER_AGENT})
-        response.raise_for_status()
-        data = response.json()
-        for result in data.get('results', []):
-            result_track = result.get('trackName', '')
-            result_album = result.get('collectionName', '')
-            result_artist = result.get('artistName', '')
-            if similar(result_artist, artist) >= 0.85 and \
-               (similar(result_track, title) >= 0.85 or similar(result_album, title) >= 0.85):
-                health_logger.info(f"✅ [Apple] Found a match: '{result_track or result_album}'")
-                return True
-        health_logger.warning(f"❌ [Apple] No strong match found for '{title}'.")
-        return False
-    except requests.exceptions.RequestException as e:
-        health_logger.error(f"❗️ [Apple] Network error for '{title}': {e}")
-        return False
+    
+    for attempt in range(3): # Try up to 3 times
+        try:
+            health_logger.info(f"[Apple] Checking for '{title}' by {artist} (Attempt {attempt+1})")
+            response = requests.get(base_url, params=params, timeout=15, headers={"User-Agent": USER_AGENT})
+            
+            if response.status_code == 403:
+                # If forbidden, wait and retry. This is rate limiting.
+                wait_time = (attempt + 1) * 15 + random.uniform(0, 5) # 15s, 30s, 45s + jitter
+                health_logger.warning(f"[Apple] Received 403 (Forbidden). Rate limited. Waiting for {wait_time:.2f}s before retry.")
+                time.sleep(wait_time)
+                continue # Go to the next attempt
+            
+            response.raise_for_status() # Raise error for other codes (4xx, 5xx)
+            data = response.json()
+            
+            for result in data.get('results', []):
+                result_track = result.get('trackName', '')
+                result_album = result.get('collectionName', '')
+                result_artist = result.get('artistName', '')
+                if similar(result_artist, artist) >= 0.85 and \
+                   (similar(result_track, title) >= 0.85 or similar(result_album, title) >= 0.85):
+                    health_logger.info(f"✅ [Apple] Found a match: '{result_track or result_album}'")
+                    return True # Success
+            
+            health_logger.warning(f"❌ [Apple] No strong match found for '{title}'.")
+            return False # No match found, no need to retry
+
+        except requests.exceptions.RequestException as e:
+            health_logger.error(f"❗️ [Apple] Network error for '{title}': {e}")
+            if attempt < 2:
+                time.sleep(5) # Wait 5s on other network errors before retry
+            else:
+                return False # Failed after all retries
+    
+    health_logger.error(f"❗️ [Apple] Failed to check '{title}' after multiple retries due to persistent 403 errors.")
+    return False # Failed all attempts
+
 
 def check_spotify_api(sp_client, artist: str, title: str) -> bool:
     """Searches for a track on Spotify using the Spotipy library."""
@@ -1368,7 +1392,9 @@ def run_catalogue_health_worker():
                     # Perform checks
                     apple_exists = check_apple_music_api(artist, title)
                     spotify_exists = check_spotify_api(spotify_client, artist, title)
-                    time.sleep(0.5) # Polite delay
+                    
+                    # --- NEW: Jittered delay to appear more human ---
+                    time.sleep(random.uniform(1.0, 2.5))
 
                     # Get track_uid from our DB, creating the track if it's new
                     track_uid = db_upsert_track(cur, isrc, artist, title)
