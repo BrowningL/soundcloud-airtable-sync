@@ -5,9 +5,10 @@ import threading
 from datetime import date, datetime, timedelta
 from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import urlparse
-import json
+
 # --- NEW: Import random for jittered delay ---
 import random
+import json
 
 import logging
 import requests
@@ -57,6 +58,17 @@ DATABASE_URL = os.getenv("DATABASE_URL")
 OUTPUT_TARGET = os.getenv("OUTPUT_TARGET", "postgres").lower()
 AUTOMATION_TOKEN = os.getenv("AUTOMATION_TOKEN")
 LOCAL_TZ = os.getenv("LOCAL_TZ", "Europe/London")
+
+# --- PROXY CONFIGURATION ---
+# IMPORTANT: For security, it's best to move the full URL into an environment variable.
+PROXY_URL = os.getenv("PROXY_URL", "http://s4b7s6GYwBP9Op89:DuXDjrXC7Q2uCQV3_country-gb@geo.iproyal.com:12321")
+proxies = {
+    "http": PROXY_URL,
+    "https": PROXY_URL,
+} if PROXY_URL else None
+
+if proxies:
+    logger.info("Proxy configured and will be used for Spotify requests.")
 
 # ----- Catalogue (ISRC list) -----
 CATALOGUE_TABLE = os.getenv("CATALOGUE_TABLE", "Catalogue")
@@ -404,7 +416,7 @@ def _has_spotify_creds():
 def get_search_token() -> str:
     r = requests.post("https://accounts.spotify.com/api/token",
                       data={"grant_type": "client_credentials"},
-                      auth=(CLIENT_ID, CLIENT_SECRET), timeout=60)
+                      auth=(CLIENT_ID, CLIENT_SECRET), timeout=60, proxies=proxies)
     r.raise_for_status()
     return r.json()["access_token"]
 
@@ -416,7 +428,7 @@ def search_track(isrc: str, bearer: str) -> Optional[Tuple[str, str, str, Option
     r = requests.get("https://api.spotify.com/v1/search",
                      headers={"Authorization": f"Bearer {bearer}"},
                      params={"q": f"isrc:{isrc}", "type": "track", "limit": 5},
-                     timeout=60)
+                     timeout=60, proxies=proxies)
     if r.status_code != 200:
         return None
     items = r.json().get("tracks", {}).get("items", [])
@@ -442,8 +454,17 @@ def search_track(isrc: str, bearer: str) -> Optional[Tuple[str, str, str, Option
     return track_id, album_id, track_name, artists_joined
 
 async def sniff_tokens() -> Tuple[str, Optional[str]]:
+    proxy_server = None
+    if PROXY_URL:
+        parsed_url = urlparse(PROXY_URL)
+        proxy_server = {
+            "server": f"{parsed_url.scheme}://{parsed_url.hostname}:{parsed_url.port}",
+            "username": parsed_url.username,
+            "password": parsed_url.password
+        }
+
     async with async_playwright() as p:
-        browser = await p.chromium.launch(headless=True, args=["--no-sandbox"])
+        browser = await p.chromium.launch(headless=True, args=["--no-sandbox"], proxy=proxy_server)
         ctx = await browser.new_context(user_agent=USER_AGENT)
         page = await ctx.new_page()
         fut = asyncio.get_event_loop().create_future()
@@ -465,6 +486,7 @@ async def sniff_tokens() -> Tuple[str, Optional[str]]:
 
 def fetch_album(album_id: str, web_token: str, client_token: Optional[str]) -> Dict[str, Any]:
     sess = requests.Session()
+    sess.proxies = proxies
     headers = {"Authorization": f"Bearer {web_token}", "User-Agent": USER_AGENT, "content-type": "application/json"}
     if client_token:
         headers["Client-Token"] = client_token
@@ -477,7 +499,11 @@ def fetch_album(album_id: str, web_token: str, client_token: Optional[str]) -> D
         try:
             r = sess.post(f"{host}/pathfinder/v2/query", headers=headers, json=body, timeout=30)
             if r.status_code == 200:
-                return r.json()
+                response_json = r.json()
+                if not response_json.get("data"):
+                    streams_logger.warning(f"Received empty 'data' from Spotify for album {album_id}. Likely a proxy/IP block.")
+                    return {}
+                return response_json
         except Exception:
             continue
     return {}
@@ -583,12 +609,12 @@ def db_catalogue_delta_for_day(cur, day_iso: str) -> int:
         prev AS (
           SELECT s1.track_uid,
                  (SELECT s2.playcount
-                    FROM streams s2
-                   WHERE s2.platform='spotify'
-                     AND s2.track_uid = s1.track_uid
-                     AND s2.stream_date < %s
-                   ORDER BY s2.stream_date DESC
-                   LIMIT 1) AS pc_prev
+                   FROM streams s2
+                  WHERE s2.platform='spotify'
+                    AND s2.track_uid = s1.track_uid
+                    AND s2.stream_date < %s
+                  ORDER BY s2.stream_date DESC
+                  LIMIT 1) AS pc_prev
             FROM streams s1
            WHERE s1.platform='spotify'
            GROUP BY s1.track_uid
@@ -642,12 +668,12 @@ def db_today_increments(cur, today_iso: str) -> List[Tuple[str,int,int]]:
         prev AS (
           SELECT s1.track_uid,
                  (SELECT s2.playcount
-                    FROM streams s2
-                   WHERE s2.platform='spotify'
-                     AND s2.track_uid = s1.track_uid
-                     AND s2.stream_date < %s
-                   ORDER BY s2.stream_date DESC
-                   LIMIT 1) AS pc_prev
+                   FROM streams s2
+                  WHERE s2.platform='spotify'
+                    AND s2.track_uid = s1.track_uid
+                    AND s2.stream_date < %s
+                  ORDER BY s2.stream_date DESC
+                  LIMIT 1) AS pc_prev
             FROM streams s1
            WHERE s1.platform='spotify'
            GROUP BY s1.track_uid
@@ -679,10 +705,8 @@ def db_apply_lag_transfer(cur, from_day: str, to_day: str, track_uid: str, from_
 #
 # ────────────────────────────────────────────────────────────────────────────────
 # MAIN WORKER: Track Streams
-# ... (this section is unchanged)
 #
 # ────────────────────────────────────────────────────────────────────────────────
-
 async def run_once(day_override: Optional[str] = None, attempt_idx: int = 1, output_target: str = OUTPUT_TARGET) -> Dict[str, Any]:
     # FIX: The script now runs for the most recently completed day (yesterday).
     day_iso = day_override or (date.today() - timedelta(days=1)).isoformat()
@@ -716,14 +740,6 @@ async def run_once(day_override: Optional[str] = None, attempt_idx: int = 1, out
             track_id, album_id, api_title, api_artist = track_info
             album_data = fetch_album(album_id, web_token, client_token)
             
-            # --- START: DEBUGGING BLOCK TO LOG RAILWAY'S RESPONSE ---
-            if i < 2: # This will log the response for the first two tracks.
-                streams_logger.info(f"DEBUG (from Railway IP): Raw response for album {album_id}:")
-                streams_logger.info(json.dumps(album_data, indent=2))
-            # --- END: DEBUGGING BLOCK ---
-            
-            # --- FIX APPLIED HERE ---
-            # Changed "tracks" to "tracksV2" to match the new Spotify API structure
             tracks = (album_data.get("data", {}).get("albumUnion", {}).get("tracksV2", {}).get("items", []))
             for item in tracks:
                 t = item.get("track")
@@ -869,7 +885,6 @@ async def run_once(day_override: Optional[str] = None, attempt_idx: int = 1, out
 #
 # ────────────────────────────────────────────────────────────────────────────────
 # MAIN WORKER: Playlist Followers
-# ... (this section is unchanged)
 #
 # ────────────────────────────────────────────────────────────────────────────────
 def run_playlist_followers(day_override: Optional[str] = None):
@@ -892,7 +907,7 @@ def run_playlist_followers(day_override: Optional[str] = None):
         plain_id = urn_to_plain_id(urn)
         try:
             r = requests.get(f"https://api.spotify.com/v1/playlists/{plain_id}?fields=followers(total)",
-                             headers={"Authorization": f"Bearer {bearer}"}, timeout=30)
+                             headers={"Authorization": f"Bearer {bearer}"}, timeout=30, proxies=proxies)
             if r.status_code == 404:
                 followers_logger.warning("playlist not found (404): id=%s name=%s", plain_id, name)
                 continue
@@ -958,7 +973,6 @@ def run_playlist_followers(day_override: Optional[str] = None):
 #
 # ────────────────────────────────────────────────────────────────────────────────
 # PLAYLIST SYNC WORKER
-# ... (this section is unchanged)
 #
 # ────────────────────────────────────────────────────────────────────────────────
 sync_logger = logging.getLogger("playlist_sync")
@@ -998,6 +1012,7 @@ def get_spotify_token_refreshed() -> str:
             "refresh_token": SPOTIFY_REFRESH_TOKEN,
         },
         timeout=30,
+        proxies=proxies
     )
     r.raise_for_status()
     token = r.json().get("access_token")
@@ -1034,7 +1049,7 @@ def extract_playlist_id(raw: Any) -> Optional[str]:
 def get_playlist_snapshot(token: str, playlist_id: str) -> Dict[str, Any]:
     """Fetches just the snapshot_id and total track count for a playlist."""
     url = f"https://api.spotify.com/v1/playlists/{playlist_id}?fields=snapshot_id,tracks(total)"
-    r = requests.get(url, headers={"Authorization": f"Bearer {token}"}, timeout=30)
+    r = requests.get(url, headers={"Authorization": f"Bearer {token}"}, timeout=30, proxies=proxies)
     r.raise_for_status()
     return r.json()
 
@@ -1047,7 +1062,7 @@ def fetch_all_playlist_tracks(token: str, playlist_id: str) -> List[Dict[str, An
     page = 1
     while url:
         sync_logger.info(f"Fetching page {page} for playlist {playlist_id}...")
-        r = requests.get(url, headers={"Authorization": f"Bearer {token}"}, timeout=60)
+        r = requests.get(url, headers={"Authorization": f"Bearer {token}"}, timeout=60, proxies=proxies)
         r.raise_for_status()
         data = r.json()
         
@@ -1297,6 +1312,7 @@ def check_apple_music_api(artist: str, title: str) -> bool:
     for attempt in range(3): # Try up to 3 times
         try:
             health_logger.info(f"[Apple] Checking for '{title}' by {artist} (Attempt {attempt+1})")
+            # NOTE: Apple Music requests are NOT proxied by default, only Spotify requests.
             response = requests.get(base_url, params=params, timeout=15, headers={"User-Agent": USER_AGENT})
             
             if response.status_code == 403:
@@ -1360,10 +1376,10 @@ def run_catalogue_health_worker():
     if not _has_spotify_creds():
         raise RuntimeError("Spotify API credentials (SPOTIFY_CLIENT_ID, SPOTIFY_CLIENT_SECRET) must be set for health checks.")
 
-    # 1. Set up Spotify client
+    # 1. Set up Spotify client with proxy
     try:
-        auth_manager = SpotifyClientCredentials(client_id=CLIENT_ID, client_secret=CLIENT_SECRET)
-        spotify_client = spotipy.Spotify(auth_manager=auth_manager)
+        auth_manager = SpotifyClientCredentials(client_id=CLIENT_ID, client_secret=CLIENT_SECRET, proxies=proxies)
+        spotify_client = spotipy.Spotify(auth_manager=auth_manager, proxies=proxies)
         health_logger.info("Spotipy client initialized successfully.")
     except Exception as e:
         health_logger.exception("Failed to initialize Spotipy client.")
