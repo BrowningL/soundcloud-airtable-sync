@@ -5,7 +5,7 @@ import threading
 from datetime import date, datetime, timedelta
 from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import urlparse
-
+import json
 # --- NEW: Import random for jittered delay ---
 import random
 
@@ -682,6 +682,7 @@ def db_apply_lag_transfer(cur, from_day: str, to_day: str, track_uid: str, from_
 # ... (this section is unchanged)
 #
 # ────────────────────────────────────────────────────────────────────────────────
+
 async def run_once(day_override: Optional[str] = None, attempt_idx: int = 1, output_target: str = OUTPUT_TARGET) -> Dict[str, Any]:
     # FIX: The script now runs for the most recently completed day (yesterday).
     day_iso = day_override or (date.today() - timedelta(days=1)).isoformat()
@@ -714,6 +715,12 @@ async def run_once(day_override: Optional[str] = None, attempt_idx: int = 1, out
             
             track_id, album_id, api_title, api_artist = track_info
             album_data = fetch_album(album_id, web_token, client_token)
+            
+            # --- START: DEBUGGING BLOCK TO LOG RAILWAY'S RESPONSE ---
+            if i < 2: # This will log the response for the first two tracks.
+                streams_logger.info(f"DEBUG (from Railway IP): Raw response for album {album_id}:")
+                streams_logger.info(json.dumps(album_data, indent=2))
+            # --- END: DEBUGGING BLOCK ---
             
             # --- FIX APPLIED HERE ---
             # Changed "tracks" to "tracksV2" to match the new Spotify API structure
