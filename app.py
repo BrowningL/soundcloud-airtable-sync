@@ -739,7 +739,7 @@ async def run_once(day_override: Optional[str] = None, attempt_idx: int = 1, out
     cat_isrcs = list(catalogue.keys())
     
     # --- DEBUG CHANGE: Limit to the first 10 tracks ---
-    is_debug_run = True # Set to False to run all tracks
+    is_debug_run = False # Set to False to run all tracks
     if is_debug_run:
         streams_logger.info("--- RUNNING IN DEBUG MODE: PROCESSING FIRST 10 TRACKS ONLY ---")
         cat_isrcs = cat_isrcs[:10]
