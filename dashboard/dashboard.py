@@ -796,23 +796,31 @@ def api_streams_top_deltas():
     except Exception:
         limit = 10000
 
+    # THIS IS THE CORRECTED SQL QUERY
     q = r"""
+        WITH deltas AS (
+            SELECT
+                s.track_uid,
+                GREATEST(0, s.playcount - COALESCE((
+                    SELECT s2.playcount
+                    FROM streams s2
+                    WHERE s2.track_uid = s.track_uid AND s2.stream_date < s.stream_date
+                    ORDER BY s2.stream_date DESC
+                    LIMIT 1
+                ), 0)) AS daily_delta_calc
+            FROM streams s
+            WHERE s.platform = 'spotify' AND s.stream_date = %s
+        )
         SELECT
-          t.isrc,
-          t.title,
-          (
-            regexp_split_to_array(
-              btrim(t.artist),
-              '(?i)\s*(?:,|&|with|feat\.?|featuring)\s*'
-            )
-          )[1] AS artist_norm,
-          COALESCE(s.daily_delta, 0)::bigint AS delta
-        FROM streams s
-        JOIN track_dim t ON t.track_uid = s.track_uid
-        WHERE s.platform = 'spotify'
-          AND s.stream_date = %s
-        ORDER BY COALESCE(s.daily_delta,0) DESC, t.isrc
-        LIMIT %s
+            t.isrc,
+            t.title,
+            t.artist,
+            d.daily_delta_calc AS delta
+        FROM deltas d
+        JOIN track_dim t ON t.track_uid = d.track_uid
+        WHERE d.daily_delta_calc > 0
+        ORDER BY d.daily_delta_calc DESC, t.isrc
+        LIMIT %s;
     """
     rows = _q(q, (day, limit))
     out = []
@@ -820,7 +828,7 @@ def api_streams_top_deltas():
         out.append({
             "isrc": r.get("isrc"),
             "title": r.get("title"),
-            "artist": r.get("artist_norm"),
+            "artist": r.get("artist"),
             "delta": int(r.get("delta") or 0),
         })
     return jsonify({"rows": out})
@@ -923,28 +931,37 @@ def api_artists_top_share():
     if not day:
         return jsonify({"date": None, "labels": [], "values": [], "shares": []})
 
+    # THIS IS THE CORRECTED SQL QUERY
     q = r"""
-        WITH base AS (
-          SELECT
-            (
-              regexp_split_to_array(
-                btrim(t.artist),
-                '(?i)\s*(?:,|&|with|feat\.?|featuring)\s*'
-              )
-            )[1] AS artist_norm,
-            GREATEST(s.daily_delta, 0)::bigint AS v
-          FROM streams s
-          JOIN track_dim t ON t.track_uid = s.track_uid
-          WHERE s.platform = 'spotify'
-            AND s.stream_date = %s
+        WITH deltas_by_track AS (
+            SELECT
+                s.track_uid,
+                GREATEST(0, s.playcount - COALESCE((
+                    SELECT s2.playcount
+                    FROM streams s2
+                    WHERE s2.track_uid = s.track_uid AND s2.stream_date < s.stream_date
+                    ORDER BY s2.stream_date DESC
+                    LIMIT 1
+                ), 0)) AS daily_delta_calc
+            FROM streams s
+            WHERE s.platform = 'spotify' AND s.stream_date = %s
+        ),
+        deltas_by_artist AS (
+            SELECT
+                t.artist,
+                d.daily_delta_calc
+            FROM deltas_by_track d
+            JOIN track_dim t ON t.track_uid = d.track_uid
+            WHERE d.daily_delta_calc > 0
         )
-        SELECT artist_norm AS artist,
-               COALESCE(SUM(v),0)::bigint AS v
-        FROM base
-        GROUP BY artist_norm
-        HAVING COALESCE(SUM(v),0) > 0
+        SELECT
+            artist,
+            COALESCE(SUM(daily_delta_calc), 0)::bigint AS v
+        FROM deltas_by_artist
+        GROUP BY artist
+        HAVING COALESCE(SUM(daily_delta_calc), 0) > 0
         ORDER BY v DESC
-        LIMIT 25
+        LIMIT 25;
     """
     rows = _q(q, (day,))
     total = sum(int(r["v"]) for r in rows) or 1
