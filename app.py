@@ -462,11 +462,23 @@ def _has_spotify_creds():
     return bool(CLIENT_ID and CLIENT_SECRET and CLIENT_ID != "YOUR_SPOTIFY_CLIENT_ID" and CLIENT_SECRET != "YOUR_SPOTIFY_CLIENT_SECRET")
 
 def get_search_token() -> str:
-    r = _spotify_request_with_retries("post", SPOTIFY_TOKEN_URL,
-                                      data={"grant_type": "client_credentials"},
-                                      auth=(CLIENT_ID, CLIENT_SECRET), timeout=60)
-    return r.json()["access_token"]
-
+    """Gets a standard API token for searching WITHOUT the proxy."""
+    # Authentication is sensitive and can fail with a proxy. We make this one request directly.
+    streams_logger.info("Getting search token directly (without proxy)...")
+    try:
+        r = requests.post(
+            SPOTIFY_TOKEN_URL,
+            data={"grant_type": "client_credentials"},
+            auth=(CLIENT_ID, CLIENT_SECRET), 
+            timeout=60
+            # Note: No 'proxies' argument, so this call is direct.
+        )
+        r.raise_for_status()
+        streams_logger.info("Successfully got search token.")
+        return r.json()["access_token"]
+    except requests.exceptions.RequestException as e:
+        streams_logger.error(f"Failed to get search token directly. Error: {e}")
+        raise # If authentication fails, we can't continue, so we stop the run.
 def search_track(isrc: str, bearer: str) -> Optional[Tuple[str, str, str, Optional[str]]]:
     """
     Return (track_id, album_id, track_name, artists_joined) for the given ISRC,
