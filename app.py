@@ -80,8 +80,7 @@ AUTOMATION_TOKEN = os.getenv("AUTOMATION_TOKEN")
 LOCAL_TZ = os.getenv("LOCAL_TZ", "Europe/London")
 
 # --- PROXY CONFIGURATION ---
-# IMPORTANT: For security, it's best to move the full URL into an environment variable.
-PROXY_URL = os.getenv("PROXY_URL", "http://s4b7s6GYwBP9Op89:DuXDjrXC7Q2uCQV3_country-gb@geo.iproyal.com:12321")
+PROXY_URL = os.getenv("PROXY_URL")
 proxies = {
     "http": PROXY_URL,
     "https": PROXY_URL,
@@ -90,7 +89,7 @@ proxies = {
 if proxies:
     logger.info("Proxy configured and will be used for Spotify requests.")
     
-# --- NEW: OFFICIAL SPOTIFY API ENDPOINTS ---
+# --- OFFICIAL SPOTIFY API ENDPOINTS ---
 SPOTIFY_TOKEN_URL = "https://accounts.spotify.com/api/token"
 SPOTIFY_SEARCH_URL = "https://api.spotify.com/v1/search"
 SPOTIFY_PLAYLIST_URL = "https://api.spotify.com/v1/playlists/"
@@ -130,6 +129,8 @@ FOLLOWERS_ALLOW_NEGATIVE = (os.getenv("FOLLOWERS_ALLOW_NEGATIVE", "true").lower(
 # Spotify creds
 CLIENT_ID = os.getenv("SPOTIFY_CLIENT_ID", "YOUR_SPOTIFY_CLIENT_ID")
 CLIENT_SECRET = os.getenv("SPOTIFY_CLIENT_SECRET", "YOUR_SPOTIFY_CLIENT_SECRET")
+SPOTIFY_REFRESH_TOKEN = os.getenv("SPOTIFY_REFRESH_TOKEN")
+
 
 # Spotify web GraphQL for streams (unchanged)
 OPERATION_NAME = "getAlbum"
@@ -146,7 +147,6 @@ airtable_sleep = float(os.getenv("AT_SLEEP", "0.2"))
 spotify_sleep = float(os.getenv("SPOTIFY_SLEEP", "0.15"))
 
 # ── Lag config (simple hard floor + caps + scheduler) ───────────────────────────
-# FIX: Default changed to "0" to disable the stream backfilling/smoothing feature.
 LAG_MIN_TOTAL = int(os.getenv("LAG_MIN_TOTAL", "0"))
 CAP_CHECKPOINT_RATIO = float(os.getenv("CAP_CHECKPOINT_RATIO", "0.30"))
 CAP_DAILY_RATIO = float(os.getenv("CAP_DAILY_RATIO", "0.60"))
@@ -156,6 +156,7 @@ SCHEDULE_EVERY_HOURS = int(os.getenv("SCHEDULE_EVERY_HOURS", "6"))
 #
 # ────────────────────────────────────────────────────────────────────────────────
 # NETWORK HELPERS (WITH RETRY LOGIC)
+#
 # ────────────────────────────────────────────────────────────────────────────────
 def _spotify_request_with_retries(method: str, url: str, **kwargs) -> requests.Response:
     """A wrapper for requests that includes retry logic for network/proxy errors."""
@@ -172,7 +173,6 @@ def _spotify_request_with_retries(method: str, url: str, **kwargs) -> requests.R
             else:
                 logger.error(f"Request to {url} failed after 3 attempts.")
                 raise  # Re-raise the exception if all retries fail
-    # This part should not be reachable, but added for safety
     raise requests.exceptions.RequestException(f"All retry attempts to {url} failed.")
 
 
@@ -196,7 +196,6 @@ def at_paginate(table: str, params: Dict[str, Any]) -> List[Dict[str, Any]]:
         q = dict(params)
         if offset:
             q["offset"] = offset
-        # This is an Airtable call, so it does not use the Spotify proxy.
         r = requests.get(at_url(table), headers=at_headers(), params=q, timeout=60)
         r.raise_for_status()
         data = r.json()
@@ -461,24 +460,33 @@ def _check_token():
 def _has_spotify_creds():
     return bool(CLIENT_ID and CLIENT_SECRET and CLIENT_ID != "YOUR_SPOTIFY_CLIENT_ID" and CLIENT_SECRET != "YOUR_SPOTIFY_CLIENT_SECRET")
 
-def get_search_token() -> str:
-    """Gets a standard API token for searching WITHOUT the proxy."""
-    # Authentication is sensitive and can fail with a proxy. We make this one request directly.
-    streams_logger.info("Getting search token directly (without proxy)...")
+def get_spotify_token_refreshed() -> str:
+    """Gets a new Spotify access token using the refresh token, bypassing the proxy."""
+    if not SPOTIFY_REFRESH_TOKEN:
+        raise ValueError("SPOTIFY_REFRESH_TOKEN is not set.")
+    
+    logger.info("Requesting new Spotify access token using refresh token (direct connection)...")
     try:
         r = requests.post(
             SPOTIFY_TOKEN_URL,
-            data={"grant_type": "client_credentials"},
-            auth=(CLIENT_ID, CLIENT_SECRET), 
-            timeout=60
-            # Note: No 'proxies' argument, so this call is direct.
+            auth=(CLIENT_ID, CLIENT_SECRET),
+            data={
+                "grant_type": "refresh_token",
+                "refresh_token": SPOTIFY_REFRESH_TOKEN,
+            },
+            timeout=30
+            # No proxy is used for this sensitive auth request
         )
         r.raise_for_status()
-        streams_logger.info("Successfully got search token.")
-        return r.json()["access_token"]
+        token = r.json().get("access_token")
+        if not token:
+            raise RuntimeError("Failed to get access_token from Spotify.")
+        logger.info("Successfully refreshed Spotify access token.")
+        return token
     except requests.exceptions.RequestException as e:
-        streams_logger.error(f"Failed to get search token directly. Error: {e}")
-        raise # If authentication fails, we can't continue, so we stop the run.
+        logger.error(f"Failed to get token via refresh. Error: {e}")
+        raise
+
 def search_track(isrc: str, bearer: str) -> Optional[Tuple[str, str, str, Optional[str]]]:
     """
     Return (track_id, album_id, track_name, artists_joined) for the given ISRC,
@@ -778,7 +786,9 @@ async def run_once(day_override: Optional[str] = None, attempt_idx: int = 1, out
     streams_logger.info("starting run: tracks=%d output=%s attempt=%d date=%s", len(cat_isrcs), output_target, attempt_idx, day_iso)
 
     try:
-        search_token = get_search_token() if _has_spotify_creds() else None
+        # Use the more robust refresh token method to get the main access token
+        search_token = get_spotify_token_refreshed()
+        # The web tokens for scraping are still needed separately
         web_token, client_token = await sniff_tokens()
     except Exception as e:
         streams_logger.error(f"Failed to get auth tokens, cannot proceed. Error: {e}")
@@ -953,10 +963,10 @@ async def run_once(day_override: Optional[str] = None, attempt_idx: int = 1, out
     )
     streams_logger.info(log_summary)
     
-    # --- ADD THIS BLOCK TO SEND THE ALERT ---
+    # Send the alert if the run completed but found no streams
     if processed > 0 and sum_pc == 0:
         error_message = f"ALERT: Spotify stream run for {day_iso} completed but found 0 total streams. Please check the system."
-        send_telegram_alert(error_message) # <-- Should be calling the new function
+        send_telegram_alert(error_message)
 
     return stats
 
