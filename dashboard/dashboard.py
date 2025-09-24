@@ -734,42 +734,20 @@ def ui():
 @app.get("/api/streams/total-daily")
 def api_streams_total_daily():
     days = _clamp_days(request.args.get("days"), 90)
-    # THIS IS THE CORRECTED SQL QUERY
     q = """
-        WITH deltas_per_track_per_day AS (
-            SELECT
-                s.stream_date,
-                s.track_uid,
-                GREATEST(0, s.playcount - COALESCE((
-                    SELECT s2.playcount
-                    FROM streams s2
-                    WHERE s2.track_uid = s.track_uid AND s2.stream_date < s.stream_date
-                    ORDER BY s2.stream_date DESC
-                    LIMIT 1
-                ), 0)) AS daily_delta_calc
-            FROM streams s
-            WHERE s.platform = 'spotify'
-              AND s.stream_date >= CURRENT_DATE - %s::int * INTERVAL '1 day'
-        )
-        SELECT
-            stream_date AS d,
-            COALESCE(SUM(daily_delta_calc), 0)::bigint AS v
-        FROM deltas_per_track_per_day
-        GROUP BY stream_date
-        ORDER BY stream_date;
+        SELECT s.stream_date AS d,
+               COALESCE(SUM(GREATEST(s.daily_delta, 0)), 0)::bigint AS v
+        FROM streams s
+        WHERE s.platform = 'spotify'
+          AND s.stream_date >= CURRENT_DATE - %s::int * INTERVAL '1 day'
+        GROUP BY s.stream_date
+        ORDER BY s.stream_date
     """
     rows = _q(q, (days,))
     if rows:
         start, end = rows[0]["d"], rows[-1]["d"]
     else:
-        end = date.today()
-        start = end - timedelta(days=days)
-    
-    # Ensure the date range covers the requested number of days
-    expected_start = date.today() - timedelta(days=days)
-    if not rows or start > expected_start:
-        start = expected_start
-
+        end = date.today(); start = end - timedelta(days=days)
     labels, values = _fill_series([(r["d"], r["v"]) for r in rows], start, end)
     return jsonify({"labels": labels, "values": values})
 
@@ -796,31 +774,23 @@ def api_streams_top_deltas():
     except Exception:
         limit = 10000
 
-    # THIS IS THE CORRECTED SQL QUERY
     q = r"""
-        WITH deltas AS (
-            SELECT
-                s.track_uid,
-                GREATEST(0, s.playcount - COALESCE((
-                    SELECT s2.playcount
-                    FROM streams s2
-                    WHERE s2.track_uid = s.track_uid AND s2.stream_date < s.stream_date
-                    ORDER BY s2.stream_date DESC
-                    LIMIT 1
-                ), 0)) AS daily_delta_calc
-            FROM streams s
-            WHERE s.platform = 'spotify' AND s.stream_date = %s
-        )
         SELECT
-            t.isrc,
-            t.title,
-            t.artist,
-            d.daily_delta_calc AS delta
-        FROM deltas d
-        JOIN track_dim t ON t.track_uid = d.track_uid
-        WHERE d.daily_delta_calc > 0
-        ORDER BY d.daily_delta_calc DESC, t.isrc
-        LIMIT %s;
+          t.isrc,
+          t.title,
+          (
+            regexp_split_to_array(
+              btrim(t.artist),
+              '(?i)\s*(?:,|&|with|feat\.?|featuring)\s*'
+            )
+          )[1] AS artist_norm,
+          COALESCE(s.daily_delta, 0)::bigint AS delta
+        FROM streams s
+        JOIN track_dim t ON t.track_uid = s.track_uid
+        WHERE s.platform = 'spotify'
+          AND s.stream_date = %s
+        ORDER BY COALESCE(s.daily_delta,0) DESC, t.isrc
+        LIMIT %s
     """
     rows = _q(q, (day, limit))
     out = []
@@ -828,7 +798,7 @@ def api_streams_top_deltas():
         out.append({
             "isrc": r.get("isrc"),
             "title": r.get("title"),
-            "artist": r.get("artist"),
+            "artist": r.get("artist_norm"),
             "delta": int(r.get("delta") or 0),
         })
     return jsonify({"rows": out})
@@ -931,37 +901,28 @@ def api_artists_top_share():
     if not day:
         return jsonify({"date": None, "labels": [], "values": [], "shares": []})
 
-    # THIS IS THE CORRECTED SQL QUERY
     q = r"""
-        WITH deltas_by_track AS (
-            SELECT
-                s.track_uid,
-                GREATEST(0, s.playcount - COALESCE((
-                    SELECT s2.playcount
-                    FROM streams s2
-                    WHERE s2.track_uid = s.track_uid AND s2.stream_date < s.stream_date
-                    ORDER BY s2.stream_date DESC
-                    LIMIT 1
-                ), 0)) AS daily_delta_calc
-            FROM streams s
-            WHERE s.platform = 'spotify' AND s.stream_date = %s
-        ),
-        deltas_by_artist AS (
-            SELECT
-                t.artist,
-                d.daily_delta_calc
-            FROM deltas_by_track d
-            JOIN track_dim t ON t.track_uid = d.track_uid
-            WHERE d.daily_delta_calc > 0
+        WITH base AS (
+          SELECT
+            (
+              regexp_split_to_array(
+                btrim(t.artist),
+                '(?i)\s*(?:,|&|with|feat\.?|featuring)\s*'
+              )
+            )[1] AS artist_norm,
+            GREATEST(s.daily_delta, 0)::bigint AS v
+          FROM streams s
+          JOIN track_dim t ON t.track_uid = s.track_uid
+          WHERE s.platform = 'spotify'
+            AND s.stream_date = %s
         )
-        SELECT
-            artist,
-            COALESCE(SUM(daily_delta_calc), 0)::bigint AS v
-        FROM deltas_by_artist
-        GROUP BY artist
-        HAVING COALESCE(SUM(daily_delta_calc), 0) > 0
+        SELECT artist_norm AS artist,
+               COALESCE(SUM(v),0)::bigint AS v
+        FROM base
+        GROUP BY artist_norm
+        HAVING COALESCE(SUM(v),0) > 0
         ORDER BY v DESC
-        LIMIT 25;
+        LIMIT 25
     """
     rows = _q(q, (day,))
     total = sum(int(r["v"]) for r in rows) or 1
