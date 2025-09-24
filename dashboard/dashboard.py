@@ -734,20 +734,42 @@ def ui():
 @app.get("/api/streams/total-daily")
 def api_streams_total_daily():
     days = _clamp_days(request.args.get("days"), 90)
+    # THIS IS THE CORRECTED SQL QUERY
     q = """
-        SELECT s.stream_date AS d,
-               COALESCE(SUM(GREATEST(s.daily_delta, 0)), 0)::bigint AS v
-        FROM streams s
-        WHERE s.platform = 'spotify'
-          AND s.stream_date >= CURRENT_DATE - %s::int * INTERVAL '1 day'
-        GROUP BY s.stream_date
-        ORDER BY s.stream_date
+        WITH deltas_per_track_per_day AS (
+            SELECT
+                s.stream_date,
+                s.track_uid,
+                GREATEST(0, s.playcount - COALESCE((
+                    SELECT s2.playcount
+                    FROM streams s2
+                    WHERE s2.track_uid = s.track_uid AND s2.stream_date < s.stream_date
+                    ORDER BY s2.stream_date DESC
+                    LIMIT 1
+                ), 0)) AS daily_delta_calc
+            FROM streams s
+            WHERE s.platform = 'spotify'
+              AND s.stream_date >= CURRENT_DATE - %s::int * INTERVAL '1 day'
+        )
+        SELECT
+            stream_date AS d,
+            COALESCE(SUM(daily_delta_calc), 0)::bigint AS v
+        FROM deltas_per_track_per_day
+        GROUP BY stream_date
+        ORDER BY stream_date;
     """
     rows = _q(q, (days,))
     if rows:
         start, end = rows[0]["d"], rows[-1]["d"]
     else:
-        end = date.today(); start = end - timedelta(days=days)
+        end = date.today()
+        start = end - timedelta(days=days)
+    
+    # Ensure the date range covers the requested number of days
+    expected_start = date.today() - timedelta(days=days)
+    if not rows or start > expected_start:
+        start = expected_start
+
     labels, values = _fill_series([(r["d"], r["v"]) for r in rows], start, end)
     return jsonify({"labels": labels, "values": values})
 
