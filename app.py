@@ -69,6 +69,14 @@ proxies = {
 
 if proxies:
     logger.info("Proxy configured and will be used for Spotify requests.")
+    
+# --- NEW: OFFICIAL SPOTIFY API ENDPOINTS ---
+SPOTIFY_TOKEN_URL = "https://accounts.spotify.com/api/token"
+SPOTIFY_SEARCH_URL = "https://api.spotify.com/v1/search"
+SPOTIFY_PLAYLIST_URL = "https://api.spotify.com/v1/playlists/"
+# This is the direct, unofficial endpoint. It may be heavily protected.
+SPOTIFY_PATHFINDER_URL = "https://api-partner.spotify.com/pathfinder/v2/query"
+
 
 # ----- Catalogue (ISRC list) -----
 CATALOGUE_TABLE = os.getenv("CATALOGUE_TABLE", "Catalogue")
@@ -113,10 +121,6 @@ USER_AGENT = (
     "AppleWebKit/537.36 (KHTML, like Gecko) "
     "Chrome/124.0.0.0 Safari/537.36"
 )
-PATHFINDER_HOSTS = [
-    "https://gue1-spclient.spotify.com",
-    "https://spclient.wg.spotify.com",
-]
 
 airtable_sleep = float(os.getenv("AT_SLEEP", "0.2"))
 spotify_sleep = float(os.getenv("SPOTIFY_SLEEP", "0.15"))
@@ -438,7 +442,7 @@ def _has_spotify_creds():
     return bool(CLIENT_ID and CLIENT_SECRET and CLIENT_ID != "YOUR_SPOTIFY_CLIENT_ID" and CLIENT_SECRET != "YOUR_SPOTIFY_CLIENT_SECRET")
 
 def get_search_token() -> str:
-    r = _spotify_request_with_retries("post", "https://accounts.spotify.com/api/token",
+    r = _spotify_request_with_retries("post", SPOTIFY_TOKEN_URL,
                                       data={"grant_type": "client_credentials"},
                                       auth=(CLIENT_ID, CLIENT_SECRET), timeout=60)
     return r.json()["access_token"]
@@ -448,7 +452,7 @@ def search_track(isrc: str, bearer: str) -> Optional[Tuple[str, str, str, Option
     Return (track_id, album_id, track_name, artists_joined) for the given ISRC,
     or None if not found.
     """
-    r = _spotify_request_with_retries("get", "https://api.spotify.com/v1/search",
+    r = _spotify_request_with_retries("get", SPOTIFY_SEARCH_URL,
                                       headers={"Authorization": f"Bearer {bearer}"},
                                       params={"q": f"isrc:{isrc}", "type": "track", "limit": 5},
                                       timeout=60)
@@ -499,6 +503,7 @@ async def sniff_tokens() -> Tuple[str, Optional[str]]:
                     if not fut.done():
                         fut.set_result((tok, cli))
         page.on("response", on_resp)
+        # We still need to visit the web player to get the tokens, even if we hit the API directly later.
         await page.goto("https://open.spotify.com/")
         try:
             return await asyncio.wait_for(fut, timeout=20) # Increased timeout for proxy
@@ -514,19 +519,18 @@ def fetch_album(album_id: str, web_token: str, client_token: Optional[str]) -> D
         "variables": {**CAPTURED_VARS, "uri": f"spotify:album:{album_id}"},
         "extensions": {"persistedQuery": {"version": 1, "sha256Hash": PERSISTED_HASH}},
     }
-    for host in PATHFINDER_HOSTS:
-        try:
-            # Using the retry wrapper here
-            r = _spotify_request_with_retries("post", f"{host}/pathfinder/v2/query", headers=headers, json=body, timeout=30)
-            response_json = r.json()
-            if not response_json.get("data"):
-                streams_logger.warning(f"Received empty 'data' from Spotify for album {album_id}. Likely a proxy/IP block.")
-                return {}
-            return response_json
-        except requests.exceptions.RequestException:
-            # The error is already logged by the wrapper, so we just continue
-            continue
-    return {}
+    try:
+        # Using the retry wrapper and the direct pathfinder URL
+        r = _spotify_request_with_retries("post", SPOTIFY_PATHFINDER_URL, headers=headers, json=body, timeout=30)
+        response_json = r.json()
+        if not response_json.get("data"):
+            streams_logger.warning(f"Received empty 'data' from Spotify for album {album_id}. Likely a proxy/IP block.")
+            return {}
+        return response_json
+    except requests.exceptions.RequestException:
+        # The error is already logged by the wrapper, so we just return empty
+        return {}
+
 
 #
 # ────────────────────────────────────────────────────────────────────────────────
@@ -943,7 +947,8 @@ def run_playlist_followers(day_override: Optional[str] = None):
         name = p_info["name"]
         plain_id = urn_to_plain_id(urn)
         try:
-            r = _spotify_request_with_retries("get", f"https://api.spotify.com/v1/playlists/{plain_id}?fields=followers(total)",
+            url = f"{SPOTIFY_PLAYLIST_URL}{plain_id}?fields=followers(total)"
+            r = _spotify_request_with_retries("get", url,
                                              headers={"Authorization": f"Bearer {bearer}"}, timeout=30)
             
             followers = int(r.json().get("followers", {}).get("total", 0) or 0)
@@ -962,10 +967,13 @@ def run_playlist_followers(day_override: Optional[str] = None):
             })
             processed += 1
             time.sleep(airtable_sleep)
-        except requests.exceptions.RequestException as e:
+        except requests.exceptions.HTTPError as e:
             if e.response and e.response.status_code == 404:
                 followers_logger.warning("playlist not found (404): id=%s name=%s", plain_id, name)
                 continue
+            followers_logger.error("error processing playlist id=%s name=%s: %s", plain_id, name, e)
+            errors += 1
+        except requests.exceptions.RequestException as e:
             followers_logger.error("error processing playlist id=%s name=%s: %s", plain_id, name, e)
             errors += 1
     
@@ -1042,7 +1050,7 @@ def get_spotify_token_refreshed() -> str:
     sync_logger.info("Requesting new Spotify access token...")
     r = _spotify_request_with_retries(
         "post",
-        "https://accounts.spotify.com/api/token",
+        SPOTIFY_TOKEN_URL,
         auth=(CLIENT_ID, CLIENT_SECRET),
         data={
             "grant_type": "refresh_token",
@@ -1083,7 +1091,7 @@ def extract_playlist_id(raw: Any) -> Optional[str]:
 
 def get_playlist_snapshot(token: str, playlist_id: str) -> Dict[str, Any]:
     """Fetches just the snapshot_id and total track count for a playlist."""
-    url = f"https://api.spotify.com/v1/playlists/{playlist_id}?fields=snapshot_id,tracks(total)"
+    url = f"{SPOTIFY_PLAYLIST_URL}{playlist_id}?fields=snapshot_id,tracks(total)"
     r = _spotify_request_with_retries("get", url, headers={"Authorization": f"Bearer {token}"}, timeout=30)
     return r.json()
 
@@ -1091,7 +1099,7 @@ def get_playlist_snapshot(token: str, playlist_id: str) -> Dict[str, Any]:
 def fetch_all_playlist_tracks(token: str, playlist_id: str) -> List[Dict[str, Any]]:
     """Paginates through a playlist to get all its tracks."""
     items = []
-    url = f"https://api.spotify.com/v1/playlists/{playlist_id}/tracks?limit=100&fields=items(track(uri,name,artists(name),album(id))),next"
+    url = f"{SPOTIFY_PLAYLIST_URL}{playlist_id}/tracks?limit=100&fields=items(track(uri,name,artists(name),album(id))),next"
     
     page = 1
     while url:
