@@ -324,7 +324,7 @@ async def sniff_tokens() -> Tuple[str, Optional[str]]:
         page.on("response", on_resp)
         await page.goto("https://open.spotify.com/")
         try:
-            return await asyncio.wait_for(fut, timeout=30)
+            return await asyncio.wait_for(fut, timeout=90)
         finally:
             await browser.close()
 
