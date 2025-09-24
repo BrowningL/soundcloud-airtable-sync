@@ -127,9 +127,9 @@ FOLLOWERS_DELTA_FIELD = os.getenv("FOLLOWERS_DELTA_FIELD", "Delta")
 FOLLOWERS_ALLOW_NEGATIVE = (os.getenv("FOLLOWERS_ALLOW_NEGATIVE", "true").lower() in ("1", "true", "yes"))
 
 # Spotify creds
-CLIENT_ID = os.getenv("SPOTIFY_CLIENT_ID", "YOUR_SPOTIFY_CLIENT_ID")
-CLIENT_SECRET = os.getenv("SPOTIFY_CLIENT_SECRET", "YOUR_SPOTIFY_CLIENT_SECRET")
-SPOTIFY_REFRESH_TOKEN = os.getenv("SPOTIFY_REFRESH_TOKEN")
+CLIENT_ID = os.getenv("SPOTIFY_CLIENT_ID")
+CLIENT_SECRET = os.getenv("SPOTIFY_CLIENT_SECRET")
+# SPOTIFY_REFRESH_TOKEN is no longer needed
 
 
 # Spotify web GraphQL for streams (unchanged)
@@ -186,7 +186,7 @@ def at_headers():
 
 def at_url(table: str) -> str:
     return f"https://api.airtable.com/v0/{AIRTABLE_BASE_ID}/{requests.utils.quote(table)}"
-# ... (All other helper functions like at_paginate, catalogue_index, db_conn, etc. can be copied from your last full script) ...
+
 def at_paginate(table: str, params: Dict[str, Any]) -> List[Dict[str, Any]]:
     out, offset = [], None
     while True:
@@ -235,12 +235,12 @@ def db_catalogue_delta_for_day(cur, day_iso: str) -> int:
         prev AS (
           SELECT s1.track_uid,
                  (SELECT s2.playcount
-                   FROM streams s2
-                  WHERE s2.platform='spotify'
-                    AND s2.track_uid = s1.track_uid
-                    AND s2.stream_date < %s
-                  ORDER BY s2.stream_date DESC
-                  LIMIT 1) AS pc_prev
+                    FROM streams s2
+                   WHERE s2.platform='spotify'
+                     AND s2.track_uid = s1.track_uid
+                     AND s2.stream_date < %s
+                   ORDER BY s2.stream_date DESC
+                   LIMIT 1) AS pc_prev
             FROM streams s1
            WHERE s1.platform='spotify'
            GROUP BY s1.track_uid
@@ -255,27 +255,32 @@ def db_catalogue_delta_for_day(cur, day_iso: str) -> int:
 # Spotify helpers for streams
 #
 # ────────────────────────────────────────────────────────────────────────────────
-def get_spotify_token_refreshed() -> str:
-    """Gets a new Spotify access token using the refresh token THROUGH the proxy."""
-    if not SPOTIFY_REFRESH_TOKEN:
-        raise ValueError("SPOTIFY_REFRESH_TOKEN is not set.")
+# 🚀 REPLACED THE OLD TOKEN FUNCTION WITH THIS RELIABLE ONE
+def get_search_token() -> str:
+    """
+    Gets a new Spotify access token using the Client Credentials Flow.
+    This is more reliable for server-to-server calls.
+    """
+    if not CLIENT_ID or not CLIENT_SECRET:
+        raise ValueError("SPOTIFY_CLIENT_ID and SPOTIFY_CLIENT_SECRET must be set.")
     
-    logger.info("Requesting new Spotify access token using refresh token (through proxy)...")
+    logger.info("Requesting new Spotify search token using client credentials (through proxy)...")
     
     r = _spotify_request_with_retries(
         "post",
         SPOTIFY_TOKEN_URL,
         auth=(CLIENT_ID, CLIENT_SECRET),
-        data={
-            "grant_type": "refresh_token",
-            "refresh_token": SPOTIFY_REFRESH_TOKEN,
-        },
+        data={"grant_type": "client_credentials"},
         timeout=30
     )
+    
     token = r.json().get("access_token")
     if not token:
+        # Add more detail to the error log
+        logger.error(f"Failed to get access_token. Status: {r.status_code}, Response: {r.text}")
         raise RuntimeError("Failed to get access_token from Spotify.")
-    logger.info("Successfully refreshed Spotify access token.")
+        
+    logger.info("Successfully obtained new Spotify search token.")
     return token
 
 def search_track(isrc: str, bearer: str) -> Optional[Tuple[str, str, str, Optional[str]]]:
@@ -351,7 +356,8 @@ async def run_once(day_override: Optional[str] = None, attempt_idx: int = 1, out
     streams_logger.info("starting run: tracks=%d output=%s attempt=%d date=%s", len(cat_isrcs), output_target, attempt_idx, day_iso)
 
     try:
-        search_token = get_spotify_token_refreshed()
+        # 🟢 UPDATED TO USE THE NEW, CORRECT FUNCTION
+        search_token = get_search_token()
         web_token, client_token = await sniff_tokens()
     except Exception as e:
         streams_logger.error(f"Failed to get auth tokens, cannot proceed. Error: {e}")
@@ -359,7 +365,6 @@ async def run_once(day_override: Optional[str] = None, attempt_idx: int = 1, out
         send_telegram_alert(error_message)
         return {"error": "Token acquisition failed", "details": str(e)}
 
-    # ... The rest of the function is the same as the one you have ...
     processed, errors, sum_pc = 0, 0, 0
     records_to_process = []
     
@@ -444,12 +449,12 @@ async def run_once(day_override: Optional[str] = None, attempt_idx: int = 1, out
         send_telegram_alert(error_message)
 
     return stats
+
 #
 # ────────────────────────────────────────────────────────────────────────────────
 # Scheduler & Flask App
 #
 # ────────────────────────────────────────────────────────────────────────────────
-# ... (The scheduler and Flask app code remains the same as your current version) ...
 _RUNNING = threading.Event()
 _run_task: Optional[asyncio.Task] = None
 
