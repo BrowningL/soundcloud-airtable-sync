@@ -982,8 +982,8 @@ def _schedule_loop():
         await _run_task
 
     # Main loop
-    # Wait for the first full interval before running
-    next_run_time = time.time() + delay_secs # <-- The Fix
+    # This line is changed back to run immediately on startup
+    next_run_time = time.time() # <-- REVERTED CHANGE
     while not _RUNNING.is_set():
         if time.time() >= next_run_time:
             scheduler_logger.info("tick → running sync()")
