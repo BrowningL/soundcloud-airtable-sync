@@ -460,28 +460,18 @@ def _check_token():
 def _has_spotify_creds():
     return bool(CLIENT_ID and CLIENT_SECRET and CLIENT_ID != "YOUR_SPOTIFY_CLIENT_ID" and CLIENT_SECRET != "YOUR_SPOTIFY_CLIENT_SECRET")
 
-def get_spotify_token_refreshed() -> str:
-    """Gets a new Spotify access token using the refresh token THROUGH the proxy."""
-    if not SPOTIFY_REFRESH_TOKEN:
-        raise ValueError("SPOTIFY_REFRESH_TOKEN is not set.")
-    
-    logger.info("Requesting new Spotify access token using refresh token (through proxy)...")
-    
+def get_search_token() -> str:
+    """Gets a standard API token using client_credentials through the proxy."""
+    logger.info("Requesting new Spotify search token using client credentials (through proxy)...")
     r = _spotify_request_with_retries(
         "post",
         SPOTIFY_TOKEN_URL,
-        auth=(CLIENT_ID, CLIENT_SECRET),
-        data={
-            "grant_type": "refresh_token",
-            "refresh_token": SPOTIFY_REFRESH_TOKEN,
-        },
-        timeout=30
+        data={"grant_type": "client_credentials"},
+        auth=(CLIENT_ID, CLIENT_SECRET), 
+        timeout=60
     )
-    token = r.json().get("access_token")
-    if not token:
-        raise RuntimeError("Failed to get access_token from Spotify.")
-    logger.info("Successfully refreshed Spotify access token.")
-    return token
+    logger.info("Successfully obtained new Spotify search token.")
+    return r.json()["access_token"]
 
 def search_track(isrc: str, bearer: str) -> Optional[Tuple[str, str, str, Optional[str]]]:
     """
@@ -768,7 +758,6 @@ def db_apply_lag_transfer(cur, from_day: str, to_day: str, track_uid: str, from_
 #
 # ────────────────────────────────────────────────────────────────────────────────
 async def run_once(day_override: Optional[str] = None, attempt_idx: int = 1, output_target: str = OUTPUT_TARGET) -> Dict[str, Any]:
-    # FIX: The script now runs for the most recently completed day (yesterday).
     day_iso = day_override or (date.today() - timedelta(days=1)).isoformat()
     
     catalogue = catalogue_index()
@@ -1423,7 +1412,7 @@ def check_apple_music_api(artist: str, title: str) -> bool:
             return False # No match found, no need to retry
 
         except requests.exceptions.RequestException as e:
-            health_logger.error(f"❗️ [Apple] Network error for '{title}": {e}")
+            health_logger.error(f"❗️ [Apple] Network error for '{title}': {e}")
             if attempt < 2:
                 time.sleep(5) # Wait 5s on other network errors before retry
             else:
@@ -1457,38 +1446,31 @@ def run_catalogue_health_worker():
     Main worker to check catalogue health and store results in Postgres.
     """
     health_logger.info("--- Starting Catalogue Health Check ---")
-
-    if not _has_spotify_creds():
-        raise RuntimeError("Spotify API credentials (SPOTIFY_CLIENT_ID, SPOTIFY_CLIENT_SECRET) must be set for health checks.")
-
-    # 1. Set up Spotify client with proxy
     try:
-        token = get_spotify_token_refreshed()
+        if not _has_spotify_creds():
+            raise RuntimeError("Spotify API credentials (SPOTIFY_CLIENT_ID, SPOTIFY_CLIENT_SECRET) must be set for health checks.")
+
+        # 1. Set up Spotify client with proxy
+        token = get_search_token() # Use the main script's auth method
         spotify_client = spotipy.Spotify(auth=token, proxies=proxies)
         health_logger.info("Spotipy client initialized successfully.")
-    except Exception as e:
-        health_logger.exception("Failed to initialize Spotipy client.")
-        raise e
+        
+        # 2. Fetch catalogue from Airtable
+        health_logger.info("Fetching catalogue from Airtable...")
+        catalogue = catalogue_index()
+        health_logger.info(f"Found {len(catalogue)} tracks in the catalogue.")
 
-    # 2. Fetch catalogue from Airtable
-    health_logger.info("Fetching catalogue from Airtable...")
-    catalogue = catalogue_index()
-    health_logger.info(f"Found {len(catalogue)} tracks in the catalogue.")
+        # 3. Connect to DB and run checks
+        conn = None
+        check_date_iso = date.today().isoformat()
+        checked_count = 0
+        errors = 0
 
-    # 3. Connect to DB and run checks
-    conn = None
-    check_date_iso = date.today().isoformat()
-    checked_count = 0
-    errors = 0
-
-    try:
         conn = db_conn()
         with conn.cursor() as cur:
-            # Ensure the table exists
             db_ensure_catalogue_health_schema(cur)
             conn.commit()
 
-            # Iterate over each track from Airtable
             for isrc, track_data in catalogue.items():
                 title = track_data.get('title')
                 artist = track_data.get('artist')
@@ -1496,37 +1478,30 @@ def run_catalogue_health_worker():
                 if not title or not artist:
                     health_logger.warning(f"Skipping ISRC {isrc} due to missing title or artist.")
                     continue
-                try:
-                    # Perform checks
-                    apple_exists = check_apple_music_api(artist, title)
-                    spotify_exists = check_spotify_api(spotify_client, artist, title)
-                    
-                    # --- NEW: Jittered delay to appear more human ---
-                    time.sleep(random.uniform(1.0, 2.5))
+                
+                apple_exists = check_apple_music_api(artist, title)
+                spotify_exists = check_spotify_api(spotify_client, artist, title)
+                
+                time.sleep(random.uniform(1.0, 2.5))
 
-                    # Get track_uid from our DB, creating the track if it's new
-                    track_uid = db_upsert_track(cur, isrc, artist, title)
+                track_uid = db_upsert_track(cur, isrc, artist, title)
 
-                    # Save the result to the database
-                    db_upsert_catalogue_health_status(cur, check_date_iso, track_uid, apple_exists, spotify_exists)
-                    checked_count += 1
-                    if checked_count % 10 == 0:
-                        conn.commit() # Commit periodically
-                        health_logger.info(f"Progress: {checked_count}/{len(catalogue)} tracks checked. Committing batch.")
+                db_upsert_catalogue_health_status(cur, check_date_iso, track_uid, apple_exists, spotify_exists)
+                checked_count += 1
+                if checked_count % 10 == 0:
+                    conn.commit()
+                    health_logger.info(f"Progress: {checked_count}/{len(catalogue)} tracks checked. Committing batch.")
 
-                except Exception as e:
-                    health_logger.exception(f"An error occurred while processing ISRC {isrc}")
-                    errors += 1
-                    conn.rollback() # Rollback this single track's transaction
+        conn.commit()
+        health_logger.info(f"--- Catalogue Health Check Finished. Checked: {checked_count}, Errors: {errors} ---")
 
-        conn.commit() # Final commit
-    except psycopg2.Error as e:
-        health_logger.exception("Database error during health check process: %s", e)
-        if conn: conn.rollback()
-        raise e
+    except Exception as e:
+        health_logger.exception("Catalogue health check worker failed.")
+        error_message = f"ALERT: The Catalogue Health Check worker failed with error: {e}"
+        send_telegram_alert(error_message)
     finally:
-        if conn: conn.close()
-    health_logger.info(f"--- Catalogue Health Check Finished. Checked: {checked_count}, Errors: {errors} ---")
+        if conn:
+            conn.close()
 
 # Assign the worker function to the ch_run variable
 ch_run = run_catalogue_health_worker
