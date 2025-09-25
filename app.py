@@ -295,6 +295,24 @@ def db_upsert_playlist_followers(cur, platform: str, playlist_id_urn: str, day_i
                       playlist_name = COALESCE(EXCLUDED.playlist_name, playlist_followers.playlist_name)
     """, (platform, playlist_id_urn, day_iso, followers, playlist_name))
 
+def db_refresh_materialized_view():
+    """Refreshes the materialized view for daily stream deltas."""
+    conn = None
+    try:
+        conn = db_conn()
+        with conn.cursor() as cur:
+            logger.info("Refreshing streams_daily_delta materialized view...")
+            cur.execute("REFRESH MATERIALIZED VIEW streams_daily_delta;")
+            conn.commit()
+            logger.info("Materialized view refreshed successfully.")
+    except psycopg2.Error as e:
+        logger.error(f"Failed to refresh materialized view: {e}")
+        if conn:
+            conn.rollback()
+    finally:
+        if conn:
+            conn.close()
+
 # --- START: NEW DB HELPERS FOR CATALOGUE HEALTH ---
 def db_ensure_catalogue_health_schema(cur):
     """Creates the catalogue_health_status table if it doesn't exist."""
@@ -874,6 +892,10 @@ async def run_once(day_override: Optional[str] = None, attempt_idx: int = 1, out
             if conn: conn.rollback()
         finally:
             if conn: conn.close()
+
+    # --- NEW: Refresh Materialized View after a successful run ---
+    if processed > 0 and output_target in ("postgres", "both"):
+        db_refresh_materialized_view()
 
     if output_target in ("postgres", "both") and LAG_MIN_TOTAL > 0:
         conn = None
