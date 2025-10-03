@@ -529,7 +529,7 @@ def search_track(isrc: str, bearer: str) -> Optional[Tuple[str, str, str, Option
 
 async def sniff_tokens() -> Tuple[str, Optional[str]]:
     proxy_server = None
-    if PROXY_URL:
+    if USE_PROXY and PROXY_URL:  # <── add USE_PROXY check here
         parsed_url = urlparse(PROXY_URL)
         proxy_server = {
             "server": f"{parsed_url.scheme}://{parsed_url.hostname}:{parsed_url.port}",
@@ -538,10 +538,15 @@ async def sniff_tokens() -> Tuple[str, Optional[str]]:
         }
 
     async with async_playwright() as p:
-        browser = await p.chromium.launch(headless=True, args=["--no-sandbox"], proxy=proxy_server)
+        browser = await p.chromium.launch(
+            headless=True,
+            args=["--no-sandbox"],
+            proxy=proxy_server  # will be None if USE_PROXY=false
+        )
         ctx = await browser.new_context(user_agent=USER_AGENT)
         page = await ctx.new_page()
         fut = asyncio.get_event_loop().create_future()
+
         def on_resp(resp):
             if "/pathfinder/v2/query" in resp.url and resp.status == 200:
                 hdrs = resp.request.headers
@@ -551,13 +556,14 @@ async def sniff_tokens() -> Tuple[str, Optional[str]]:
                     cli = hdrs.get("client-token")
                     if not fut.done():
                         fut.set_result((tok, cli))
+
         page.on("response", on_resp)
-        # We still need to visit the web player to get the tokens, even if we hit the API directly later.
         await page.goto("https://open.spotify.com/")
         try:
             return await asyncio.wait_for(fut, timeout=30)
         finally:
             await browser.close()
+
 
 def fetch_album(album_id: str, web_token: str, client_token: Optional[str]) -> Dict[str, Any]:
     headers = {"Authorization": f"Bearer {web_token}", "User-Agent": USER_AGENT, "content-type": "application/json"}
