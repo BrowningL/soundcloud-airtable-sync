@@ -80,14 +80,19 @@ AUTOMATION_TOKEN = os.getenv("AUTOMATION_TOKEN")
 LOCAL_TZ = os.getenv("LOCAL_TZ", "Europe/London")
 
 # --- PROXY CONFIGURATION ---
+USE_PROXY = os.getenv("USE_PROXY", "false").lower() in ("1", "true", "yes")
 PROXY_URL = os.getenv("PROXY_URL")
-proxies = {
-    "http": PROXY_URL,
-    "https": PROXY_URL,
-} if PROXY_URL else None
 
-if proxies:
+proxies = None
+if USE_PROXY and PROXY_URL:
+    proxies = {
+        "http": PROXY_URL,
+        "https": PROXY_URL,
+    }
     logger.info("Proxy configured and will be used for Spotify requests.")
+else:
+    logger.info("Proxy disabled (USE_PROXY is false or PROXY_URL not set).")
+
     
 # --- OFFICIAL SPOTIFY API ENDPOINTS ---
 SPOTIFY_TOKEN_URL = "https://accounts.spotify.com/api/token"
