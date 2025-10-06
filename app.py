@@ -237,27 +237,96 @@ def _norm_lookup(val: Any) -> Optional[str]:
 
 def catalogue_index() -> Dict[str, Dict[str, Optional[str]]]:
     """
-    Return mapping:
-      { ISRC_UPPER: { "air_id": <catalogue_record_id>, "artist": <str|None>, "title": <str|None> } }
+    Fetches the catalogue, resolves linked artist record IDs to names,
+    and returns a mapping:
+      { ISRC_UPPER: { "air_id": ..., "artist": ..., "title": ... } }
     """
+    # 1. Fetch all raw data from the Catalogue table
     params = {
         "view": CATALOGUE_VIEW,
         "pageSize": 100,
         "fields[]": [CATALOGUE_ISRC_FIELD, CATALOGUE_ARTIST_FIELD, CATALOGUE_TITLE_FIELD],
     }
     rows = at_paginate(CATALOGUE_TABLE, params)
-    out: Dict[str, Dict[str, Optional[str]]] = {}
+
+    # 2. Collect all unique artist Record IDs that need to be resolved
+    tracks_to_process = []
+    artist_ids_to_resolve = set()
+
     for rec in rows:
         f = rec.get("fields", {})
         isrc = (f.get(CATALOGUE_ISRC_FIELD) or "").strip().upper()
         if not isrc:
             continue
-        out[isrc] = {
+        
+        # Get the list of linked record IDs for the artist
+        artist_record_ids = f.get(CATALOGUE_ARTIST_FIELD)
+        if artist_record_ids and isinstance(artist_record_ids, list):
+            artist_ids_to_resolve.update(artist_record_ids)
+        
+        tracks_to_process.append({
+            "isrc": isrc,
             "air_id": rec["id"],
-            "artist": _norm_lookup(f.get(CATALOGUE_ARTIST_FIELD)),
             "title": _norm_lookup(f.get(CATALOGUE_TITLE_FIELD)),
+            "artist_ids": artist_record_ids or []
+        })
+
+    # 3. Resolve all artist IDs in one efficient batch call
+    resolved_artist_names = at_resolve_artist_names(list(artist_ids_to_resolve))
+
+    # 4. Build the final catalogue index using the resolved names
+    out: Dict[str, Dict[str, Optional[str]]] = {}
+    for track in tracks_to_process:
+        # Look up each artist ID and join them into a single string
+        names = [resolved_artist_names.get(rid, rid) for rid in track["artist_ids"]]
+        artist_name = " & ".join(names) if names else None
+
+        out[track["isrc"]] = {
+            "air_id": track["air_id"],
+            "artist": artist_name,
+            "title": track["title"],
         }
     return out
+
+
+def at_resolve_artist_names(record_ids: List[str]) -> Dict[str, str]:
+    """"
+    Given a list of Airtable record IDs from the 'Accounts' table,
+    returns a dictionary mapping each ID to its primary field value (the artist name).
+    This is to fix the new Artist field being a multiple linked record type.
+    """"
+    if not record_ids:
+        return {}
+
+    # Airtable's formula is limited, so we batch requests just in case
+    batch_size = 50 
+    id_to_name_map = {}
+    unique_ids = sorted(list(set(record_ids)))
+
+    logger.info(f"Resolving {len(unique_ids)} artist Record IDs from the 'Accounts' table...")
+
+    for i in range(0, len(unique_ids), batch_size):
+        batch_ids = unique_ids[i:i+batch_size]
+        
+        formula_parts = [f"RECORD_ID()='{rid}'" for rid in batch_ids]
+        formula = f"OR({', '.join(formula_parts)})"
+
+        params = {
+            "filterByFormula": formula,
+            "fields[]": ["Artist"] # The primary field of your 'Accounts' table
+        }
+        
+        # We can use the existing at_paginate helper
+        records = at_paginate("Accounts", params)
+        
+        for record in records:
+            rec_id = record.get("id")
+            artist_name = (record.get("fields", {}) or {}).get("Artist")
+            if rec_id and artist_name:
+                id_to_name_map[rec_id] = artist_name
+    
+    logger.info(f"Successfully resolved {len(id_to_name_map)} artist names.")
+    return id_to_name_map
 
 #
 # ────────────────────────────────────────────────────────────────────────────────
