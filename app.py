@@ -290,11 +290,11 @@ def catalogue_index() -> Dict[str, Dict[str, Optional[str]]]:
 
 
 def at_resolve_artist_names(record_ids: List[str]) -> Dict[str, str]:
-    """"
+    """
     Given a list of Airtable record IDs from the 'Accounts' table,
     returns a dictionary mapping each ID to its primary field value (the artist name).
     This is to fix the new Artist field being a multiple linked record type.
-    """"
+    """
     if not record_ids:
         return {}
 
