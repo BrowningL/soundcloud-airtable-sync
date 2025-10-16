@@ -1,3 +1,10 @@
+Of course. Since you cannot modify the Airtable base, the application's code must be updated to match your new schema.
+
+The key issues are that the code was hardcoded to look for a table named **`Accounts`** with a primary field named **`Artist`**. Based on your new schema, this should be the **`Artists`** table with a primary field named **`Name`**.
+
+Here is the fully corrected `app.py` file with the necessary changes. The modifications are confined to the `at_resolve_artist_names` function to correctly query your new table structure.
+
+```python
 import os
 import time
 import asyncio
@@ -291,7 +298,7 @@ def catalogue_index() -> Dict[str, Dict[str, Optional[str]]]:
 
 def at_resolve_artist_names(record_ids: List[str]) -> Dict[str, str]:
     """
-    Given a list of Airtable record IDs from the 'Accounts' table,
+    Given a list of Airtable record IDs from the 'Artists' table,
     returns a dictionary mapping each ID to its primary field value (the artist name).
     This is to fix the new Artist field being a multiple linked record type.
     """
@@ -303,7 +310,7 @@ def at_resolve_artist_names(record_ids: List[str]) -> Dict[str, str]:
     id_to_name_map = {}
     unique_ids = sorted(list(set(record_ids)))
 
-    logger.info(f"Resolving {len(unique_ids)} artist Record IDs from the 'Accounts' table...")
+    logger.info(f"Resolving {len(unique_ids)} artist Record IDs from the 'Artists' table...")
 
     for i in range(0, len(unique_ids), batch_size):
         batch_ids = unique_ids[i:i+batch_size]
@@ -313,15 +320,15 @@ def at_resolve_artist_names(record_ids: List[str]) -> Dict[str, str]:
 
         params = {
             "filterByFormula": formula,
-            "fields[]": ["Artist"] # The primary field of your 'Accounts' table
+            "fields[]": ["Name"] # The primary field of your 'Artists' table
         }
         
         # We can use the existing at_paginate helper
-        records = at_paginate("Accounts", params)
+        records = at_paginate("Artists", params)
         
         for record in records:
             rec_id = record.get("id")
-            artist_name = (record.get("fields", {}) or {}).get("Artist")
+            artist_name = (record.get("fields", {}) or {}).get("Name")
             if rec_id and artist_name:
                 id_to_name_map[rec_id] = artist_name
     
@@ -1083,7 +1090,7 @@ def run_playlist_followers(day_override: Optional[str] = None):
         try:
             url = f"{SPOTIFY_PLAYLIST_URL}{plain_id}?fields=followers(total)"
             r = _spotify_request_with_retries("get", url,
-                                             headers={"Authorization": f"Bearer {bearer}"}, timeout=30)
+                                              headers={"Authorization": f"Bearer {bearer}"}, timeout=30)
             
             followers = int(r.json().get("followers", {}).get("total", 0) or 0)
             
@@ -1748,3 +1755,4 @@ if __name__ == "__main__":
     
     port = int(os.environ.get("PORT", 8080))
     app.run(host="0.0.0.0", port=port)
+```
