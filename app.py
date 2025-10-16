@@ -1,10 +1,3 @@
-Of course. Since you cannot modify the Airtable base, the application's code must be updated to match your new schema.
-
-The key issues are that the code was hardcoded to look for a table named **`Accounts`** with a primary field named **`Artist`**. Based on your new schema, this should be the **`Artists`** table with a primary field named **`Name`**.
-
-Here is the fully corrected `app.py` file with the necessary changes. The modifications are confined to the `at_resolve_artist_names` function to correctly query your new table structure.
-
-```python
 import os
 import time
 import asyncio
